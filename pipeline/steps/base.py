@@ -21,6 +21,11 @@ class Step(ABC):
         """Execute the step on the given data and return the result."""
         raise NotImplementedError
 
+    # @abstractmethod
+    # def save_data(self, path: str) -> None:
+    #     """Save the step's state to the specified path."""
+    #     raise NotImplementedError
+
     def __call__(self, data: Any) -> Any:
         # allows step_instance(data) as a shortcut for step_instance.run(data)
         return self.run(data)
