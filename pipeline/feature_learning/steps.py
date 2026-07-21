@@ -1,84 +1,194 @@
 """Concrete feature learning steps."""
 
-from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import dataloader
+from pathlib import Path
+from PIL import Image, ImageOps
+from torch.utils.data import Dataset
+from torchvision import transforms
 
 from pipeline.feature_learning.base import FeatureLearningStep
 
-
-class PretrainedFeatureLearning(FeatureLearningStep):
-    def __init__(self, backbone: str = "resnet50", normalize: bool = True):
-        super().__init__()
-        self.backbone = backbone
-        self.normalize = normalize
-
-    def run(self, data: Any) -> np.ndarray:
-        # TODO: extract features from pretrained backbone
-        features = np.zeros((len(data), 512))
-        return self.l2_normalize(features) if self.normalize else features
-
-
-class VAEFeatureLearning(FeatureLearningStep):
-    def __init__(self, latent_dim: int = 128, epochs: int = 100, normalize: bool = True):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.epochs = epochs
-        self.normalize = normalize
-
-    def run(self, data: Any) -> np.ndarray:
-        # TODO: train VAE, return latent vectors
-        features = np.zeros((len(data), self.latent_dim))
-        return self.l2_normalize(features) if self.normalize else features
-
-
-class PotteryVAE(nn.Module):
-    def __init__(self, latent_dim=128, dropout_p=0.25):
-        super().__init__()
-        # Encoder: 256x256 -> csökkenő spatial dim, növekvő csatornaszám
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),  # 128x128
-            nn.ELU(), nn.Dropout2d(dropout_p),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 64x64
-            nn.ELU(), nn.Dropout2d(dropout_p),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # 32x32
-            nn.ELU(), nn.Dropout2d(dropout_p),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),  # 16x16
-            nn.ELU(), nn.Dropout2d(dropout_p),
-        )
-        self.flatten_dim = 256 * 16 * 16
-        self.fc_mu = nn.Linear(self.flatten_dim, latent_dim)
-        self.fc_logvar = nn.Linear(self.flatten_dim, latent_dim)
-
-        self.decoder_input = nn.Linear(latent_dim, self.flatten_dim)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ELU(), nn.Dropout2d(dropout_p),
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ELU(), nn.Dropout2d(dropout_p),
-            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.ELU(), nn.Dropout2d(dropout_p),
-            nn.ConvTranspose2d(32, 1, kernel_size=3, stride=2, padding=1, output_padding=1),
-        )
-
-    def encode(self, x):
-        h = self.encoder(x)
-        h = h.view(h.size(0), -1)
-        return self.fc_mu(h), self.fc_logvar(h)
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def decode(self, z):
-        h = self.decoder_input(z)
-        h = h.view(h.size(0), 256, 16, 16)
-        return self.decoder(h)  # logits, sigmoid loss-ban alkalmazva
+class VAE(FeatureLearningStep, nn.Module):
+    def __init__(self, f=4, n=3, s=1, k=128):
+        nn.Module.__init__(self)
+        FeatureLearningStep.__init__(self)
+        self.encoder = Encoder(f, n, s, k)
+        self.decoder = Decoder(f, n, s, k)
 
     def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        x_recon = self.decode(z)
-        return x_recon, mu, logvar, z
+        mu, sigma = self.encoder(x)
+        std = torch.exp(0.5 * sigma)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        x_reconstructed = self.decoder(z)
+        return x_reconstructed, mu, sigma
+    
+    def train_model(self, folder, epochs=10, lr=1e-6, batch_size=32):
+        dataset = ImageFolderDataset(folder)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+
+        self.train()
+        for epoch in range(epochs):
+            train_loss = 0.0
+            for i, inputs in enumerate(loader):
+                optimizer.zero_grad()
+                outputs, mu, sigma = self(inputs)
+                loss = self._loss_function(outputs, inputs, mu, sigma)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+            print(f'[epoch {epoch+1}] loss: {train_loss / len(loader):.3f}')
+
+    def extract_features(self, folder, batch_size=32):
+        dataset = ImageFolderDataset(folder)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        self.eval()
+        all_features = []
+        with torch.no_grad():
+            for inputs in loader:
+                mu, sigma = self.encoder(inputs)
+                z = torch.cat([mu, sigma], dim=1)
+                all_features.append(z)
+        return torch.cat(all_features, dim=0)
+
+    @staticmethod
+    def _loss_function(recon_x, x, mu, logvar):
+        BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return BCE + KLD
+
+
+class Encoder(nn.Module):
+    def __init__(self, f=4, n=3, s=1, k=128):
+        super(Encoder, self).__init__()
+
+        #used multiple times
+        self.elu = nn.ELU()
+        self.dropout = nn.Dropout(p=0.25)
+
+        #block0
+        self.conv0 = nn.Conv2d(1, 2**f, kernel_size=n, stride=s)
+
+        #block1
+        self.conv1_0 = nn.Conv2d(2**f, 2**(f+1), kernel_size=n, stride=s+1)
+        self.conv1_1 = nn.Conv2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s)
+
+        #block2
+        self.conv2_0 = nn.Conv2d(2**(f+1), 2**(f+2), kernel_size=n, stride=s+1)
+        self.conv2_1 = nn.Conv2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s)
+
+        #block3
+        self.conv3_0 = nn.Conv2d(2**(f+2), 2**(f+3), kernel_size=n, stride=s+1)
+        self.conv3_1 = nn.Conv2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s)
+
+        #block4
+        self.fc_mu = nn.Linear(k, 1)
+        self.fc_sigma = nn.Linear(k, 1)
+
+    def forward(self, x):
+        #block0
+        x = self.conv0(x)
+            
+        #block1
+        x = self.elu(self.conv1_0(x))
+        x = self.elu(self.conv1_1(x))
+        x = self.dropout(x)
+
+        #block2
+        x = self.elu(self.conv2_0(x))
+        x = self.elu(self.conv2_1(x))
+        x = self.dropout(x)
+
+        #block3
+        x = self.elu(self.conv3_0(x))
+        x = self.elu(self.conv3_1(x))
+        x = self.dropout(x)
+
+        #block4
+        x = x.view(x.size(0), -1)
+        mu = self.fc_mu(x)
+        sigma = self.fc_sigma(x)
+
+        return mu, sigma
+
+class Decoder(nn.Module):
+    def __init__(self, f=4, n=3, s=1, k=128):
+        super(Decoder, self).__init__()
+
+        #used multiple times
+        self.elu = nn.ELU()
+        self.dropout = nn.Dropout(p=0.25)
+
+        #block0
+        self.conv0 = nn.Conv2d(k, 2**(f+3), kernel_size=n, stride=s)
+
+        #block1
+        self.conv1_0 = nn.Conv2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s)
+        self.conv1_1 = nn.Conv2d(2**(f+3), 2**(f+2), kernel_size=n, stride=s+1)
+
+        #block2
+        self.conv2_0 = nn.Conv2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s)
+        self.conv2_1 = nn.Conv2d(2**(f+2), 2**(f+1), kernel_size=n, stride=s+1)
+
+        #block3
+        self.conv3_0 = nn.Conv2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s)
+        self.conv3_1 = nn.Conv2d(2**(f+1), 2**(f), kernel_size=n, stride=s+1)
+
+        #block4
+        self.conv4 = nn.Conv2d(2**f, 1, kernel_size=n, stride=s)
+
+    def forward(self, x):
+        #block0
+        x = self.conv0(x)
+            
+        #block1
+        x = self.elu(self.conv1_0(x))
+        x = self.elu(self.conv1_1(x))
+        x = self.dropout(x)
+
+        #block2
+        x = self.elu(self.conv2_0(x))
+        x = self.elu(self.conv2_1(x))
+        x = self.dropout(x)
+
+        #block3
+        x = self.elu(self.conv3_0(x))
+        x = self.elu(self.conv3_1(x))
+        x = self.dropout(x)
+
+        #block4
+        x = self.conv4(x)
+
+        return x
+
+def resize_with_padding(img, target_size=256, fill=255):
+    img = img.copy()
+    img.thumbnail((target_size, target_size))
+    delta_w = target_size - img.size[0]
+    delta_h = target_size - img.size[1]
+    padding = (delta_w // 2, delta_h // 2, delta_w - delta_w // 2, delta_h - delta_h // 2)
+    return ImageOps.expand(img, padding, fill=fill)
+
+
+class ImageFolderDataset(Dataset):
+    def __init__(self, folder, target_size=256):
+        self.paths = sorted(Path(folder).glob("*.jpg"))
+        self.transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Lambda(lambda img: resize_with_padding(img, target_size)),
+            transforms.ToTensor(),
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx])
+        return self.transform(img)
