@@ -67,7 +67,7 @@ class VAE(FeatureLearningStep, nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, f=4, n=3, s=1, k=128):
+    def __init__(self, f=4, n=3, s=1, k=128, p=1):
         super(Encoder, self).__init__()
 
         #used multiple times
@@ -75,22 +75,22 @@ class Encoder(nn.Module):
         self.dropout = nn.Dropout(p=0.25)
 
         #block0
-        self.conv0 = nn.Conv2d(1, 2**f, kernel_size=n, stride=s)
+        self.conv0 = nn.Conv2d(1, 2**f, kernel_size=n, stride=s, padding=p)
 
         #block1
-        self.conv1_0 = nn.Conv2d(2**f, 2**(f+1), kernel_size=n, stride=s+1)
-        self.conv1_1 = nn.Conv2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s)
+        self.conv1_0 = nn.Conv2d(2**f, 2**(f+1), kernel_size=n, stride=s+1, padding=p)
+        self.conv1_1 = nn.Conv2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s, padding=p)
 
         #block2
-        self.conv2_0 = nn.Conv2d(2**(f+1), 2**(f+2), kernel_size=n, stride=s+1)
-        self.conv2_1 = nn.Conv2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s)
+        self.conv2_0 = nn.Conv2d(2**(f+1), 2**(f+2), kernel_size=n, stride=s+1, padding=p)
+        self.conv2_1 = nn.Conv2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s, padding=p)
 
         #block3
-        self.conv3_0 = nn.Conv2d(2**(f+2), 2**(f+3), kernel_size=n, stride=s+1)
-        self.conv3_1 = nn.Conv2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s)
+        self.conv3_0 = nn.Conv2d(2**(f+2), 2**(f+3), kernel_size=n, stride=s+1, padding=p)
+        self.conv3_1 = nn.Conv2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s, padding=p)
 
         #block4
-        flatten_size = 93312
+        flatten_size = 131072
 
         self.fc_mu = nn.Linear(flatten_size, k)
         self.fc_sigma = nn.Linear(flatten_size, k)
@@ -122,7 +122,7 @@ class Encoder(nn.Module):
         return mu, sigma
 
 class Decoder(nn.Module):
-    def __init__(self, f=4, n=3, s=1, k=128):
+    def __init__(self, f=4, n=3, s=1, k=128, p=1):
         super(Decoder, self).__init__()
 
         #used multiple times
@@ -130,22 +130,22 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(p=0.25)
 
         #block0
-        self.conv0 = nn.ConvTranspose2d(k, 2**(f+3), kernel_size=n, stride=s)
+        self.conv0 = nn.ConvTranspose2d(k, 2**(f+3), kernel_size=n, stride=s, padding=p)
 
         #block1
-        self.conv1_0 = nn.ConvTranspose2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s)
-        self.conv1_1 = nn.ConvTranspose2d(2**(f+3), 2**(f+2), kernel_size=n, stride=s+1)
+        self.conv1_0 = nn.ConvTranspose2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s, padding=p)
+        self.conv1_1 = nn.ConvTranspose2d(2**(f+3), 2**(f+2), kernel_size=n, stride=s+1, padding=p)
 
         #block2
-        self.conv2_0 = nn.ConvTranspose2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s)
-        self.conv2_1 = nn.ConvTranspose2d(2**(f+2), 2**(f+1), kernel_size=n, stride=s+1)
+        self.conv2_0 = nn.ConvTranspose2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s, padding=p)
+        self.conv2_1 = nn.ConvTranspose2d(2**(f+2), 2**(f+1), kernel_size=n, stride=s+1, padding=p)
 
         #block3
-        self.conv3_0 = nn.ConvTranspose2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s)
-        self.conv3_1 = nn.ConvTranspose2d(2**(f+1), 2**(f), kernel_size=n, stride=s+1)
+        self.conv3_0 = nn.ConvTranspose2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s, padding=p)
+        self.conv3_1 = nn.ConvTranspose2d(2**(f+1), 2**(f), kernel_size=n, stride=s+1, padding=p)
 
         #block4
-        self.conv4 = nn.ConvTranspose2d(2**f, 1, kernel_size=n, stride=s)
+        self.conv4 = nn.ConvTranspose2d(2**f, 1, kernel_size=n, stride=s, padding=p)
 
     def forward(self, x):
         #block0
