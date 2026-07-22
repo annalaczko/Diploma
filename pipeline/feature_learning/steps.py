@@ -25,6 +25,7 @@ class VAE(FeatureLearningStep, nn.Module):
         std = torch.exp(0.5 * sigma)
         eps = torch.randn_like(std)
         z = mu + eps * std
+        z = z.view(z.size(0), -1, 1, 1)  # (batch, k, 1, 1)
         x_reconstructed = self.decoder(z)
         return x_reconstructed, mu, sigma
     
@@ -89,8 +90,10 @@ class Encoder(nn.Module):
         self.conv3_1 = nn.Conv2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s)
 
         #block4
-        self.fc_mu = nn.Linear(k, 1)
-        self.fc_sigma = nn.Linear(k, 1)
+        flatten_size = 93312
+
+        self.fc_mu = nn.Linear(flatten_size, k)
+        self.fc_sigma = nn.Linear(flatten_size, k)
 
     def forward(self, x):
         #block0
@@ -127,22 +130,22 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(p=0.25)
 
         #block0
-        self.conv0 = nn.Conv2d(k, 2**(f+3), kernel_size=n, stride=s)
+        self.conv0 = nn.ConvTranspose2d(k, 2**(f+3), kernel_size=n, stride=s)
 
         #block1
-        self.conv1_0 = nn.Conv2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s)
-        self.conv1_1 = nn.Conv2d(2**(f+3), 2**(f+2), kernel_size=n, stride=s+1)
+        self.conv1_0 = nn.ConvTranspose2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s)
+        self.conv1_1 = nn.ConvTranspose2d(2**(f+3), 2**(f+2), kernel_size=n, stride=s+1)
 
         #block2
-        self.conv2_0 = nn.Conv2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s)
-        self.conv2_1 = nn.Conv2d(2**(f+2), 2**(f+1), kernel_size=n, stride=s+1)
+        self.conv2_0 = nn.ConvTranspose2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s)
+        self.conv2_1 = nn.ConvTranspose2d(2**(f+2), 2**(f+1), kernel_size=n, stride=s+1)
 
         #block3
-        self.conv3_0 = nn.Conv2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s)
-        self.conv3_1 = nn.Conv2d(2**(f+1), 2**(f), kernel_size=n, stride=s+1)
+        self.conv3_0 = nn.ConvTranspose2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s)
+        self.conv3_1 = nn.ConvTranspose2d(2**(f+1), 2**(f), kernel_size=n, stride=s+1)
 
         #block4
-        self.conv4 = nn.Conv2d(2**f, 1, kernel_size=n, stride=s)
+        self.conv4 = nn.ConvTranspose2d(2**f, 1, kernel_size=n, stride=s)
 
     def forward(self, x):
         #block0
