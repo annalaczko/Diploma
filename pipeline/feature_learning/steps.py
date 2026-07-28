@@ -13,10 +13,9 @@ from torchvision import transforms
 
 from pipeline.feature_learning.base import FeatureLearningStep
 
-class VAE(FeatureLearningStep, nn.Module):
+class VAE( nn.Module):
     def __init__(self, f=4, n=3, s=1, k=128):
         nn.Module.__init__(self)
-        FeatureLearningStep.__init__(self)
         self.encoder = Encoder(f, n, s, k)
         self.decoder = Decoder(f, n, s, k)
 
@@ -25,7 +24,8 @@ class VAE(FeatureLearningStep, nn.Module):
         std = torch.exp(0.5 * sigma)
         eps = torch.randn_like(std)
         z = mu + eps * std
-        z = z.view(z.size(0), -1, 1, 1)  # (batch, k, 1, 1)
+        z = self.decoder.fc(z)
+        z = z.view(-1, 128, 32, 32)
         x_reconstructed = self.decoder(z)
         return x_reconstructed, mu, sigma
     
@@ -130,19 +130,20 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(p=0.25)
 
         #block0
+        self.fc = nn.Linear(k, 2**(f+3) * 32 * 32)
         self.conv0 = nn.ConvTranspose2d(k, 2**(f+3), kernel_size=n, stride=s, padding=p)
 
         #block1
         self.conv1_0 = nn.ConvTranspose2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s, padding=p)
-        self.conv1_1 = nn.ConvTranspose2d(2**(f+3), 2**(f+2), kernel_size=n, stride=s+1, padding=p)
+        self.conv1_1 = nn.ConvTranspose2d(2**(f+3), 2**(f+2), kernel_size=n, stride=s+1, padding=p, output_padding=1)
 
         #block2
         self.conv2_0 = nn.ConvTranspose2d(2**(f+2), 2**(f+2), kernel_size=n, stride=s, padding=p)
-        self.conv2_1 = nn.ConvTranspose2d(2**(f+2), 2**(f+1), kernel_size=n, stride=s+1, padding=p)
+        self.conv2_1 = nn.ConvTranspose2d(2**(f+2), 2**(f+1), kernel_size=n, stride=s+1, padding=p, output_padding=1)
 
         #block3
         self.conv3_0 = nn.ConvTranspose2d(2**(f+1), 2**(f+1), kernel_size=n, stride=s, padding=p)
-        self.conv3_1 = nn.ConvTranspose2d(2**(f+1), 2**(f), kernel_size=n, stride=s+1, padding=p)
+        self.conv3_1 = nn.ConvTranspose2d(2**(f+1), 2**(f), kernel_size=n, stride=s+1, padding=p, output_padding=1)
 
         #block4
         self.conv4 = nn.ConvTranspose2d(2**f, 1, kernel_size=n, stride=s, padding=p)
@@ -169,7 +170,7 @@ class Decoder(nn.Module):
         #block4
         x = self.conv4(x)
 
-        return x
+        return torch.sigmoid(x)
 
 def resize_with_padding(img, target_size=256, fill=255):
     img = img.copy()

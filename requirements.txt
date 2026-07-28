@@ -94,4 +94,4 @@ typing_extensions==4.16.0
 ultralytics==8.4.95
 ultralytics-thop==2.0.20
 urllib3==2.7.0
-wcwidth==0.8.2
+wcwidth==0.8.2pytest==8.3.3
