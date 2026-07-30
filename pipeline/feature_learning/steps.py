@@ -1,5 +1,9 @@
 """Concrete feature learning steps."""
 
+import math
+
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -40,11 +44,12 @@ class VAE( nn.Module):
             for i, inputs in enumerate(loader):
                 optimizer.zero_grad()
                 outputs, mu, sigma = self(inputs)
-                loss = self._loss_function(outputs, inputs, mu, sigma)
+                beta = self._cyclical_beta(epoch + 1, epochs, M=10)
+                loss = self._loss_function(outputs, inputs, mu, sigma, beta=beta)
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
-            print(f'[epoch {epoch+1}] loss: {train_loss / len(loader):.3f}')
+            print(f'[epoch {epoch+1}] loss: {train_loss / len(loader):.3f}, beta: {beta:.3f}')
 
     def extract_features(self, folder, batch_size=32):
         dataset = ImageFolderDataset(folder)
@@ -60,10 +65,25 @@ class VAE( nn.Module):
         return torch.cat(all_features, dim=0)
 
     @staticmethod
-    def _loss_function(recon_x, x, mu, logvar):
+    def _loss_function(recon_x, x, mu, logvar, beta=1.0):
         BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return BCE + KLD
+        return BCE + beta * KLD
+
+    @staticmethod
+    def _cyclical_beta(epoch, T, M, R=0.5):
+        """
+        epoch: current epoch (1-indexed, matches 'e' in the paper)
+        T: total number of epochs
+        M: number of cycles
+        R: proportion of each cycle spent annealing (fraction that ramps 0->1)
+        """
+        period = T / M
+        tau = ((epoch - 1) % math.ceil(period)) / period
+        if tau <= R:
+            return tau / R          # linear ramp 0 -> 1
+        else:
+            return 1.0              # fixed stage, beta = 1
 
 
 class Encoder(nn.Module):
