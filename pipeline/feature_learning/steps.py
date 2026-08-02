@@ -34,34 +34,44 @@ class VAE( nn.Module):
         return x_reconstructed, mu, sigma
     
     def train_model(self, folder, epochs=10, lr=1e-6, batch_size=32):
+        device = next(self.parameters()).device
         dataset = ImageFolderDataset(folder)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True,
+            num_workers=16, pin_memory=True, persistent_workers=True
+        )
         optimizer = optim.Adam(self.parameters(), lr=lr)
 
         self.train()
         for epoch in range(epochs):
             train_loss = 0.0
+            beta = self._cyclical_beta(epoch+1, epochs, 10)
             for i, inputs in enumerate(loader):
+                inputs = inputs.to(device, non_blocking=True)
                 optimizer.zero_grad()
                 outputs, mu, sigma = self(inputs)
-                beta = self._cyclical_beta(epoch + 1, epochs, M=10)
-                loss = self._loss_function(outputs, inputs, mu, sigma, beta=beta)
+                loss = self._loss_function(outputs, inputs, mu, sigma, beta)
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
-            print(f'[epoch {epoch+1}] loss: {train_loss / len(loader):.3f}, beta: {beta:.3f}')
+            print(f'[epoch {epoch+1}] loss: {train_loss / len(loader):.3f} | beta: {beta:.3f}')
 
     def extract_features(self, folder, batch_size=32):
+        device = next(self.parameters()).device
         dataset = ImageFolderDataset(folder)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=False,
+            num_workers=16, pin_memory=True, persistent_workers=True
+        )
 
         self.eval()
         all_features = []
         with torch.no_grad():
             for inputs in loader:
+                inputs = inputs.to(device, non_blocking=True)
                 mu, sigma = self.encoder(inputs)
                 z = torch.cat([mu, sigma], dim=1)
-                all_features.append(z)
+                all_features.append(z.cpu())
         return torch.cat(all_features, dim=0)
 
     @staticmethod
@@ -203,7 +213,8 @@ def resize_with_padding(img, target_size=256, fill=255):
 
 class ImageFolderDataset(Dataset):
     def __init__(self, folder, target_size=256):
-        self.paths = sorted(Path(folder).glob("*.jpg"))
+        exts = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
+        self.paths = sorted(p for ext in exts for p in Path(folder).glob(ext))
         self.transform = transforms.Compose([
             transforms.Grayscale(num_output_channels=1),
             transforms.Lambda(lambda img: resize_with_padding(img, target_size)),
