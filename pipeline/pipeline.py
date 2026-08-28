@@ -3,10 +3,10 @@ feature learning, clustering, and evaluation."""
 
 from typing import Any, List
 
-from pipeline.clustering.base import ClusteringStep
-from pipeline.evaluation.base import EvaluationStep
-from pipeline.feature_learning.base import FeatureLearningStep
-from pipeline.preprocessing.base import PreprocessingStep
+from pipeline.clustering.clustering_step import ClusteringStep
+from pipeline.evaluation.evaluation_step import EvaluationStep
+from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
+from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 
 
 class Pipeline:

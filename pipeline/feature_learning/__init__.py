@@ -1,4 +1,4 @@
-from pipeline.feature_learning.base import FeatureLearningStep
-from pipeline.feature_learning.steps import VAE
+from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
+from pipeline.feature_learning.vae import VAE
 
 __all__ = ["FeatureLearningStep", "VAE"]

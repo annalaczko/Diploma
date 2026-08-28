@@ -12,9 +12,11 @@ FONTOS: igazitsd az alabbi import sort a sajat projekt struktrurajahoz
 (pl. ha a VAE osztaly masik fajlban van, mint amit korabban kuldtel).
 """
 import pytest
+import numpy as np
 import torch
+from PIL import Image
 
-from pipeline.feature_learning.steps import VAE, Encoder, Decoder
+from pipeline.feature_learning.vae import VAE, Encoder, Decoder
 
 BATCH_SIZE = 4
 IMG_SIZE = 256
@@ -163,6 +165,27 @@ class TestVAEEndToEnd:
             "A decoder kimenete nincs [0,1] tartomanyba szoritva -- "
             "hianyzik egy Sigmoid a conv4 utan, ami a BCE losshoz kell."
         )
+
+
+class TestFeatureExport:
+    def test_extract_features_saves_filename_and_vector_csv(self, vae, tmp_path):
+        image_dir = tmp_path / "images"
+        image_dir.mkdir()
+
+        for i in range(2):
+            img = Image.new("L", (256, 256), color=255 * (i + 1) % 256)
+            img.save(image_dir / f"sample_{i}.png")
+
+        out = vae.extract_features(str(image_dir), batch_size=1, csv_path=str(tmp_path / "features.csv"))
+
+        assert isinstance(out["features"], np.ndarray)
+        assert out["features"].shape[0] == 2
+        assert len(out["filenames"]) == 2
+        assert out["csv_path"].endswith("features.csv")
+
+        csv_lines = (tmp_path / "features.csv").read_text(encoding="utf-8").splitlines()
+        assert csv_lines[0].startswith("filename,")
+        assert "sample_0.png" in csv_lines[1]
 
 
 if __name__ == "__main__":

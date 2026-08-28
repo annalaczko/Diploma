@@ -2,33 +2,21 @@
 each inheriting from PreprocessingStep."""
 from importlib.resources import path
 
-from os import path
+import shutil
+import tempfile
+from xml.parsers.expat import model
 
 import cv2
 import numpy as np
 import os
+import time
+import torch
 from pyparsing import results
+from tornado import gen
 from ultralytics import YOLO
 from tqdm import tqdm
 
-from pipeline.preprocessing.base import PreprocessingStep
-
-
-class ImageEnhancement(PreprocessingStep):
-    """_summary_
-
-    Args:
-        PreprocessingStep (_type_): _description_
-    """
-    def __init__(self, method: str = "denoise", **kwargs):
-        super().__init__()
-        self.method = method
-        self.kwargs = kwargs
-
-    # def run(self, data: Any) -> Any:
-    #     # TODO: implement enhancement (e.g. denoising, contrast normalization)
-    #     return data
-
+from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 
 class BackgroundEraser(PreprocessingStep):
     """ Erases the background of images
@@ -36,147 +24,84 @@ class BackgroundEraser(PreprocessingStep):
     Args:
         PreprocessingStep (_type_): _description_
     """
-    def __init__(self, image_paths=None, mode = 'segmentation', model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt', save_path="/caa/Homes01/alaczko/Diploma/Diploma/data/processed/cleared_images", **kwargs):
+    def __init__(self, input_path=None, mode = 'segmentation', model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt', **kwargs):
         """_summary_
 
         Args:
-            image_paths (_type_, optional): _description_. Defaults to None.
+            input_path (_type_, optional): _description_. Defaults to None.
             mode (str, optional): _description_. Defaults to 'segmentation'.
             model (str, optional): _description_. Defaults to '/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt'.
             save_path (str, optional): _description_. Defaults to '/caa/Homes01/alaczko/Diploma/Diploma/data/processed/cleared_images'.
         """
 
-        super().__init__()
-        self.image_paths = image_paths
-        self.save_path = save_path
+        super().__init__(input_path = input_path)
         self.mode = mode
         self.model = model
         self.kwargs = kwargs
 
-    def run(self, keep_results=False):
-        """ Only public method, which is called by the pipeline. It runs the background erasing process.
-
-        Returns:
-            _type_: _description_
-        """
+    def run(self, keep_results=True):
         model = YOLO(self.model)
-      
-        shards=self._detect_shards(self.image_paths, model)
-        #shards_no_duplicates=self._erase_duplicates(shards)
-        self._clear_images(shards, output_dir=self.save_path)
+        tmp_dir, path_map = self._make_flat_symlink_dir(self.input_path)
+        try:
+            print("_detectshards")
+            shards = self._detect_shards(model, tmp_dir, path_map)
+            print("clearing images")
+            self._clear_images(shards, output_dir=self.output_path, crop=True)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return self.output_path if keep_results else None
 
-        return 0
-    
-    
-    """Concrete preprocessing steps. Add new steps here or in new files,
-each inheriting from PreprocessingStep."""
-from importlib.resources import path
+    def _make_flat_symlink_dir(self, paths):
+        tmp_dir = tempfile.mkdtemp(prefix="yolo_batch_")
+        path_map = {}
+        for i, p in enumerate(paths):
+            ext = os.path.splitext(p)[1]
+            link_path = os.path.join(tmp_dir, f"{i:06d}{ext}")
+            os.symlink(p, link_path)
+            path_map[link_path] = p
+        return tmp_dir, path_map
 
-from os import path
+    def _detect_shards(self, model, tmp_dir, path_map, batch_size=256):
+        device = self.kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
 
-import cv2
-import numpy as np
-import os
-from pyparsing import results
-from ultralytics import YOLO
-from tqdm import tqdm
+        try:
+            model_results = model.predict(
+                tmp_dir,
+                verbose=False,
+                batch=batch_size,
+                iou=0.3,
+                stream=True,
+                device=device,
+            )
+        except Exception as e:
+            print(f"Error when calling model.predict: {e}")
+            raise
 
-from pipeline.preprocessing.base import PreprocessingStep
-
-
-class ImageEnhancement(PreprocessingStep):
-    """_summary_
-
-    Args:
-        PreprocessingStep (_type_): _description_
-    """
-    def __init__(self, method: str = "denoise", **kwargs):
-        super().__init__()
-        self.method = method
-        self.kwargs = kwargs
-
-    # def run(self, data: Any) -> Any:
-    #     # TODO: implement enhancement (e.g. denoising, contrast normalization)
-    #     return data
-
-
-class BackgroundEraser(PreprocessingStep):
-    """ Erases the background of images
-
-    Args:
-        PreprocessingStep (_type_): _description_
-    """
-    def __init__(self, image_paths=None, mode = 'segmentation', model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt', save_path="/caa/Homes01/alaczko/Diploma/Diploma/data/processed/cleared_images", **kwargs):
-        """_summary_
-
-        Args:
-            image_paths (_type_, optional): _description_. Defaults to None.
-            mode (str, optional): _description_. Defaults to 'segmentation'.
-            model (str, optional): _description_. Defaults to '/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt'.
-            save_path (str, optional): _description_. Defaults to '/caa/Homes01/alaczko/Diploma/Diploma/data/processed/cleared_images'.
-        """
-
-        super().__init__()
-        self.image_paths = image_paths
-        self.save_path = save_path
-        self.mode = mode
-        self.model = model
-        self.kwargs = kwargs
-
-    def run(self, keep_results=False):
-        """ Only public method, which is called by the pipeline. It runs the background erasing process.
-
-        Returns:
-            _type_: _description_
-        """
-        model = YOLO(self.model)
-      
-        shards=self._detect_shards(self.image_paths, model)
-        #shards_no_duplicates=self._erase_duplicates(shards)
-        self._clear_images(shards, output_dir=self.save_path)
-
-        return 0
-    
-    
-    def _detect_shards(self, image_paths, model):
-        """ detects the shards in the images using the provided model and returns the results in a formatted way.
-
-        Args:
-            image_paths (_type_): image paths to be processed
-            model (_type_): model to be used for detection
-
-        Raises:
-            NotImplementedError: _description_
-
-        Returns:
-            _type_: _description_
-        """
-
-        model_results = model.predict(image_paths, verbose=True, batch=32, iou=0.3)
         results_formatted = []
         failed_paths = []
 
-        for image_path, model_result in tqdm(
-            zip(image_paths, model_results),
-            total=len(image_paths),
-            desc="Detecting shards"
+        for idx, model_result in enumerate(
+            tqdm(model_results, total=len(path_map), desc="Detecting shards", unit="image")
         ):
-            result = {}
-            result['path'] = image_path
+            symlink_path = model_result.path
+            original_path = path_map.get(symlink_path, symlink_path)
+            try:
+                result = {"path": original_path}
+                if self.mode == "segmentation":
+                    if getattr(model_result, "masks", None) is None:
+                        failed_paths.append(original_path)
+                        continue
+                    result["masks"] = model_result.masks.xy
+                    result["boxes"] = model_result.boxes.xyxy
+                elif self.mode == "detection":
+                    raise NotImplementedError("Detection mode not implemented yet.")
+                results_formatted.append(result)
+            except Exception as e:
+                print(f"Error processing image {original_path} (index {idx}): {e}")
+                failed_paths.append(original_path)
 
-            if self.mode == 'segmentation':
-                if model_result.masks is None:
-                    failed_paths.append(image_path)
-                    continue  # skip this image, no mask detected
-                result['masks'] = model_result.masks.xy
-                result['boxes'] = model_result.boxes.xyxy
-            elif self.mode == 'detection':
-                raise NotImplementedError("Detection mode not implemented yet.")
-
-            results_formatted.append(result)
-
+        print(f"Detected {len(results_formatted)} shard(s), failed on {len(failed_paths)}")
         if failed_paths:
-            print(f"Warning: no mask detected for {len(failed_paths)} image(s):")
             for p in failed_paths:
                 print(f"  - {p}")
 

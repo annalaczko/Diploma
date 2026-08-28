@@ -1,3 +1,3 @@
-from pipeline.steps.base import Step
+from pipeline.steps.step import Step
 
 __all__ = ["Step"]

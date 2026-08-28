@@ -1,7 +1,6 @@
 """Concrete feature learning steps."""
 
-import math
-
+import csv
 import math
 
 import numpy as np
@@ -15,7 +14,7 @@ from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from pipeline.feature_learning.base import FeatureLearningStep
+from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 
 class VAE( nn.Module):
     def __init__(self, f=4, n=3, s=1, k=128):
@@ -36,6 +35,7 @@ class VAE( nn.Module):
     def train_model(self, folder, epochs=10, lr=1e-6, batch_size=32):
         device = next(self.parameters()).device
         dataset = ImageFolderDataset(folder)
+        print(f"Dataset size: {dataset.__len__()}")
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True,
             num_workers=16, pin_memory=True, persistent_workers=True
@@ -56,7 +56,14 @@ class VAE( nn.Module):
                 train_loss += loss.item()
             print(f'[epoch {epoch+1}] loss: {train_loss / len(loader):.3f} | beta: {beta:.3f}')
 
-    def extract_features(self, folder, batch_size=32):
+    def extract_features(self, folder, batch_size=32, csv_path=None):
+        """Extract latent vectors and optionally save them with filenames as CSV.
+
+        Returns a dict containing:
+            - filenames: list of image filenames in the same order as features
+            - features: numpy array of shape (N, D)
+            - csv_path: saved CSV path or None
+        """
         device = next(self.parameters()).device
         dataset = ImageFolderDataset(folder)
         loader = torch.utils.data.DataLoader(
@@ -64,15 +71,32 @@ class VAE( nn.Module):
             num_workers=16, pin_memory=True, persistent_workers=True
         )
 
+        filenames = [Path(p).name.rsplit(".", 1)[0] for p in dataset.paths]
         self.eval()
         all_features = []
         with torch.no_grad():
             for inputs in loader:
                 inputs = inputs.to(device, non_blocking=True)
-                mu, sigma = self.encoder(inputs)
-                z = torch.cat([mu, sigma], dim=1)
-                all_features.append(z.cpu())
-        return torch.cat(all_features, dim=0)
+                mu, _ = self.encoder(inputs)
+                all_features.append(mu.cpu())
+
+        features = torch.cat(all_features, dim=0).numpy()
+
+        if csv_path is not None:
+            csv_path = Path(csv_path)
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["filename"] + [f"feature_{idx}" for idx in range(features.shape[1])])
+                for name, vector in zip(filenames, features):
+                    writer.writerow([name] + vector.tolist())
+
+        return {
+            "filenames": filenames,
+            "features": features,
+            "csv_path": str(csv_path) if csv_path is not None else None,
+        }
 
     @staticmethod
     def _loss_function(recon_x, x, mu, logvar, beta=1.0):

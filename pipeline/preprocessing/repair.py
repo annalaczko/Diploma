@@ -1,0 +1,293 @@
+"""Repair step: full pre-skeleton-repair pipeline.
+
+Reproduces the notebook workflow as a single pipeline step:
+
+    1. Contrast enhancement (ImageEnhance.Contrast)
+    2. Otsu threshold (inverted: dark lines on light background -> white
+       lines on black background) + dilation to pre-close small gaps
+    3. Skeletonization (skimage.morphology.skeletonize)
+    4. Endpoint-based gap repair: finds skeleton endpoints and joins
+       nearby pairs with a straight line, then (optionally)
+       re-skeletonizes so the output stays a clean 1px skeleton.
+
+Each stage is also exposed as its own method, so it can be reused or
+tested independently of the full `run` pipeline.
+"""
+
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+from PIL import Image, ImageEnhance
+from scipy.ndimage import convolve
+from scipy.spatial.distance import cdist
+from skimage.filters import threshold_otsu
+from skimage.morphology import skeletonize
+from tqdm import tqdm
+
+from pipeline.preprocessing.preprocessing_step import PreprocessingStep  # adjust import to match your actual module path
+
+
+class Repair(PreprocessingStep):
+    """Cleans up and repairs broken hand-drawn/scanned line skeletons.
+
+    Config (all optional, sensible defaults provided):
+        contrast_factor: factor passed to ImageEnhance.Contrast; higher
+            values push mid-tones toward pure black/white.
+        dilate_kernel_size: side length of the square structuring
+            element used before skeletonization, to pre-close small
+            gaps (e.g. 3 for a (3,3) kernel).
+        dilate_iterations: number of dilation iterations applied with
+            that kernel.
+        max_distance: maximum pixel distance between two skeleton
+            endpoints for them to be joined during the repair step.
+        line_thickness: thickness (in px) of the connecting line drawn
+            between matched endpoints.
+        min_component_size: connected components smaller than this
+            (in px) are treated as noise and removed before repairing.
+            Set to 0 to disable this noise-filtering step.
+        re_skeletonize: if True, re-thin the result after connecting
+            gaps, so the output stays a clean 1px skeleton instead of
+            having slightly thicker joins.
+        output_thickness: final line thickness (in px) of the output
+            image. 1 keeps the raw 1px skeleton; any larger odd value
+            (3, 5, ...) dilates the repaired skeleton uniformly to
+            that width as the very last step.
+        image_extensions: file suffixes considered as input images
+            when input_path points to a directory.
+    """
+
+    def __init__(
+        self,
+        input_path: str,
+        output_path: str | None = None,
+        name: str | None = None,
+        delete_input_data: bool = False,
+        run_id: str = "default_run",
+        contrast_factor: float = 10.0,
+        dilate_kernel_size: int = 3,
+        dilate_iterations: int = 3,
+        max_distance: int = 15,
+        line_thickness: int = 1,
+        min_component_size: int = 0,
+        re_skeletonize: bool = True,
+        output_thickness: int = 1,
+        image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
+    ):
+        super().__init__(
+            input_path=input_path,
+            output_path=output_path,
+            name=name,
+            delete_input_data=delete_input_data,
+            run_id=run_id,
+        )
+        self.contrast_factor = contrast_factor
+        self.dilate_kernel_size = dilate_kernel_size
+        self.dilate_iterations = dilate_iterations
+        self.max_distance = max_distance
+        self.line_thickness = line_thickness
+        self.min_component_size = min_component_size
+        self.re_skeletonize = re_skeletonize
+        self.output_thickness = output_thickness
+        self.image_extensions = image_extensions
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+
+    def run(self) -> Path:
+        """Process one image or every image found under `input_path`.
+
+        `data` is currently unused (kept for interface compatibility
+        with the rest of the pipeline) - the step reads directly from
+        `self.input_path`. Returns `self.output_path`.
+        """
+        input_paths = self._collect_image_paths(self.input_path)
+        output_dir = Path(self.output_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if not input_paths:
+            source_description = self.input_path if isinstance(self.input_path, (list, tuple)) else Path(self.input_path)
+            raise FileNotFoundError(
+                f"No existing images with extensions {self.image_extensions} found under {source_description}"
+            )
+
+        for image_path in tqdm(input_paths, desc="Repairing images", unit="image"):
+            img = Image.open(image_path).convert("L")
+            repaired = self.process_image(img)
+
+            out_path = output_dir / image_path.name
+            Image.fromarray(repaired).save(out_path)
+
+        if self.delete_input_data_flag:
+            self.delete_input_data()
+
+        return output_dir
+
+    def process_image(self, img: Image.Image) -> np.ndarray:
+        """Full pipeline on a single raw (grayscale) PIL image.
+
+        contrast enhance -> threshold + dilate -> skeletonize -> repair gaps.
+        Returns a uint8 array (0/255), the final repaired skeleton.
+        """
+        enhanced = self.enhance_contrast(img)
+        dilated = self.threshold_and_dilate(enhanced)
+        skeleton = self.to_skeleton(dilated)
+        repaired = self.repair_skeleton(skeleton)
+
+        if self.output_thickness > 1:
+            repaired = self.thicken(repaired, self.output_thickness)
+
+        return repaired
+
+    # ------------------------------------------------------------------ #
+    # Pipeline stages (each also usable standalone)
+    # ------------------------------------------------------------------ #
+
+    def enhance_contrast(self, img: Image.Image) -> Image.Image:
+        """Stage 1: push the image toward pure black/white via contrast enhancement."""
+        return ImageEnhance.Contrast(img).enhance(self.contrast_factor)
+
+    def threshold_and_dilate(self, img: Image.Image) -> np.ndarray:
+        """Stage 2: Otsu-binarize (dark lines on light bg -> white lines on
+        black bg) and dilate to pre-close small gaps before skeletonization.
+        """
+        img_arr = np.array(img)
+        _, binary = cv2.threshold(img_arr, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        kernel = np.ones((self.dilate_kernel_size, self.dilate_kernel_size), np.uint8)
+        dilated = cv2.dilate(binary, kernel, iterations=self.dilate_iterations)
+        return dilated
+
+    def to_skeleton(self, binary_arr: np.ndarray) -> np.ndarray:
+        """Stage 3: thin a binary (white lines on black bg) image to a 1px skeleton.
+
+        Note: expects white lines (255) on a black background (0), i.e. the
+        output convention of `threshold_and_dilate`. Uses Otsu again on the
+        already-binary array, which simply reproduces the 0/255 split.
+        """
+        thresh = threshold_otsu(binary_arr)
+        binary = binary_arr > thresh  # True where the (white) line is
+        skeleton = skeletonize(binary)
+        return (skeleton * 255).astype(np.uint8)
+
+    def repair_skeleton(self, skeleton: np.ndarray) -> np.ndarray:
+        """Stage 4: connect nearby endpoints to close remaining gaps.
+
+        Steps: optional noise removal -> endpoint detection ->
+        nearest-endpoint connection -> optional re-skeletonization.
+        """
+        binary = (skeleton > 0).astype(np.uint8) * 255
+
+        if self.min_component_size > 0:
+            binary = self._remove_small_components(binary, self.min_component_size)
+
+        connected = self._connect_nearby_endpoints(
+            binary, max_distance=self.max_distance, thickness=self.line_thickness
+        )
+
+        if self.re_skeletonize:
+            thin = skeletonize(connected > 0)
+            connected = (thin * 255).astype(np.uint8)
+
+        return connected
+
+    def thicken(self, binary: np.ndarray, thickness: int) -> np.ndarray:
+        """Stage 5 (optional): uniformly thicken a 1px skeleton to `thickness` px.
+
+        Dilates the skeleton with a `thickness`x`thickness` kernel, which
+        turns each 1px-wide line into an approximately `thickness`-px-wide
+        line, centered on the original skeleton path.
+        """
+        if thickness <= 1:
+            return binary
+        kernel = np.ones((thickness, thickness), np.uint8)
+        return cv2.dilate(binary, kernel, iterations=1)
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _collect_image_paths(self, input_value: str | Path | list[str | Path] | tuple[str | Path, ...]) -> list[Path]:
+        """Collect every existing image under the provided input path(s).
+
+        Supports a single path or a list/tuple of paths. Missing entries are ignored
+        and only actual existing files/directories are processed.
+        """
+        candidates = input_value if isinstance(input_value, (list, tuple)) else [input_value]
+        collected: list[Path] = []
+        seen: set[str] = set()
+
+        for raw_path in candidates:
+            path = Path(raw_path)
+            if not path.exists():
+                continue
+
+            if path.is_file():
+                if path.suffix.lower() in self.image_extensions:
+                    resolved = path.resolve()
+                    if str(resolved) not in seen:
+                        seen.add(str(resolved))
+                        collected.append(path)
+                continue
+
+            for nested in sorted(path.rglob("*")):
+                if not nested.is_file():
+                    continue
+                if nested.suffix.lower() not in self.image_extensions:
+                    continue
+                resolved = nested.resolve()
+                if str(resolved) not in seen:
+                    seen.add(str(resolved))
+                    collected.append(nested)
+
+        return collected
+
+    @staticmethod
+    def _remove_small_components(binary: np.ndarray, min_size: int) -> np.ndarray:
+        """Drop connected components smaller than `min_size` pixels (noise removal)."""
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        cleaned = np.zeros_like(binary)
+        for i in range(1, n_labels):  # 0 = background
+            if stats[i, cv2.CC_STAT_AREA] >= min_size:
+                cleaned[labels == i] = 255
+        return cleaned
+
+    @staticmethod
+    def _find_skeleton_endpoints(skeleton: np.ndarray) -> np.ndarray:
+        """Return (row, col) coordinates of skeleton endpoints
+        (skeleton pixels with exactly one skeleton neighbour)."""
+        skel = (skeleton > 0).astype(np.uint8)
+        kernel = np.array([[1, 1, 1], [1, 10, 1], [1, 1, 1]])
+        neighbor_count = convolve(skel, kernel, mode="constant", cval=0)
+        # value 11 = the pixel itself (10) plus exactly 1 neighbour
+        endpoints = np.argwhere(neighbor_count == 11)
+        return endpoints
+
+    def _connect_nearby_endpoints(
+        self, skeleton: np.ndarray, max_distance: int, thickness: int = 1
+    ) -> np.ndarray:
+        """Join each endpoint to its nearest endpoint if within `max_distance`."""
+        result = skeleton.copy()
+        endpoints = self._find_skeleton_endpoints(skeleton)
+
+        if len(endpoints) < 2:
+            return result
+
+        dist_matrix = cdist(endpoints, endpoints)
+        np.fill_diagonal(dist_matrix, np.inf)
+
+        connected: set[int] = set()
+        for i in range(len(endpoints)):
+            if i in connected:
+                continue
+            j = int(np.argmin(dist_matrix[i]))
+            if dist_matrix[i, j] <= max_distance and j not in connected:
+                pt1 = tuple(endpoints[i][::-1])  # (row, col) -> (x, y) for cv2
+                pt2 = tuple(endpoints[j][::-1])
+                cv2.line(result, pt1, pt2, 255, thickness=thickness)
+                connected.add(i)
+                connected.add(j)
+
+        return result

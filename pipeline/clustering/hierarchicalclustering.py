@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from pipeline.clustering.base import ClusteringStep
+from pipeline.clustering.clustering_step import ClusteringStep
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import pdist
 
@@ -17,9 +17,7 @@ class HierarchicalClustering(ClusteringStep):
         _type_: _description_
     """
 
-    # TODO: tests
-
-    def __init__(self, vectors):
+    def __init__(self, vectors, cluster_num=30):
 
         """
         Initialization. We build this on scipy and have only the methods imported that Parisotto used right now. 
@@ -32,6 +30,8 @@ class HierarchicalClustering(ClusteringStep):
 
         self.best_method = 'average'
         self.best_metric = 'euclidean'
+        self.cluster_num = cluster_num
+
 
     def run(self):
 
@@ -44,7 +44,7 @@ class HierarchicalClustering(ClusteringStep):
                     which original observation i belongs.
         """
 
-        result = hierarchy.fclusterdata(self.vectors, metric=self.best_metric, method=self.best_method)
+        result = hierarchy.fclusterdata(self.vectors, t=self.cluster_num, criterion="maxclust", metric=self.best_metric, method=self.best_method)
         return result
     
     def compare_all(self):
