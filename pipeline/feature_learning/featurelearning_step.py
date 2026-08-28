@@ -45,3 +45,11 @@ class FeatureLearningStep(Step):
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1
         return vectors / norms
+
+    def return_feature_df(self, ) -> pd.DataFrame:
+        """Return the extracted features and optionally save themto a CSV file."""
+        if self.save_results:
+            output_file = Path(self.output_path) / "features.csv"
+            features.to_csv(output_file, index=False)
+            print(f"Features saved to {output_file}")
+        return features
