@@ -32,6 +32,7 @@ class VAE(nn.Module, FeatureLearningStep):
         name=None,
         delete_input_data=False,
         save_results=False,
+        run_id="default_run",
     ):
         nn.Module.__init__(self)
         FeatureLearningStep.__init__(
@@ -41,6 +42,7 @@ class VAE(nn.Module, FeatureLearningStep):
             name=name,
             delete_input_data=delete_input_data,
             save_results=save_results,
+            run_id=run_id,
         )
         self.encoder = Encoder(f, n, s, k)
         self.decoder = Decoder(f, n, s, k)

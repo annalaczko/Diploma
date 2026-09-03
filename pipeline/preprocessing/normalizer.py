@@ -23,6 +23,7 @@ class Normalizer(PreprocessingStep):
         target_size: int = 256,
         background_color=(0, 0, 0),
         image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
+        rename=False,
         **kwargs,
     ):
         super().__init__(
@@ -36,7 +37,7 @@ class Normalizer(PreprocessingStep):
         self.target_size = target_size
         self.background_color = background_color
         self.image_extensions = image_extensions
-
+        self.rename = rename
     def run(self) -> Path:
         """Pad each image to a square, resize to 256x256, and save under output_path."""
         output_dir = Path(self.output_path)

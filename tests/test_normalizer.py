@@ -2,7 +2,25 @@ from pathlib import Path
 
 from PIL import Image
 
+from pipeline.preprocessing.background_eraser import BackgroundEraser
 from pipeline.preprocessing.normalizer import Normalizer
+
+
+def test_background_eraser_collects_images_recursively_from_directory(tmp_path):
+    source_dir = tmp_path / "source"
+    nested_dir = source_dir / "nested"
+    nested_dir.mkdir(parents=True)
+
+    img_a = Image.new("RGB", (40, 40), color=(10, 20, 30))
+    img_b = Image.new("RGB", (50, 50), color=(40, 50, 60))
+    img_a.save(source_dir / "a.png")
+    img_b.save(nested_dir / "b.png")
+
+    eraser = BackgroundEraser(input_path=str(source_dir), output_path=str(tmp_path / "out"))
+    paths = eraser._collect_image_paths(eraser.input_path)
+
+    assert {p.name for p in paths} == {"a.png", "b.png"}
+    assert all(p.exists() for p in paths)
 
 
 def test_normalizer_pads_and_resizes_images(tmp_path):

@@ -23,6 +23,7 @@ class PreprocessingStep(Step):
         name: str | None = None,
         delete_input_data: bool = False,
         save_results: bool = True,
+        run_id: str | None = None,
     ):
         super().__init__(
             input_path=input_path,
@@ -30,6 +31,7 @@ class PreprocessingStep(Step):
             name=name,
             delete_input_data=delete_input_data,
             save_results=save_results,
+            run_id=run_id,
         )
 
     @abstractmethod

@@ -1,6 +1,7 @@
 """Concrete preprocessing steps. Add new steps here or in new files,
 each inheriting from PreprocessingStep."""
 from importlib.resources import path
+from pathlib import Path
 
 import shutil
 import tempfile
@@ -24,24 +25,37 @@ class BackgroundEraser(PreprocessingStep):
     Args:
         PreprocessingStep (_type_): _description_
     """
-    def __init__(self, input_path=None, mode = 'segmentation', model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt', **kwargs):
+    def __init__(self, 
+                 input_path=None, 
+                 mode = 'segmentation', 
+                 model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt', 
+                 run_id="default_run",
+                 image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
+                 **kwargs):
         """_summary_
 
         Args:
-            input_path (_type_, optional): _description_. Defaults to None.
+            input_path (_type_, optional): path to the root folder containing images. Defaults to None.
             mode (str, optional): _description_. Defaults to 'segmentation'.
             model (str, optional): _description_. Defaults to '/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt'.
             save_path (str, optional): _description_. Defaults to '/caa/Homes01/alaczko/Diploma/Diploma/data/processed/cleared_images'.
         """
 
-        super().__init__(input_path = input_path)
+        super().__init__(input_path=input_path, run_id=run_id)
         self.mode = mode
         self.model = model
         self.kwargs = kwargs
+        self.image_extensions = image_extensions
 
     def run(self, keep_results=True):
+        image_paths = self._collect_image_paths(self.input_path)
+        if not image_paths:
+            raise FileNotFoundError(
+                f"No existing images with extensions {self.image_extensions} found under {self.input_path}"
+            )
+
         model = YOLO(self.model)
-        tmp_dir, path_map = self._make_flat_symlink_dir(self.input_path)
+        tmp_dir, path_map = self._make_flat_symlink_dir(image_paths)
         try:
             print("_detectshards")
             shards = self._detect_shards(model, tmp_dir, path_map)
@@ -51,14 +65,40 @@ class BackgroundEraser(PreprocessingStep):
             shutil.rmtree(tmp_dir, ignore_errors=True)
         return self.output_path if keep_results else None
 
+    def _collect_image_paths(self, input_value) -> list[Path]:
+        """Collect all valid image files recursively below a root directory."""
+        if input_value is None:
+            return []
+
+        root = Path(input_value)
+        if not root.exists():
+            return []
+
+        if root.is_file():
+            return [root] if root.suffix.lower() in self.image_extensions else []
+
+        collected: list[Path] = []
+        seen: set[str] = set()
+        for nested in sorted(root.rglob("*")):
+            if not nested.is_file():
+                continue
+            if nested.suffix.lower() not in self.image_extensions:
+                continue
+            resolved = nested.resolve()
+            if str(resolved) not in seen:
+                seen.add(str(resolved))
+                collected.append(nested)
+        return collected
+
     def _make_flat_symlink_dir(self, paths):
         tmp_dir = tempfile.mkdtemp(prefix="yolo_batch_")
         path_map = {}
         for i, p in enumerate(paths):
-            ext = os.path.splitext(p)[1]
+            path = Path(p)
+            ext = path.suffix
             link_path = os.path.join(tmp_dir, f"{i:06d}{ext}")
-            os.symlink(p, link_path)
-            path_map[link_path] = p
+            os.symlink(str(path), link_path)
+            path_map[link_path] = str(path)
         return tmp_dir, path_map
 
     def _detect_shards(self, model, tmp_dir, path_map, batch_size=256):

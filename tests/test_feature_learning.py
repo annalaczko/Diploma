@@ -12,10 +12,12 @@ FONTOS: igazitsd az alabbi import sort a sajat projekt struktrurajahoz
 (pl. ha a VAE osztaly masik fajlban van, mint amit korabban kuldtel).
 """
 import pytest
+import pandas as pd
 import numpy as np
 import torch
 from PIL import Image
 
+from pipeline.clustering.hierarchical_clustering import HierarchicalClustering
 from pipeline.feature_learning.vae import VAE, Encoder, Decoder
 
 BATCH_SIZE = 4
