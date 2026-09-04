@@ -12,19 +12,23 @@ import pandas as pd
 
 
 class HierarchicalClustering(ClusteringStep):
-    """ Does the hierarchical clustering, and evaluates the results via the metrics used by Parisotto
-
-    Args:
-        ClusteringStep (_type_): _description_
-
-    Returns:
-        _type_: _description_
+    """Hierarchical clustering over precomputed feature vectors, built on
+    scipy. Supports the same linkage methods and distance metrics used by
+    Parisotto, and can sweep all of their combinations to pick the best one
+    by cophenetic correlation (see `compare_all`).
     """
 
     def __init__(self, input_path, cluster_num=30, method=None, metric=None):
-
         """
-        Initialization. We build this on scipy and have only the methods imported that Parisotto used right now. 
+        Args:
+            input_path: CSV path with a 'features' column, as produced by
+                a feature-learning step (each cell holding a bracketed,
+                comma/space-separated vector string).
+            cluster_num: number of flat clusters to extract in `run`.
+            method: scipy linkage method to use; falls back to 'average'
+                if not one of `self.methods`.
+            metric: scipy distance metric to use; falls back to 'euclidean'
+                if not one of `self.metrics`.
         """
 
         super().__init__(input_path=input_path, output_path=None, name=None, delete_input_data=False, save_results=True)

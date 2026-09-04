@@ -20,6 +20,7 @@ from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
 
 
 class ClassificationDataset(Dataset):
@@ -80,13 +81,17 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             for parameter in self.encoder.parameters():
                 parameter.requires_grad = False
 
-        hidden_size = max(latent_size // 2, 32)
+        hidden_size_1 = max(latent_size // 2, 32)
+        hidden_size_2 = max(hidden_size_1 // 2, 32)
         self.classifier = nn.Sequential(
             nn.LayerNorm(latent_size),
-            nn.Linear(latent_size, hidden_size),
+            nn.Linear(latent_size, hidden_size_1),
             nn.ReLU(),
             nn.Dropout(p=0.3),
-            nn.Linear(hidden_size, num_classes),
+            nn.Linear(hidden_size_1, hidden_size_2),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+            nn.Linear(hidden_size_2, num_classes),
         )
 
     def forward(self, x):
@@ -100,6 +105,11 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         batch_size=64,
         validation_size=0.2,
         num_workers=0,
+        early_stopping_patience=15,
+        early_stopping_min_delta=0.0,
+        early_stopping_smoothing_window=10,
+        class_weighted_loss=True,
+        min_samples_per_class=10,
     ) -> pd.DataFrame:
 
         # Checking label path correctness and reading labels
@@ -147,31 +157,15 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
 
         labels = [labels_by_id[path.stem] for path in paths]
 
-        label_counts = pd.Series(labels).value_counts()
-        valid_labels = label_counts[label_counts >= 2].index
-        valid_labels = set(valid_labels.tolist())
-
-        filtered_data = [
-            (path, label)
-            for path, label in zip(paths, labels)
-            if label in valid_labels
-        ]
-        if not filtered_data:
-            raise ValueError("No classes with at least two labelled images found")
-
-        paths, labels = zip(*filtered_data)
-        paths = list(paths)
-
-        label_order = sorted(valid_labels)
-        label_mapping = {
-            label: index for index, label in enumerate(label_order)
-        }
-        labels = [label_mapping[label] for label in labels]
+        paths, labels, label_order = self._filter_rare_classes(
+            paths, labels, min_samples_per_class
+        )
 
         classes = encoder.classes_[label_order]
+        self.classes_ = classes.tolist()
         print(
             f"Using {len(classes)} classes and {len(paths)} labelled images "
-            "after excluding singleton classes"
+            f"after excluding classes with fewer than {min_samples_per_class} samples"
         )
         classifier_device = next(self.parameters()).device
         self.classifier[-1] = nn.Linear(
@@ -188,6 +182,9 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             random_state=42,
             stratify=labels,
         )
+        # Kept for downstream evaluation (e.g. confusion matrix) once run() returns.
+        self.val_paths_ = val_paths
+        self.val_labels_ = val_labels
 
         loader_kwargs = {
             "batch_size": batch_size,
@@ -208,7 +205,20 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         )
 
         device = next(self.parameters()).device
-        criterion = nn.CrossEntropyLoss()
+
+        if class_weighted_loss:
+            # Inverse-frequency weighting so rare classes contribute as much
+            # to the loss as common ones, computed on the train split only
+            # (val stays untouched so val_acc reflects true performance).
+            class_weights = compute_class_weight(
+                class_weight="balanced",
+                classes=np.arange(len(classes)),
+                y=train_labels,
+            )
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
+            criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        else:
+            criterion = nn.CrossEntropyLoss()
 
         optimizer = optim.Adam(
             filter(lambda p: p.requires_grad, self.parameters()),
@@ -216,6 +226,11 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         )
 
         history = []
+        val_acc_history = []
+        best_smoothed_val_acc = -1.0
+        best_epoch = 0
+        best_state_dict = None
+        epochs_without_improvement = 0
 
         for epoch in range(epochs):
             self.train()
@@ -265,19 +280,50 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             val_acc = val_correct / val_count
             average_loss = train_loss / train_count
 
+            val_acc_history.append(val_acc)
+            smoothed_val_acc = sum(
+                val_acc_history[-early_stopping_smoothing_window:]
+            ) / len(val_acc_history[-early_stopping_smoothing_window:])
+
             history.append({
                 "epoch": epoch + 1,
                 "loss": average_loss,
                 "train_accuracy": train_acc,
                 "validation_accuracy": val_acc,
+                "validation_accuracy_smoothed": smoothed_val_acc,
             })
 
             print(
                 f"[{epoch + 1}/{epochs}] "
                 f"loss={average_loss:.4f} | "
                 f"train_acc={train_acc:.4f} | "
-                f"val_acc={val_acc:.4f}"
+                f"val_acc={val_acc:.4f} | "
+                f"val_acc_smoothed={smoothed_val_acc:.4f}"
             )
+
+            # Early stopping runs on the moving average of val_acc rather
+            # than the raw per-epoch value, so a single noisy epoch can't
+            # trigger it while the underlying trend is still improving.
+            if smoothed_val_acc > best_smoothed_val_acc + early_stopping_min_delta:
+                best_smoothed_val_acc = smoothed_val_acc
+                best_epoch = epoch + 1
+                best_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.state_dict().items()
+                }
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= early_stopping_patience:
+                    print(
+                        f"Early stopping at epoch {epoch + 1} "
+                        f"(no improvement in smoothed val_acc for {early_stopping_patience} epochs, "
+                        f"best smoothed={best_smoothed_val_acc:.4f} @ epoch {best_epoch})"
+                    )
+                    break
+
+        if best_state_dict is not None:
+            self.load_state_dict(best_state_dict)
 
         output_dir = Path(self.output_path or "classifier_results")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -294,6 +340,58 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         history_df.to_csv(output_dir / "training_history.csv", index=False)
 
         return history_df
+
+    @staticmethod
+    def _filter_rare_classes(paths, labels, min_samples_per_class):
+        """Drop samples belonging to classes with fewer than
+        `min_samples_per_class` labelled images, then remap the surviving
+        class ids to a dense 0..N-1 range (required since the classifier's
+        output layer size and CrossEntropyLoss both assume contiguous ids).
+
+        Args:
+            paths: sequence of image paths, one per sample.
+            labels: sequence of original (encoder-assigned) label ids,
+                aligned with `paths`.
+            min_samples_per_class: classes with fewer labelled images than
+                this are dropped entirely. Must be >= 2, since the
+                downstream stratified train/val split requires at least
+                two samples per class.
+
+        Returns:
+            (filtered_paths, remapped_labels, label_order) where
+            label_order is the sorted list of original label ids that
+            survived filtering; remapped_labels[i] indexes into
+            label_order (i.e. `label_order[remapped_labels[i]]` recovers
+            the original label id for filtered_paths[i]).
+        """
+        if min_samples_per_class < 2:
+            raise ValueError(
+                "min_samples_per_class must be >= 2 for a stratified "
+                f"train/val split, got {min_samples_per_class}"
+            )
+
+        label_counts = pd.Series(labels).value_counts()
+        valid_labels = set(
+            label_counts[label_counts >= min_samples_per_class].index.tolist()
+        )
+
+        filtered_data = [
+            (path, label)
+            for path, label in zip(paths, labels)
+            if label in valid_labels
+        ]
+        if not filtered_data:
+            raise ValueError(
+                f"No classes with at least {min_samples_per_class} labelled images found"
+            )
+
+        filtered_paths, filtered_labels = zip(*filtered_data)
+
+        label_order = sorted(valid_labels)
+        label_mapping = {label: index for index, label in enumerate(label_order)}
+        remapped_labels = [label_mapping[label] for label in filtered_labels]
+
+        return list(filtered_paths), remapped_labels, label_order
 
 class VAE(nn.Module, FeatureLearningStep):
 

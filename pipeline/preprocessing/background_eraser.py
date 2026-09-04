@@ -1,44 +1,39 @@
 """Concrete preprocessing steps. Add new steps here or in new files,
 each inheriting from PreprocessingStep."""
-from importlib.resources import path
 from pathlib import Path
 
 import shutil
 import tempfile
-from xml.parsers.expat import model
 
 import cv2
 import numpy as np
 import os
-import time
 import torch
-from pyparsing import results
-from tornado import gen
 from ultralytics import YOLO
 from tqdm import tqdm
 
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 
 class BackgroundEraser(PreprocessingStep):
-    """ Erases the background of images
-
-    Args:
-        PreprocessingStep (_type_): _description_
+    """Runs a YOLO segmentation model on each image, whites out everything
+    outside the detected shard mask, and (optionally) crops to a square
+    canvas centered on the detection box.
     """
-    def __init__(self, 
-                 input_path=None, 
-                 mode = 'segmentation', 
-                 model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt', 
+    def __init__(self,
+                 input_path=None,
+                 mode = 'segmentation',
+                 model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt',
                  run_id="default_run",
                  image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
                  **kwargs):
-        """_summary_
-
+        """
         Args:
-            input_path (_type_, optional): path to the root folder containing images. Defaults to None.
-            mode (str, optional): _description_. Defaults to 'segmentation'.
-            model (str, optional): _description_. Defaults to '/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt'.
-            save_path (str, optional): _description_. Defaults to '/caa/Homes01/alaczko/Diploma/Diploma/data/processed/cleared_images'.
+            input_path: path to the root folder containing images. Defaults to None.
+            mode: detection mode; only 'segmentation' is implemented. Defaults to 'segmentation'.
+            model: path to the YOLO segmentation weights to use.
+            run_id: identifier used to namespace the default output path (see Step).
+            image_extensions: file suffixes treated as input images.
+            **kwargs: extra options, e.g. device='cuda'/'cpu' for inference.
         """
 
         super().__init__(input_path=input_path, run_id=run_id)
@@ -57,9 +52,9 @@ class BackgroundEraser(PreprocessingStep):
         model = YOLO(self.model)
         tmp_dir, path_map = self._make_flat_symlink_dir(image_paths)
         try:
-            print("_detectshards")
+            print("Detecting shards...")
             shards = self._detect_shards(model, tmp_dir, path_map)
-            print("clearing images")
+            print("Clearing images...")
             self._clear_images(shards, output_dir=self.output_path, crop=True)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -148,110 +143,34 @@ class BackgroundEraser(PreprocessingStep):
         return results_formatted
     
     def _clear_images(self, image_dict, output_dir=None, crop=True):
-        """_summary_
+        """Whites out every pixel outside the detected mask for each image
+        and, if `crop` is True, crops to a square canvas centered on its
+        detection box (padded with white where the box runs off-image).
 
         Args:
-            image_dict (_type_): _description_
-            output_dir (_type_, optional): _description_. Defaults to None.
+            image_dict: list of dicts with 'path', 'masks' and 'boxes'
+                entries, as produced by `_detect_shards`.
+            output_dir: if given, each processed image is written here
+                under its original filename.
+            crop: whether to crop to a square canvas around the detection
+                box, in addition to whiting out the background.
 
         Returns:
-            _type_: _description_
+            list of dicts with 'path' and the processed 'image' array.
         """
         results = []
         for item in tqdm(image_dict, desc="Clearing images"):
             path = item['path']
-            polygon = np.asarray(item['masks'][0], dtype=np.float32)  # (N, 2) pontlista
+            polygon = np.asarray(item['masks'][0], dtype=np.float32)  # (N, 2) point list
 
             img = cv2.imread(path)
             if img is None:
-                print(f"Nem sikerült beolvasni: {path}")
+                print(f"Failed to read image: {path}")
                 continue
 
             h, w = img.shape[:2]
 
-            # Raszteres bináris maszk generálása a poligonból
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
-            mask = mask.astype(bool)
-
-            white_bg = np.full_like(img, 255)
-            out = np.where(mask[..., None], img, white_bg)
-
-            if crop:
-                box = np.asarray(item['boxes'][0].cpu(), dtype=np.float32).reshape(-1)  # (x1, y1, x2, y2)
-                x1, y1, x2, y2 = box
-
-                box_w = x2 - x1
-                box_h = y2 - y1
-                side = max(box_w, box_h)
-
-                cx = (x1 + x2) / 2.0
-                cy = (y1 + y2) / 2.0
-                half = side / 2.0
-
-                # Single integer half-size shared by both axes so the
-                # square canvas always has equal width and height
-                half_i = int(round(half))
-                side_i = 2 * half_i
-
-                cx_i = int(round(cx))
-                cy_i = int(round(cy))
-
-                sq_x1_i = cx_i - half_i
-                sq_x2_i = cx_i + half_i
-                sq_y1_i = cy_i - half_i
-                sq_y2_i = cy_i + half_i
-
-                # Valid region that actually overlaps the image
-                src_x1 = max(sq_x1_i, 0)
-                src_y1 = max(sq_y1_i, 0)
-                src_x2 = min(sq_x2_i, w)
-                src_y2 = min(sq_y2_i, h)
-
-                # Where that region lands inside the (white) square canvas
-                dst_x1 = src_x1 - sq_x1_i
-                dst_y1 = src_y1 - sq_y1_i
-                dst_x2 = dst_x1 + (src_x2 - src_x1)
-                dst_y2 = dst_y1 + (src_y2 - src_y1)
-
-                square = np.full((side_i, side_i, img.shape[2]), 255, dtype=out.dtype)
-                if src_x2 > src_x1 and src_y2 > src_y1:
-                    square[dst_y1:dst_y2, dst_x1:dst_x2] = out[src_y1:src_y2, src_x1:src_x2]
-
-                out = square
-
-            results.append({'path': path, 'image': out})
-
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                out_path = os.path.join(output_dir, os.path.basename(path))
-                cv2.imwrite(out_path, out)
-
-        return results
-    
-    def _clear_images(self, image_dict, output_dir=None, crop=True):
-        """_summary_
-
-        Args:
-            image_dict (_type_): _description_
-            output_dir (_type_, optional): _description_. Defaults to None.
-
-        Returns:
-            _type_: _description_
-        """
-        results = []
-        for item in tqdm(image_dict, desc="Clearing images"):
-            path = item['path']
-            polygon = np.asarray(item['masks'][0], dtype=np.float32)  # (N, 2) pontlista
-
-            img = cv2.imread(path)
-            if img is None:
-                print(f"Nem sikerült beolvasni: {path}")
-                continue
-
-            h, w = img.shape[:2]
-
-            # Raszteres bináris maszk generálása a poligonból
+            # Rasterize a binary mask from the polygon
             mask = np.zeros((h, w), dtype=np.uint8)
             cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
             mask = mask.astype(bool)
