@@ -18,6 +18,283 @@ from torchvision import transforms
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+
+
+class ClassificationDataset(Dataset):
+    def __init__(self, paths, labels):
+        self.paths = list(paths)
+        self.labels = torch.tensor(labels, dtype=torch.long)
+
+        self.transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        with Image.open(self.paths[idx]) as image:
+            image = image.convert("L")
+            image = self.transform(image)
+
+        return image, self.labels[idx]
+
+
+class VAEClassifier(nn.Module, FeatureLearningStep):
+    def __init__(
+        self,
+        vae,
+        num_classes=28,
+        labels_path=None,
+        freeze_encoder=False,
+        output_path=None,
+        name=None,
+        delete_input_data=False,
+        save_results=False,
+        run_id="default_run",
+        input_path=None,
+    ):
+        nn.Module.__init__(self)
+
+        FeatureLearningStep.__init__(
+            self,
+            input_path=input_path or vae.input_path,
+            output_path=output_path,
+            name=name,
+            delete_input_data=delete_input_data,
+            save_results=save_results,
+            run_id=run_id
+        )
+
+        self.encoder = vae.encoder
+        self.labels_path = labels_path
+        self.freeze_encoder = freeze_encoder
+
+        latent_size = self.encoder.fc_mu.out_features
+
+        if freeze_encoder:
+            for parameter in self.encoder.parameters():
+                parameter.requires_grad = False
+
+        hidden_size = max(latent_size // 2, 32)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(latent_size),
+            nn.Linear(latent_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+            nn.Linear(hidden_size, num_classes),
+        )
+
+    def forward(self, x):
+        mu, _ = self.encoder(x)
+        return self.classifier(mu)
+
+    def run(
+        self,
+        epochs=30,
+        lr=1e-4,
+        batch_size=64,
+        validation_size=0.2,
+        num_workers=0,
+    ) -> pd.DataFrame:
+
+        # Checking label path correctness and reading labels
+
+        if not self.labels_path:
+            raise ValueError("labels_path is required")
+
+        labels_df = pd.read_csv(self.labels_path)
+        labels_df["ID"] = labels_df["ID"].astype(str)
+
+        # Checking that the number of classes is correct and encoding labels
+        encoder = LabelEncoder()
+        labels_df["label"] = encoder.fit_transform(
+            labels_df["TypeRev"].astype(str)
+        )
+
+        if len(encoder.classes_) != 28:
+            raise ValueError(
+                f"Expected 28 classes, got {len(encoder.classes_)}"
+            )
+
+        # Creating a mapping from image IDs to labels and filtering the dataset to include only labelled images
+
+        labels_by_id = dict(
+            zip(labels_df["ID"], labels_df["label"])
+        )
+
+        # Filtering the dataset to include only labelled images
+
+        extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+        paths = sorted(
+            path
+            for path in Path(self.input_path).rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in extensions
+            and path.stem in labels_by_id
+        )
+
+        
+
+        print(f"Found {len(paths)} labelled images in {self.input_path}")
+
+        if not paths:
+            raise ValueError("No labelled images found")
+
+        labels = [labels_by_id[path.stem] for path in paths]
+
+        label_counts = pd.Series(labels).value_counts()
+        valid_labels = label_counts[label_counts >= 2].index
+        valid_labels = set(valid_labels.tolist())
+
+        filtered_data = [
+            (path, label)
+            for path, label in zip(paths, labels)
+            if label in valid_labels
+        ]
+        if not filtered_data:
+            raise ValueError("No classes with at least two labelled images found")
+
+        paths, labels = zip(*filtered_data)
+        paths = list(paths)
+
+        label_order = sorted(valid_labels)
+        label_mapping = {
+            label: index for index, label in enumerate(label_order)
+        }
+        labels = [label_mapping[label] for label in labels]
+
+        classes = encoder.classes_[label_order]
+        print(
+            f"Using {len(classes)} classes and {len(paths)} labelled images "
+            "after excluding singleton classes"
+        )
+        classifier_device = next(self.parameters()).device
+        self.classifier[-1] = nn.Linear(
+            self.classifier[-1].in_features,
+            len(classes),
+        ).to(classifier_device)
+
+        
+
+        train_paths, val_paths, train_labels, val_labels = train_test_split(
+            paths,
+            labels,
+            test_size=validation_size,
+            random_state=42,
+            stratify=labels,
+        )
+
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "pin_memory": torch.cuda.is_available(),
+        }
+
+        train_loader = torch.utils.data.DataLoader(
+            ClassificationDataset(train_paths, train_labels),
+            shuffle=True,
+            **loader_kwargs,
+        )
+
+        val_loader = torch.utils.data.DataLoader(
+            ClassificationDataset(val_paths, val_labels),
+            shuffle=False,
+            **loader_kwargs,
+        )
+
+        device = next(self.parameters()).device
+        criterion = nn.CrossEntropyLoss()
+
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, self.parameters()),
+            lr=lr,
+        )
+
+        history = []
+
+        for epoch in range(epochs):
+            self.train()
+
+            if self.freeze_encoder:
+                self.encoder.eval()
+
+            train_loss = 0.0
+            train_correct = 0
+            train_count = 0
+
+            for images, targets in train_loader:
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+
+                optimizer.zero_grad()
+
+                logits = self(images)
+                loss = criterion(logits, targets)
+
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item() * images.size(0)
+                train_correct += (
+                    logits.argmax(dim=1) == targets
+                ).sum().item()
+                train_count += images.size(0)
+
+            self.eval()
+            val_correct = 0
+            val_count = 0
+
+            with torch.no_grad():
+                for images, targets in val_loader:
+                    images = images.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+
+                    logits = self(images)
+
+                    val_correct += (
+                        logits.argmax(dim=1) == targets
+                    ).sum().item()
+                    val_count += images.size(0)
+
+            train_acc = train_correct / train_count
+            val_acc = val_correct / val_count
+            average_loss = train_loss / train_count
+
+            history.append({
+                "epoch": epoch + 1,
+                "loss": average_loss,
+                "train_accuracy": train_acc,
+                "validation_accuracy": val_acc,
+            })
+
+            print(
+                f"[{epoch + 1}/{epochs}] "
+                f"loss={average_loss:.4f} | "
+                f"train_acc={train_acc:.4f} | "
+                f"val_acc={val_acc:.4f}"
+            )
+
+        output_dir = Path(self.output_path or "classifier_results")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        torch.save(
+            {
+                "model_state_dict": self.state_dict(),
+                "classes": classes.tolist(),
+            },
+            output_dir / "vae_classifier.pt",
+        )
+
+        history_df = pd.DataFrame(history)
+        history_df.to_csv(output_dir / "training_history.csv", index=False)
+
+        return history_df
+
 class VAE(nn.Module, FeatureLearningStep):
 
 
