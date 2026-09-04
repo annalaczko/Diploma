@@ -26,7 +26,8 @@ from skimage.filters import threshold_otsu
 from skimage.morphology import skeletonize
 from tqdm import tqdm
 
-from pipeline.preprocessing.preprocessing_step import PreprocessingStep  # adjust import to match your actual module path
+from pipeline.preprocessing.preprocessing_step import PreprocessingStep
+from pipeline.preprocessing.dataset import collect_image_paths
 
 
 class Repair(PreprocessingStep):
@@ -103,7 +104,7 @@ class Repair(PreprocessingStep):
         with the rest of the pipeline) - the step reads directly from
         `self.input_path`. Returns `self.output_path`.
         """
-        input_paths = self._collect_image_paths(self.input_path)
+        input_paths = collect_image_paths(self.input_path, self.image_extensions)
         output_dir = Path(self.output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,41 +209,6 @@ class Repair(PreprocessingStep):
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
-
-    def _collect_image_paths(self, input_value: str | Path | list[str | Path] | tuple[str | Path, ...]) -> list[Path]:
-        """Collect every existing image under the provided input path(s).
-
-        Supports a single path or a list/tuple of paths. Missing entries are ignored
-        and only actual existing files/directories are processed.
-        """
-        candidates = input_value if isinstance(input_value, (list, tuple)) else [input_value]
-        collected: list[Path] = []
-        seen: set[str] = set()
-
-        for raw_path in candidates:
-            path = Path(raw_path)
-            if not path.exists():
-                continue
-
-            if path.is_file():
-                if path.suffix.lower() in self.image_extensions:
-                    resolved = path.resolve()
-                    if str(resolved) not in seen:
-                        seen.add(str(resolved))
-                        collected.append(path)
-                continue
-
-            for nested in sorted(path.rglob("*")):
-                if not nested.is_file():
-                    continue
-                if nested.suffix.lower() not in self.image_extensions:
-                    continue
-                resolved = nested.resolve()
-                if str(resolved) not in seen:
-                    seen.add(str(resolved))
-                    collected.append(nested)
-
-        return collected
 
     @staticmethod
     def _remove_small_components(binary: np.ndarray, min_size: int) -> np.ndarray:

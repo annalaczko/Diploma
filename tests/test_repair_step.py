@@ -3,6 +3,7 @@ from pathlib import Path
 from PIL import Image
 
 from pipeline.preprocessing.repair import Repair
+from pipeline.preprocessing.dataset import collect_image_paths
 
 
 def test_collect_image_paths_accepts_list_of_paths(tmp_path):
@@ -17,7 +18,7 @@ def test_collect_image_paths_accepts_list_of_paths(tmp_path):
 
     repair = Repair(input_path=[str(image_dir), str(image_dir / "a.png")], output_path=str(tmp_path / "out"))
 
-    paths = repair._collect_image_paths(repair.input_path)
+    paths = collect_image_paths(repair.input_path, repair.image_extensions)
 
     assert {p.name for p in paths} == {"a.png", "b.jpg"}
     assert all(p.exists() for p in paths)

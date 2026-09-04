@@ -24,12 +24,35 @@ class Step(ABC):
         delete_input_data: bool = False,
         run_id = "default_run",
     ):
+        """
+        Args:
+            input_path: where this step reads its input from (a file,
+                directory, or step-specific value such as a CSV path).
+            output_path: where this step writes its output. If omitted,
+                a directory is auto-derived (see below) and created.
+            save_results: whether the step should persist its output to
+                `output_path` (steps decide for themselves how to honor
+                this - it is not enforced here).
+            name: human-readable step name, used in logging/`__repr__`.
+                Defaults to the concrete class name.
+            delete_input_data: if True, `delete_input_data()` empties
+                `input_path` after the step considers itself done (the
+                concrete `run()` implementation must call it explicitly).
+            run_id: identifies this pipeline run; used to namespace the
+                auto-derived output directory so different runs (e.g.
+                different experiments) don't overwrite each other's data.
+        """
         self.input_path = input_path
         self.save_results = save_results
 
         if output_path:
             self.output_path = output_path
         else:
+            # Group outputs as data/pipeline/<run_id>/<stage>/<step>, where
+            # <stage> is the immediate abstract base (e.g. PreprocessingStep)
+            # and <step> is the concrete class (e.g. Normalizer). Falls back
+            # to using the concrete class name twice if there's no such base
+            # (e.g. Step is instantiated directly, or subclassed only once).
             parent_class = (
                 self.__class__.__mro__[1].__name__
                 if len(self.__class__.__mro__) > 2

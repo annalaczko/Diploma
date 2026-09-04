@@ -4,10 +4,16 @@ from PIL import Image
 from tqdm import tqdm
 
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
+from pipeline.preprocessing.dataset import collect_image_paths
 
 
 class Normalizer(PreprocessingStep):
     """Pad images to a square canvas, resize them to 256x256, and save them.
+
+    This gives every downstream step (feature learning, YOLO, ...) images
+    with a consistent size and aspect ratio, without distorting the
+    original content: padding preserves the aspect ratio, only the final
+    resize changes scale.
 
     Supports a single file, a directory, or a list/tuple of valid image paths.
     Missing paths are ignored. The output directory is returned by run().
@@ -26,6 +32,19 @@ class Normalizer(PreprocessingStep):
         rename=False,
         **kwargs,
     ):
+        """
+        Args:
+            input_path: a single file, a directory, or a list/tuple of
+                either. Directories are searched recursively.
+            output_path: where normalized images are written. Defaults to
+                the Step-computed run-scoped directory if not given.
+            target_size: side length (px) of the final square image.
+            background_color: RGB fill color used for the padding added
+                around non-square source images.
+            image_extensions: file suffixes treated as input images.
+            rename: currently unused/reserved; output files keep their
+                original filenames regardless of this flag.
+        """
         super().__init__(
             input_path=input_path,
             output_path=output_path,
@@ -38,12 +57,13 @@ class Normalizer(PreprocessingStep):
         self.background_color = background_color
         self.image_extensions = image_extensions
         self.rename = rename
+
     def run(self) -> Path:
         """Pad each image to a square, resize to 256x256, and save under output_path."""
         output_dir = Path(self.output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        image_paths = self._collect_image_paths(self.input_path)
+        image_paths = collect_image_paths(self.input_path, self.image_extensions)
         if not image_paths:
             raise FileNotFoundError(
                 f"No existing images with extensions {self.image_extensions} found under {self.input_path}"
@@ -61,7 +81,12 @@ class Normalizer(PreprocessingStep):
         return output_dir
 
     def pad_to_square(self, image: Image.Image, fill_color=(0, 0, 0)) -> Image.Image:
-        """Pad the image with a background color to the nearest square size."""
+        """Pad the image with a background color to the nearest square size.
+
+        Centers the original image on a new `max(width, height)`-sized
+        canvas filled with `fill_color`, so aspect ratio is preserved
+        (unlike a plain resize to a square, which would stretch it).
+        """
         width, height = image.size
         max_side = max(width, height)
 
@@ -70,37 +95,3 @@ class Normalizer(PreprocessingStep):
         offset_y = (max_side - height) // 2
         padded.paste(image, (offset_x, offset_y))
         return padded
-
-    def _collect_image_paths(self, input_value) -> list[Path]:
-        """Collect every existing image path from a file/dir or a list/tuple of them."""
-        candidates = input_value if isinstance(input_value, (list, tuple)) else [input_value]
-        collected: list[Path] = []
-        seen: set[str] = set()
-
-        for raw_path in candidates:
-            if raw_path is None:
-                continue
-
-            path = Path(raw_path)
-            if not path.exists():
-                continue
-
-            if path.is_file():
-                if path.suffix.lower() in self.image_extensions:
-                    resolved = path.resolve()
-                    if str(resolved) not in seen:
-                        seen.add(str(resolved))
-                        collected.append(path)
-                continue
-
-            for nested in sorted(path.rglob("*")):
-                if not nested.is_file():
-                    continue
-                if nested.suffix.lower() not in self.image_extensions:
-                    continue
-                resolved = nested.resolve()
-                if str(resolved) not in seen:
-                    seen.add(str(resolved))
-                    collected.append(nested)
-
-        return collected

@@ -27,6 +27,7 @@ class FeatureLearningStep(Step):
         save_results: bool = False,
         run_id: str | None = None,
     ):
+        """See `Step.__init__` for what each argument controls."""
         super().__init__(
             input_path=input_path,
             output_path=output_path,

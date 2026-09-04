@@ -4,6 +4,7 @@ from PIL import Image
 
 from pipeline.preprocessing.background_eraser import BackgroundEraser
 from pipeline.preprocessing.normalizer import Normalizer
+from pipeline.preprocessing.dataset import collect_image_paths
 
 
 def test_background_eraser_collects_images_recursively_from_directory(tmp_path):
@@ -17,7 +18,7 @@ def test_background_eraser_collects_images_recursively_from_directory(tmp_path):
     img_b.save(nested_dir / "b.png")
 
     eraser = BackgroundEraser(input_path=str(source_dir), output_path=str(tmp_path / "out"))
-    paths = eraser._collect_image_paths(eraser.input_path)
+    paths = collect_image_paths(eraser.input_path, eraser.image_extensions)
 
     assert {p.name for p in paths} == {"a.png", "b.png"}
     assert all(p.exists() for p in paths)

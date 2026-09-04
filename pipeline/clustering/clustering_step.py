@@ -12,8 +12,10 @@ class ClusteringStep(Step):
     """Common contract for clustering methods applied to fixed
     feature representations.
 
-    `run` takes a feature matrix (n_samples, n_features) and
-    returns cluster labels (n_samples,).
+    Unlike the base `Step.run(data)`, concrete clustering steps take no
+    `run()` argument - they read their input (a feature matrix, or the
+    CSV path it's stored at) from config passed to `__init__` instead,
+    and `run()` returns cluster labels (n_samples,).
     """
 
     def __init__(
@@ -24,6 +26,8 @@ class ClusteringStep(Step):
         delete_input_data: bool = False,
         save_results: bool = False,
     ):
+        """See `Step.__init__` for what each argument controls; `input_path`
+        here is expected to be a CSV of precomputed feature vectors."""
         super().__init__(
             input_path=input_path,
             output_path=output_path,

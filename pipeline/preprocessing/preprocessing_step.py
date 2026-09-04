@@ -25,6 +25,8 @@ class PreprocessingStep(Step):
         save_results: bool = True,
         run_id: str | None = None,
     ):
+        # See Step.__init__ for what each argument controls (output path
+        # resolution, whether to delete input data after the step runs, etc).
         super().__init__(
             input_path=input_path,
             output_path=output_path,

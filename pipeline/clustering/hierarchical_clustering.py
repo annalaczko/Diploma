@@ -3,8 +3,6 @@
 import numpy as np
 import re as regex_module
 
-from numpy import strings
-
 from pipeline.clustering.clustering_step import ClusteringStep
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import pdist
@@ -42,9 +40,9 @@ class HierarchicalClustering(ClusteringStep):
 
 
     def run(self):
-
-        """
-        Runs the full clustering as a black box
+        """Cluster `self.vectors` into `self.cluster_num` flat clusters
+        using `self.best_method`/`self.best_metric` (either passed in at
+        construction, or the winners from a prior `compare_all()` call).
 
         Returns:
             fclusterdata : ndarray
@@ -54,17 +52,19 @@ class HierarchicalClustering(ClusteringStep):
 
         result = hierarchy.fclusterdata(self.vectors, t=self.cluster_num, criterion="maxclust", metric=self.best_metric, method=self.best_method)
         return result
-    
+
     def compare_all(self):
+        """Try every (method, metric) combination and rank them by
+        cophenetic correlation, a measure of how well a linkage's
+        dendrogram distances preserve the original pairwise distances
+        (higher = the clustering better reflects the true data geometry).
 
-        """
-        Runs all the variation for clustering between methods and metrics.
-
-        We here run the same clustering as in "run" but we can control all the pipeline pieces separately.
-
+        As a side effect, updates `self.best_method`/`self.best_metric`
+        to the winning combination, so a subsequent `run()` call uses it.
 
         Returns:
-            list of dict: A list of dictionaries containing the clustering results for each combination of method and metric.
+            list of dict: one entry per (method, metric) combination, with
+            keys 'method', 'metric' and 'cophenetic coefficient score'.
         """
 
         results=[]
@@ -94,7 +94,28 @@ class HierarchicalClustering(ClusteringStep):
         return results
 
     def parse_feature_string(self, values):
+        """Turn the 'features' column of a feature-learning CSV into a
+        dense (n_samples, n_features) float matrix.
+
+        Feature vectors get written to CSV as their string repr (e.g.
+        numpy's `"[0.1, 0.2, ...]"` or space-separated form), since CSV
+        cells can't hold arrays directly. This undoes that: for each row,
+        strips brackets, normalizes comma/whitespace separators, and
+        parses the numbers back out.
+
+        Args:
+            values: the CSV column's values - typically a pandas Series
+                or numpy array of strings, but a single string or an
+                already-numeric array/row is also accepted.
+
+        Returns:
+            A single 1D array if `values` was a single row/string, else a
+            stacked (n_samples, n_features) array. Raises ValueError if
+            the parsed rows don't all share the same length, since
+            clustering requires a consistent feature dimensionality.
+        """
         def _parse_one(raw):
+            """Parse a single cell into a 1D float array, or None if it's missing (NaN)."""
             if raw is None or pd.isna(raw):
                 return None
 

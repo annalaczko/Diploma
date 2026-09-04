@@ -13,6 +13,7 @@ from ultralytics import YOLO
 from tqdm import tqdm
 
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
+from pipeline.preprocessing.dataset import collect_image_paths
 
 class BackgroundEraser(PreprocessingStep):
     """Runs a YOLO segmentation model on each image, whites out everything
@@ -43,7 +44,15 @@ class BackgroundEraser(PreprocessingStep):
         self.image_extensions = image_extensions
 
     def run(self, keep_results=True):
-        image_paths = self._collect_image_paths(self.input_path)
+        """Run YOLO segmentation on every input image and write cleaned
+        (background-erased, cropped) versions to `self.output_path`.
+
+        Args:
+            keep_results: if True (default), returns `self.output_path`;
+                if False, returns None. Useful when this step is chained
+                purely for its side effect of writing files.
+        """
+        image_paths = collect_image_paths(self.input_path, self.image_extensions)
         if not image_paths:
             raise FileNotFoundError(
                 f"No existing images with extensions {self.image_extensions} found under {self.input_path}"
@@ -60,32 +69,20 @@ class BackgroundEraser(PreprocessingStep):
             shutil.rmtree(tmp_dir, ignore_errors=True)
         return self.output_path if keep_results else None
 
-    def _collect_image_paths(self, input_value) -> list[Path]:
-        """Collect all valid image files recursively below a root directory."""
-        if input_value is None:
-            return []
-
-        root = Path(input_value)
-        if not root.exists():
-            return []
-
-        if root.is_file():
-            return [root] if root.suffix.lower() in self.image_extensions else []
-
-        collected: list[Path] = []
-        seen: set[str] = set()
-        for nested in sorted(root.rglob("*")):
-            if not nested.is_file():
-                continue
-            if nested.suffix.lower() not in self.image_extensions:
-                continue
-            resolved = nested.resolve()
-            if str(resolved) not in seen:
-                seen.add(str(resolved))
-                collected.append(nested)
-        return collected
-
     def _make_flat_symlink_dir(self, paths):
+        """Symlink every image into a single flat temp directory with
+        sequential zero-padded names (e.g. 000000.jpg, 000001.png, ...).
+
+        YOLO's `model.predict` is pointed at this directory rather than at
+        the original (possibly deeply nested) paths, since it walks a
+        single flat folder more predictably than an arbitrary directory
+        tree. The returned `path_map` lets callers translate the symlink
+        paths YOLO reports back in its results to the real source paths.
+
+        Returns:
+            (tmp_dir, path_map): the temp directory path, and a dict
+            mapping each symlink path to its original source path.
+        """
         tmp_dir = tempfile.mkdtemp(prefix="yolo_batch_")
         path_map = {}
         for i, p in enumerate(paths):
@@ -97,6 +94,28 @@ class BackgroundEraser(PreprocessingStep):
         return tmp_dir, path_map
 
     def _detect_shards(self, model, tmp_dir, path_map, batch_size=256):
+        """Run the YOLO model over the flat symlink directory and collect
+        one segmentation result per successfully detected image.
+
+        Streams predictions (`stream=True`) so results are processed one
+        at a time instead of all being held in memory at once, which
+        matters for large batches of high-resolution images.
+
+        Args:
+            model: a loaded `ultralytics.YOLO` model.
+            tmp_dir: the flat symlink directory to run inference over.
+            path_map: symlink path -> original path, from
+                `_make_flat_symlink_dir`, used to report results (and
+                failures) against the real source paths.
+            batch_size: inference batch size passed to `model.predict`.
+
+        Returns:
+            A list of dicts, one per successfully segmented image, each
+            with 'path' (original path), 'masks' (polygon points) and
+            'boxes' (bounding boxes) as produced by YOLO. Images with no
+            detected mask, or that raised during processing, are skipped
+            and logged instead of raising.
+        """
         device = self.kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
 
         try:
@@ -179,6 +198,9 @@ class BackgroundEraser(PreprocessingStep):
             out = np.where(mask[..., None], img, white_bg)
 
             if crop:
+                # Build a square canvas centered on the detection box, big
+                # enough to fit its longer side, and white-pad wherever the
+                # square runs off the edge of the original image.
                 box = np.asarray(item['boxes'][0].cpu(), dtype=np.float32).reshape(-1)  # (x1, y1, x2, y2)
                 x1, y1, x2, y2 = box
 
