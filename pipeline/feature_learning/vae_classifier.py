@@ -80,7 +80,13 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         self.labels_path = labels_path
         self.freeze_encoder = freeze_encoder
 
-        latent_size = self.encoder.fc_mu.out_features
+        # The classifier head takes mu and sigma concatenated, so its input
+        # is twice the encoder's latent dimensionality. Including sigma
+        # (the encoder's per-dimension uncertainty for this image) gives
+        # the head strictly more information than mu alone - at worst it
+        # can learn to ignore it, at best it's a useful signal (e.g. an
+        # unusual/hard-to-encode image tends to have high sigma).
+        latent_size = self.encoder.fc_mu.out_features * 2
 
         if freeze_encoder:
             for parameter in self.encoder.parameters():
@@ -106,11 +112,14 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         )
 
     def forward(self, x):
-        """Embed `x` with the VAE encoder (using only its mean, not a
-        sampled latent - classification should be deterministic) and run
-        the classifier head on top. Returns raw logits (n, num_classes)."""
-        mu, _ = self.encoder(x)
-        return self.classifier(mu)
+        """Embed `x` with the VAE encoder and run the classifier head on
+        the concatenation of its mean (`mu`) and log-variance (`sigma`) -
+        deterministic (no sampling), so classification stays reproducible,
+        but now uses everything the encoder outputs instead of just `mu`.
+        Returns raw logits (n, num_classes)."""
+        mu, sigma = self.encoder(x)
+        embedding = torch.cat([mu, sigma], dim=1)
+        return self.classifier(embedding)
 
     def run(
         self,
