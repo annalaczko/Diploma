@@ -8,7 +8,8 @@ letting the two approaches be compared directly.
 ```
 pipeline/feature_learning/
 ├── featurelearning_step.py   # FeatureLearningStep: abstract base
-└── vae.py                     # VAE, VAEClassifier, Encoder, Decoder, resize_with_padding
+├── vae.py                     # VAE, Encoder, Decoder, resize_with_padding
+└── vae_classifier.py          # VAEClassifier
 ```
 
 Image loading (path discovery + tensor conversion) is delegated to
