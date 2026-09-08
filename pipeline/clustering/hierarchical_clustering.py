@@ -16,7 +16,7 @@ class HierarchicalClustering(ClusteringStep):
     by cophenetic correlation (see `compare_all`).
     """
 
-    def __init__(self, input_path, cluster_num=30, method=None, metric=None):
+    def __init__(self, input_path, cluster_num=30, method=None, metric=None, output_path=None, run_id="default_run"):
         """
         Args:
             input_path: CSV path with a 'features' column, as produced by
@@ -27,9 +27,20 @@ class HierarchicalClustering(ClusteringStep):
                 if not one of `self.methods`.
             metric: scipy distance metric to use; falls back to 'euclidean'
                 if not one of `self.metrics`.
+            output_path: where results are saved; if omitted, auto-derived
+                and namespaced under `run_id` (see `Step.__init__`).
+            run_id: identifies this pipeline run; namespaces the
+                auto-derived `output_path` when one isn't given explicitly.
         """
 
-        super().__init__(input_path=input_path, output_path=None, name=None, delete_input_data=False, save_results=True)
+        super().__init__(
+            input_path=input_path,
+            output_path=output_path,
+            name=None,
+            delete_input_data=False,
+            save_results=True,
+            run_id=run_id,
+        )
         self.vectors = self.parse_feature_string(pd.read_csv(input_path)['features'].values)
         self.methods=['single', 'complete', 'average', 'weighted', 'centroid', 'ward']
         self.metrics=['euclidean', 'cityblock', 'chebyshev', 'cosine'] 

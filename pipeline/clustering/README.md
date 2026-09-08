@@ -18,7 +18,10 @@ Common contract for clustering methods applied to fixed feature
 representations. Unlike the base `Step.run(data)`, concrete clustering steps
 take **no `run()` argument** — they read their input (typically a CSV of
 precomputed feature vectors) from config passed to `__init__` instead, and
-`run()` returns cluster labels, shape `(n_samples,)`.
+`run()` returns cluster labels, shape `(n_samples,)`. Accepts `run_id` like
+every other step, so its auto-derived `output_path` (when one isn't given
+explicitly) is namespaced under the same pipeline run as the preprocessing/
+feature-learning steps that produced its input.
 
 ## `HierarchicalClustering`
 
@@ -33,6 +36,8 @@ HierarchicalClustering(
     cluster_num=30,   # number of flat clusters to extract
     method=None,      # scipy linkage method; falls back to 'average'
     metric=None,      # scipy distance metric; falls back to 'euclidean'
+    output_path=None,  # where results are saved; auto-derived (namespaced by run_id) if omitted
+    run_id="default_run",
 )
 ```
 

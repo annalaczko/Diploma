@@ -101,29 +101,43 @@ class ImageDataset(Dataset):
             grayscale: if True (default), convert every image to
                 single-channel grayscale before returning it - matches
                 what the VAE encoder expects.
-            target_size: if given (default 256), resize every image to
-                (target_size, target_size). Pass None to skip resizing
-                and keep each image's original size - only safe if every
-                image already shares one size (e.g. after a Normalizer
-                step), since a DataLoader can't batch mismatched shapes.
+            target_size: if given (default 256), resize every image that
+                isn't already exactly (target_size, target_size) - most
+                images here already are, having gone through a Normalizer
+                step, so this is usually a cheap no-op rather than a real
+                resize. Pass None to skip resizing entirely and keep each
+                image's original size - only safe if every image already
+                shares one size, since a DataLoader can't batch mismatched
+                shapes.
         """
         self.paths = list(paths)
         self.labels = torch.tensor(labels, dtype=torch.long) if labels is not None else None
+        self.grayscale = grayscale
+        self.target_size = target_size
 
-        transform_steps = []
+        pre_resize_steps = []
         if grayscale:
-            transform_steps.append(transforms.Grayscale(num_output_channels=1))
-        if target_size is not None:
-            transform_steps.append(transforms.Resize((target_size, target_size)))
-        transform_steps.append(transforms.ToTensor())
-        self.transform = transforms.Compose(transform_steps)
+            pre_resize_steps.append(transforms.Grayscale(num_output_channels=1))
+        self.pre_resize = transforms.Compose(pre_resize_steps) if pre_resize_steps else None
+        self.to_tensor = transforms.ToTensor()
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx):
         with Image.open(self.paths[idx]) as image:
-            image = self.transform(image)
+            if self.pre_resize is not None:
+                image = self.pre_resize(image)
+
+            # Only actually resize if needed: most images here already went
+            # through a Normalizer step and are already target_size x
+            # target_size, so unconditionally resizing every image on every
+            # __getitem__ call (i.e. every epoch) would repeat an expensive,
+            # no-op interpolation millions of times over a long training run.
+            if self.target_size is not None and image.size != (self.target_size, self.target_size):
+                image = image.resize((self.target_size, self.target_size), Image.Resampling.LANCZOS)
+
+            image = self.to_tensor(image)
 
         if self.labels is not None:
             return image, self.labels[idx]

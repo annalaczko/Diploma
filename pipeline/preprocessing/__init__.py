@@ -6,6 +6,7 @@ from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 from pipeline.preprocessing.background_eraser import BackgroundEraser
 from pipeline.preprocessing.repair import Repair
 from pipeline.preprocessing.normalizer import Normalizer
+from pipeline.preprocessing.augmentation import Augmentor
 from pipeline.preprocessing.dataset import collect_image_paths, ImageDataset, DEFAULT_IMAGE_EXTENSIONS
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "BackgroundEraser",
     "Repair",
     "Normalizer",
+    "Augmentor",
     "collect_image_paths",
     "ImageDataset",
     "DEFAULT_IMAGE_EXTENSIONS",

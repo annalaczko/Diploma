@@ -106,7 +106,7 @@ grouped together and separate from other runs.
 pipeline/
 ├── pipeline.py              # Pipeline orchestrator class
 ├── steps/                   # Step: shared abstract base for every stage
-├── preprocessing/           # BackgroundEraser, Repair, Normalizer + shared image-loading helpers
+├── preprocessing/           # BackgroundEraser, Repair, Normalizer, Augmentor + shared image-loading helpers
 ├── feature_learning/        # VAE, VAEClassifier
 ├── clustering/               # HierarchicalClustering
 └── evaluation/                # EvaluationWithGroundTruth, EvaluationWithNoGroundTruth

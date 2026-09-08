@@ -252,14 +252,18 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             "pin_memory": torch.cuda.is_available(),
         }
 
+        # target_size=None: this pipeline's Normalizer step already makes every
+        # image 256x256, so resizing here would just be repeated wasted work
+        # (every image, every epoch); a wrong-sized image will fail loudly when
+        # DataLoader tries to batch it, rather than being silently resized.
         train_loader = torch.utils.data.DataLoader(
-            ImageDataset(train_paths, labels=train_labels, grayscale=True, target_size=256),
+            ImageDataset(train_paths, labels=train_labels, grayscale=True, target_size=None),
             shuffle=True,
             **loader_kwargs,
         )
 
         val_loader = torch.utils.data.DataLoader(
-            ImageDataset(val_paths, labels=val_labels, grayscale=True, target_size=256),
+            ImageDataset(val_paths, labels=val_labels, grayscale=True, target_size=None),
             shuffle=False,
             **loader_kwargs,
         )

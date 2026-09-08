@@ -10,16 +10,21 @@ pipeline/preprocessing/
 ├── background_eraser.py    # BackgroundEraser
 ├── repair.py                # Repair
 ├── normalizer.py            # Normalizer
+├── augmentation.py           # Augmentor
 ├── dataset.py                # collect_image_paths, ImageDataset (shared, also used by feature_learning)
 └── utils.py                   # convert_json_to_yolo: standalone LabelMe -> YOLO conversion script
 ```
 
-A typical run chains these three steps in this order (see the example in
-[`pipeline/README.md`](../README.md)):
+A typical run chains the first three steps in this order (see the example
+in [`pipeline/README.md`](../README.md)):
 
 ```
 BackgroundEraser  ->  Normalizer  ->  Repair
 ```
+
+`Augmentor` is optional and sits after that chain, right before a training
+step (`VAE` / `VAEClassifier`) that would otherwise overfit on a small
+labelled dataset - see its own section below.
 
 ## `PreprocessingStep`
 
@@ -130,6 +135,42 @@ new `max(width, height)`-sized canvas filled with `background_color`
 (preserving aspect ratio — unlike a plain resize to a square, which would
 stretch the image), then resizes the padded square to `target_size` and
 saves it under `output_path` with its original filename.
+
+## `Augmentor`
+
+Writes randomly perturbed copies of each input image - rotation,
+horizontal/vertical flips, mild scale/translation jitter - to grow a small
+labelled dataset without collecting more real images. Pottery sherds have
+no canonical orientation, so rotation and flips are safe (and useful)
+augmentations here, unlike for e.g. natural photographs where "up" usually
+matters.
+
+```python
+Augmentor(
+    input_path,
+    output_path=None,
+    num_augmentations=1,        # augmented copies to generate per input image
+    keep_original=True,         # also copy each source image unchanged
+    rotation_degrees=180,       # random angle in [-rotation_degrees, rotation_degrees]
+    horizontal_flip=True,       # random (p=0.5) mirror along that axis
+    vertical_flip=True,
+    scale_range=(0.9, 1.1),     # random zoom factor
+    translate_fraction=0.05,    # max random shift, as a fraction of width/height
+    fill_value=255,             # background fill for pixels exposed by the transform
+    seed=None,                  # set for reproducible augmentations
+    image_extensions=(".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
+)
+```
+
+`run() -> Path`: for every collected input image, optionally copies it
+unchanged (`keep_original`), then writes `num_augmentations` randomly
+transformed copies named `<stem>_aug<i><suffix>`. Built on
+`torchvision.transforms` (`RandomAffine` for rotation/translate/scale,
+`RandomHorizontalFlip`/`RandomVerticalFlip` for the flips); `fill_value` is
+automatically reshaped to match each image's mode (a plain int for
+grayscale `"L"` images, an RGB(A) tuple otherwise), so the same config
+works whether it runs before or after `Normalizer` has converted images to
+RGB.
 
 ## `dataset.py` — shared image-loading helpers
 

@@ -25,6 +25,7 @@ class ClusteringStep(Step):
         name: str | None = None,
         delete_input_data: bool = False,
         save_results: bool = False,
+        run_id: str = "default_run",
     ):
         """See `Step.__init__` for what each argument controls; `input_path`
         here is expected to be a CSV of precomputed feature vectors."""
@@ -34,6 +35,7 @@ class ClusteringStep(Step):
             name=name,
             delete_input_data=delete_input_data,
             save_results=save_results,
+            run_id=run_id,
         )
 
     @abstractmethod
