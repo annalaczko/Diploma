@@ -3,5 +3,5 @@ venv/
 models/
 __pycache__/
 *.pyc
-
+DeepStructurePriors/
 PyPotteryInk/

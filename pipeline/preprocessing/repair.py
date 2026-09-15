@@ -130,6 +130,12 @@ class Repair(PreprocessingStep):
         """Full pipeline on a single raw (grayscale) PIL image.
 
         contrast enhance -> threshold + dilate -> skeletonize -> repair gaps.
+        Every internal stage works with the white-lines-on-black convention
+        (see `threshold_and_dilate`), but the final result is inverted back
+        to black lines on a white background before being returned, since
+        that's the convention the rest of the pipeline (and a human looking
+        at the file) expects.
+
         Returns a uint8 array (0/255), the final repaired skeleton.
         """
         enhanced = self.enhance_contrast(img)
@@ -140,7 +146,7 @@ class Repair(PreprocessingStep):
         if self.output_thickness > 1:
             repaired = self.thicken(repaired, self.output_thickness)
 
-        return repaired
+        return 255 - repaired
 
     # ------------------------------------------------------------------ #
     # Pipeline stages (each also usable standalone)

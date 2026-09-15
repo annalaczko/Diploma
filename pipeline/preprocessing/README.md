@@ -40,20 +40,30 @@ arguments shared with every other step.
 
 ## `BackgroundEraser`
 
-Runs a YOLO segmentation model on each image, whites out everything outside
-the detected shard mask, and (optionally) crops to a square canvas centered
-on the detection box.
+Runs a YOLO model on each image, whites out everything outside the detected
+shard, and (optionally) crops to a square canvas centered on the detection
+box. Supports two YOLO output types via `mode`:
+- `'segmentation'`: a precise per-pixel mask is used for whiting-out.
+- `'detection'` (the default): only a bounding box is available, so that
+  box (padded by `box_margin`) stands in for the mask - see `_clear_images`
+  below.
 
 ```python
 BackgroundEraser(
     input_path=None,
-    mode='segmentation',        # only 'segmentation' is implemented
-    model='.../yolov8n_seg_finetuned.pt',
+    mode='detection',           # 'detection' or 'segmentation'
+    model='.../yolo26m_legion.pt',
     run_id="default_run",
+    batch_size=256,              # model.predict's inference batch size
+    box_margin=0.15,             # see _expand_box below
     image_extensions=(".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
     **kwargs,                   # e.g. device='cuda'/'cpu'
 )
 ```
+
+`batch_size` controls GPU memory use during detection - lower it if
+`model.predict` raises CUDA out-of-memory errors; it doesn't affect how many
+images are processed overall, just how many go through YOLO at once.
 
 `run(keep_results=True) -> str | None`
 
@@ -61,14 +71,40 @@ BackgroundEraser(
 2. Symlinks them into a single flat temp directory (`_make_flat_symlink_dir`)
    — YOLO's `model.predict` walks a flat folder more predictably than an
    arbitrary directory tree.
-3. Runs YOLO segmentation over that directory (`_detect_shards`), streaming
-   results so large batches don't all sit in memory at once. Images with no
-   detected mask, or that error out, are skipped and logged rather than
-   failing the whole run.
+3. Runs YOLO over that directory (`_detect_shards`, `batch=self.batch_size`),
+   streaming results so large batches don't all sit in memory at once.
+   Images with no detected mask (`mode='segmentation'`) or no detected box
+   at all (`mode='detection'`), or that error out, are skipped and logged
+   rather than failing the whole run.
 4. For each detected image (`_clear_images`): whites out every pixel outside
-   the mask; if `crop=True` (the default when called from `run`), also crops
-   to a square canvas centered on the detection box, white-padding wherever
-   that square runs off the edge of the original image.
+   the mask (or, in `mode='detection'`, outside the padded bounding box -
+   see `_expand_box` below); if `crop=True` (the default when called from
+   `run`), also crops to a square canvas centered on that same padded box,
+   white-padding wherever the square runs off the edge of the original
+   image; and saves the result under a flattened, collision-free filename
+   (`_flatten_output_name`, see below).
+
+`_expand_box(box, image_width, image_height, margin) -> ndarray`: pads a
+`(x1, y1, x2, y2)` box outward by `margin` (a fraction of its own
+width/height) on every side, then clamps to the image bounds. A raw YOLO
+box is often drawn tight against the shard's visible edge, so the default
+`margin=0.15` (15% of the box's own size per side, 30% wider/taller
+overall) leaves a safety buffer so a thin protruding detail - a handle, a
+spout - doesn't get clipped by whiting-out or cropping. Used for both:
+in `mode='detection'`, the padded box becomes the whiting-out polygon (in
+`mode='segmentation'`, the mask itself is unaffected - only the crop uses
+the padded box); the crop's square canvas is always centered on it.
+
+`_flatten_output_name(path) -> str`: `output_dir` is a single flat
+directory, but `input_path` is typically a tree of subfolders (e.g. one per
+survey/album) that independently reuse the same simple, sequential
+filenames (`001.jpg`, `002.jpg`, ...). Saving under the bare basename would
+make images from different subfolders silently overwrite one another
+whenever their names collide, so the actual saved filename instead joins
+every ancestor directory name (relative to `input_path`) with the basename,
+e.g. `2012_Survey Gladiatorenschule__006.jpg` for
+`<input_path>/2012_Survey Gladiatorenschule/006.jpg`. Falls back to just the
+basename if `path` isn't under `input_path` at all.
 
 Returns `self.output_path` (or `None` if `keep_results=False`).
 
@@ -90,6 +126,11 @@ Reproduces a manual notebook workflow as a single pipeline step:
    clean 1px skeleton instead of having slightly thicker joins.
 5. **Thicken** (`thicken`, optional) — uniformly dilates the final skeleton
    to `output_thickness` px.
+6. **Invert** — stages 2-5 all work with the white-lines-on-black
+   convention `threshold_and_dilate` establishes; `process_image` inverts
+   the final result back to black lines on a white background before
+   returning it, matching what the rest of the pipeline (and a human
+   looking at the file) expects.
 
 ```python
 Repair(
@@ -138,12 +179,10 @@ saves it under `output_path` with its original filename.
 
 ## `Augmentor`
 
-Writes randomly perturbed copies of each input image - rotation,
-horizontal/vertical flips, mild scale/translation jitter - to grow a small
-labelled dataset without collecting more real images. Pottery sherds have
-no canonical orientation, so rotation and flips are safe (and useful)
-augmentations here, unlike for e.g. natural photographs where "up" usually
-matters.
+Writes randomly perturbed copies of each input image - random crop+resize,
+brightness/contrast jitter, occasional Gaussian blur, and a random
+horizontal flip - to grow a small labelled dataset without collecting more
+real images.
 
 ```python
 Augmentor(
@@ -151,12 +190,15 @@ Augmentor(
     output_path=None,
     num_augmentations=1,        # augmented copies to generate per input image
     keep_original=True,         # also copy each source image unchanged
-    rotation_degrees=180,       # random angle in [-rotation_degrees, rotation_degrees]
-    horizontal_flip=True,       # random (p=0.5) mirror along that axis
-    vertical_flip=True,
-    scale_range=(0.9, 1.1),     # random zoom factor
-    translate_fraction=0.05,    # max random shift, as a fraction of width/height
-    fill_value=255,             # background fill for pixels exposed by the transform
+    output_size=256,            # augmented copies are cropped+resized to this size
+    crop_scale=(0.8, 1.0),      # fraction of the image area the random crop covers
+    crop_ratio=(0.9, 1.1),      # aspect ratio range for the random crop
+    brightness=0.2,             # ColorJitter brightness strength
+    contrast=0.2,                # ColorJitter contrast strength
+    blur_kernel_size=5,
+    blur_sigma=(0.1, 2.0),       # randomized blur strength when blur is applied
+    blur_probability=0.5,       # chance the Gaussian blur is applied at all
+    horizontal_flip=True,       # random (p=0.5) left-right mirror
     seed=None,                  # set for reproducible augmentations
     image_extensions=(".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
 )
@@ -165,12 +207,13 @@ Augmentor(
 `run() -> Path`: for every collected input image, optionally copies it
 unchanged (`keep_original`), then writes `num_augmentations` randomly
 transformed copies named `<stem>_aug<i><suffix>`. Built on
-`torchvision.transforms` (`RandomAffine` for rotation/translate/scale,
-`RandomHorizontalFlip`/`RandomVerticalFlip` for the flips); `fill_value` is
-automatically reshaped to match each image's mode (a plain int for
-grayscale `"L"` images, an RGB(A) tuple otherwise), so the same config
-works whether it runs before or after `Normalizer` has converted images to
-RGB.
+`torchvision.transforms`: `RandomResizedCrop` (crop+resize),
+`ColorJitter` (brightness/contrast), `GaussianBlur` wrapped in
+`RandomApply` (blur, applied only `blur_probability` of the time), and
+`RandomHorizontalFlip`. Since `RandomResizedCrop` always produces a square
+`output_size x output_size` image, every augmented copy ends up that size
+regardless of the source image's own dimensions - only the kept-original
+copy (if any) is left at its original size.
 
 ## `dataset.py` — shared image-loading helpers
 

@@ -1,15 +1,22 @@
 # `pipeline.feature_learning`
 
-Turns preprocessed pottery-sherd images into fixed-length feature vectors
-(unsupervised, `VAE`) or predicts a pottery type label directly
-(supervised, `VAEClassifier`, built on top of a trained `VAE`'s encoder) —
-letting the two approaches be compared directly.
+Turns preprocessed pottery-sherd images into fixed-length feature vectors -
+unsupervised, via `VAE` (reconstruction-based), `SimCLR` (contrastive,
+needs negative pairs) or `BYOL` (no negative pairs) - or predicts a
+pottery type label directly (supervised, `VAEClassifier`, built on top of
+a trained `VAE`'s encoder). Having three unsupervised approaches with
+different training objectives but the *same* encoder architecture lets
+you isolate whether the objective or the network capacity is the
+bottleneck for downstream classification.
 
 ```
 pipeline/feature_learning/
 ├── featurelearning_step.py   # FeatureLearningStep: abstract base
+├── early_stopping.py          # EarlyStopping: shared moving-average stopping logic
 ├── vae.py                     # VAE, Encoder, Decoder, resize_with_padding
-└── vae_classifier.py          # VAEClassifier
+├── vae_classifier.py          # VAEClassifier
+├── simclr.py                  # SimCLR, SimCLREncoder, SimCLRDataset
+└── byol.py                    # BYOL
 ```
 
 Image loading (path discovery + tensor conversion) is delegated to
@@ -34,6 +41,43 @@ FeatureLearningStep.l2_normalize(vectors: np.ndarray) -> np.ndarray
 L2-normalizes feature vectors row-wise — required before distance/cosine
 similarity comparisons.
 
+## `EarlyStopping` — shared early-stopping logic
+
+```python
+from pipeline.feature_learning import EarlyStopping
+```
+
+Every training loop in this package (`VAE`, `SimCLR`, `BYOL`, `VAEClassifier`)
+stops early the same way: a metric is smoothed with a trailing moving
+average over `smoothing_window` epochs, then compared against the best
+smoothed value seen so far. Training stops once `patience` consecutive
+epochs pass with no improvement of at least `min_delta`. Smoothing first
+means a single noisy epoch can't trigger a stop (or reset the patience
+counter) on its own — only a real, sustained plateau does.
+
+```python
+EarlyStopping(patience=15, min_delta=0.0, smoothing_window=10, mode="min")
+```
+
+- `mode="min"`: lower is better — used by `VAE`/`SimCLR`/`BYOL`, which
+  have no validation split and instead watch their own smoothed
+  **training loss**.
+- `mode="max"`: higher is better — used by `VAEClassifier`, which watches
+  smoothed **validation accuracy**.
+
+```python
+smoothed_value, should_stop = early_stopping.step(value, epoch, model=self)
+...
+early_stopping.restore_best(self)
+```
+
+`step(value, epoch, model=None)` records this epoch's raw value, and — if
+`model` is given and this epoch improves on the best smoothed value so
+far — snapshots `model.state_dict()` (detached, on CPU) as the new best.
+`restore_best(model)` loads that snapshot back once training loops end,
+so every one of these models resumes/returns with its *best*-epoch
+weights, not necessarily its *last*-epoch ones.
+
 ## `VAE` — unsupervised feature learning
 
 A convolutional Variational Autoencoder: trained to reconstruct grayscale
@@ -52,10 +96,10 @@ VAE(
 )
 ```
 
-### `run(mode="extract_features", *, epochs=10, lr=1e-6, batch_size=32)`
+### `run(mode="extract_features", *, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
 
-- `mode="train_model"`: trains for `epochs` epochs, then extracts features
-  from the trained model.
+- `mode="train_model"`: trains for up to `epochs` epochs (may stop earlier
+  via early stopping), then extracts features from the trained model.
 - `mode="extract_features"` (default): skips training, just runs
   inference — use this once you already have trained weights loaded (e.g.
   via `vae.load_state_dict(...)`).
@@ -68,9 +112,9 @@ N(0, I)`), and decodes it back into a reconstruction. Returns
 `(x_reconstructed, mu, sigma)` — `sigma` is a **log-variance**, not a raw
 variance.
 
-### `train_model(folder, epochs=10, lr=1e-6, batch_size=32)`
+### `train_model(folder, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
 
-Standard VAE training loop, with one twist: the KL-divergence weight
+Standard VAE training loop, with two twists: the KL-divergence weight
 (`beta`) is annealed on a **cyclical schedule** (`_cyclical_beta`, after Fu
 et al., "Cyclical Annealing Schedule", 2019) instead of held constant. Beta
 ramps linearly from 0 to 1 over the first half of each cycle, then holds at
@@ -78,6 +122,14 @@ ramps linearly from 0 to 1 over the first half of each cycle, then holds at
 avoids *posterior collapse* (the decoder learning to ignore the latent code
 entirely, which a constant high beta from epoch 1 tends to cause) while
 still reaching full KL regularization within each cycle.
+
+The second twist: there's no validation split here (this is unsupervised
+reconstruction, not classification), so early stopping (see
+[`EarlyStopping`](#earlystopping--shared-early-stopping-logic) above)
+instead watches a smoothed moving average of the epoch's **training
+loss** (`mode="min"`), stopping once it's stopped decreasing for
+`early_stopping_patience` epochs and restoring the best-epoch weights
+before extracting features.
 
 Loss (`_loss_function`, a standard beta-VAE loss):
 
@@ -186,11 +238,12 @@ What happens, in order:
    ...)` on the *train* split only (validation stays untouched, so
    `val_acc` reflects true, unweighted performance), so rare pottery types
    don't get drowned out by common ones in the loss.
-5. **Standard train loop**, with **early stopping on a moving average**:
-   each epoch's validation accuracy is smoothed over the last
-   `early_stopping_smoothing_window` epochs before being compared to the
-   running best, so a single noisy epoch can't trigger a stop while the
-   underlying trend is still improving. Training stops after
+5. **Standard train loop**, with early stopping via the shared
+   [`EarlyStopping`](#earlystopping--shared-early-stopping-logic) helper
+   (`mode="max"`): each epoch's validation accuracy is smoothed over the
+   last `early_stopping_smoothing_window` epochs before being compared to
+   the running best, so a single noisy epoch can't trigger a stop while
+   the underlying trend is still improving. Training stops after
    `early_stopping_patience` consecutive epochs with no improvement of at
    least `early_stopping_min_delta` in the smoothed value.
 6. **Restore the best-epoch weights** (by smoothed val accuracy, not the
@@ -224,6 +277,202 @@ with torch.no_grad():
 cm = confusion_matrix(y_true, y_pred, labels=range(len(classifier.classes_)))
 ConfusionMatrixDisplay(cm, display_labels=classifier.classes_).plot(xticks_rotation="vertical")
 ```
+
+## `SimCLR` — contrastive feature learning
+
+An unsupervised alternative to `VAE`: instead of reconstruction, it trains
+via **contrastive learning** (Chen et al., "A Simple Framework for
+Contrastive Learning of Visual Representations", 2020) - the encoder
+learns to recognize that two differently-augmented views of the *same*
+image belong together, and are different from every other image in the
+batch. This is a directly discriminative objective (no labels needed),
+unlike the VAE's reconstruction loss, which only ever rewards encoding
+whatever makes pixel reconstruction easy - typically coarse shape rather
+than the fine typological detail that distinguishes pottery types.
+
+Uses the same `f`/`n`/`s`/`k`-controlled 4-block conv architecture as
+`vae.Encoder`, so a difference in downstream clustering/classification
+accuracy between the two can be attributed to the training objective, not
+to one having a bigger network - but as its own `SimCLREncoder` class,
+not `vae.Encoder` directly, since it adds a `BatchNorm2d` after every
+convolution. Contrastive losses like NT-Xent are prone to *representation
+collapse* (the encoder settling into a near-constant output for every
+input, since early in training that can look like a stable low-gradient
+point) - BatchNorm prevents this by forcing each batch's embeddings to
+stay spread out. In practice, training without it gets visibly stuck: the
+loss sits exactly at `ln(2N-1)` (the "random guessing" baseline for batch
+size N) and never moves, no matter how many epochs run - a telltale sign
+of collapse, not just slow convergence. The VAE's reconstruction loss has
+no equivalent collapse mode, so its `Encoder` never needed BatchNorm.
+
+```python
+SimCLR(
+    input_path: str,   # folder of images (searched recursively)
+    f=4, n=3, s=1, k=128,  # SimCLREncoder architecture - match your VAE's values
+    projection_dim=64,      # output size of the projection head used for the loss
+    output_path=None,
+    run_id="default_run",
+)
+```
+
+### `run(mode="extract_features", *, epochs=100, lr=1e-3, batch_size=128, temperature=0.5, view_transform=None, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
+
+Same two-mode contract as `VAE.run`: `mode="train_model"` trains then
+extracts features; `mode="extract_features"` (default) just runs
+inference with whatever encoder weights are currently loaded. `batch_size`
+matters more here than for the VAE - each training batch also supplies
+the negative examples for the contrastive loss, so very small batches
+give it too few negatives to be a useful signal. `temperature` controls
+how sharply the loss focuses on hard negatives; the default (0.5) is
+safer than the original paper's 0.1, which assumed batch sizes in the
+thousands.
+
+### `forward(x)`
+
+Returns `(h, z)`: `h` is the `SimCLREncoder`'s embedding; `z` is `h` run
+through the projection head and L2-normalized. **Downstream feature
+extraction uses `h`, never `z`** - per the SimCLR paper, the
+pre-projection representation transfers better to downstream tasks, while
+`z` exists only to compute the contrastive loss during training.
+
+### `train_model(folder, epochs=100, lr=1e-3, batch_size=128, temperature=0.5, view_transform=None, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
+
+For each batch, builds two independently-augmented views of every image
+(via `SimCLRDataset`), embeds both views, and minimizes the NT-Xent
+contrastive loss (`_nt_xent_loss`) between them. As with `VAE`, there's no
+validation split, so early stopping watches a smoothed moving average of
+the epoch's **training loss** (`mode="min"`) and restores the best-epoch
+weights once it stops improving — see
+[`EarlyStopping`](#earlystopping--shared-early-stopping-logic).
+`view_transform`
+defaults to `build_augmentation_transform()` (the same recipe the
+`Augmentor` preprocessing step uses) plus `ToTensor()`, but you can pass
+in an existing, already-tuned `Augmentor`'s `.transform` instead of
+letting SimCLR define a second, separately-configured augmentation setup:
+
+```python
+from pipeline.preprocessing.augmentation import Augmentor
+from torchvision import transforms
+
+# Built only for its config/.transform - never call .run() on it.
+augmentor = Augmentor(input_path=folder, crop_scale=(0.7, 1.0))
+view_transform = transforms.Compose([augmentor.transform, transforms.ToTensor()])
+
+simclr.run("train_model", view_transform=view_transform)
+```
+
+`_nt_xent_loss(z1, z2, temperature)`: for a batch of N images (2N views
+total), the only positive for a view is the other view of the same
+source image; every other one of the remaining 2N-2 views is a negative.
+Implemented as a single `cross_entropy` over the `(2N, 2N)` cosine
+similarity matrix, with the diagonal (self-similarity) masked out and the
+target class for each row set to the index of its positive partner.
+
+### `extract_features(batch_size=32) -> pd.DataFrame`
+
+Same output shape as `VAE.extract_features`: a `filename` + `features`
+(the encoder's `h`) row per image, written to
+`<output_path>/features.csv` - drop-in compatible with the same
+downstream clustering/evaluation code, just point it at a different CSV.
+
+### `SimCLRDataset(paths, transform)`
+
+Yields two independently-augmented views of each image per `__getitem__`
+call (freshly randomized every time, so every training epoch sees
+different crops/jitter/blur) - the positive pair the contrastive loss is
+trained on. Has no labels, unlike `ImageDataset`.
+
+## `BYOL` — self-supervised feature learning without negative pairs
+
+A third unsupervised alternative (Grill et al., "Bootstrap Your Own
+Latent", 2020): like `SimCLR`, it relates two augmented views of the same
+image, but it never contrasts against *other* images at all - no
+negative pairs, and therefore no dependence on batch size for the loss to
+have "enough negatives" (a real limitation of `SimCLR` on a dataset this
+size; see `SimCLR.run`'s docstring).
+
+Instead, BYOL keeps two copies of the network:
+- the **online** network (encoder + projector + predictor) - trained by
+  gradient descent, as usual.
+- the **target** network (encoder + projector, no predictor) - *never*
+  trained by gradient descent; its weights are an exponential moving
+  average (EMA) of the online network's.
+
+The online network's *prediction* of one view's projection is trained to
+match the *target* network's actual projection of the other view
+(stop-gradient on the target side), and vice versa - no labels, no
+negatives.
+
+Reuses `SimCLREncoder` and `SimCLRDataset` from `simclr.py` rather than
+duplicating them. If anything, BYOL depends on `SimCLREncoder`'s
+BatchNorm even more than SimCLR does: without negative pairs at all,
+BatchNorm's cross-batch normalization is the main mechanism left
+preventing the online/target networks from collapsing onto "predict the
+same constant regardless of input" - a trivially perfect solution to a
+loss with no negatives to push against. This is literally the failure
+mode the BYOL paper studied when it investigated training without
+BatchNorm.
+
+```python
+BYOL(
+    input_path: str,   # folder of images (searched recursively)
+    f=4, n=3, s=1, k=128,  # SimCLREncoder architecture - match your VAE's/SimCLR's values
+    hidden_dim=256,          # projector/predictor MLP hidden size
+    projection_dim=64,       # projector/predictor output size
+    tau=0.99,                 # EMA momentum for the target network
+    output_path=None,
+    run_id="default_run",
+)
+```
+
+### `run(mode="extract_features", *, epochs=100, lr=1e-3, batch_size=64, view_transform=None, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
+
+Same two-mode contract as `VAE.run`/`SimCLR.run`. Unlike `SimCLR`,
+`batch_size` here doesn't need to be large - there's no negative-pair pool
+to fill, so pick it based on memory/throughput rather than "enough
+negatives". `view_transform` works exactly like `SimCLR.run`'s (defaults
+to `build_augmentation_transform()`; pass an existing `Augmentor`'s
+`.transform` to reuse its exact settings - see `SimCLR.train_model`'s
+docstring for the pattern).
+
+### `forward(view1, view2)`
+
+Unlike `VAE`/`SimCLR`'s `forward` (which take one input and return an
+embedding), `BYOL.forward` takes the *pair* of views and returns the
+scalar training loss directly - its online-predicts-target computation
+only makes sense given two views at once, so this avoids duplicating that
+logic between `forward` and the training loop.
+
+### `train_model(folder, epochs=100, lr=1e-3, batch_size=64, view_transform=None, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
+
+Optimizes only the **online** network's parameters (encoder + projector +
+predictor) - the target network is never touched by the optimizer.
+After every step, `_update_target_network()` pushes the target network's
+weights toward the online network's current weights by `tau`:
+`target = tau * target + (1 - tau) * online`. The target starts training
+as an exact copy of the online network (see `__init__`).
+
+No validation split here either, so early stopping watches a smoothed
+moving average of the epoch's **training loss** (`mode="min"`) exactly
+like `VAE`/`SimCLR`, restoring the best-epoch weights — online *and*
+target networks both, since the snapshot is taken over the whole `BYOL`
+module's `state_dict()` — once training stops. See
+[`EarlyStopping`](#earlystopping--shared-early-stopping-logic).
+
+### `extract_features(batch_size=32) -> pd.DataFrame`
+
+Same output shape as `VAE.extract_features`/`SimCLR.extract_features`:
+a `filename` + `features` row per image, taken from the **online
+encoder's** embedding (never the target encoder's, and never the
+projector/predictor outputs) - drop-in compatible with the same
+downstream clustering/evaluation code.
+
+### `_byol_loss(pred, target)`
+
+`2 - 2 * cosine_similarity(pred, target)` between L2-normalized vectors -
+0 when they point in exactly the same direction, up to 4 when opposite.
+Computed in both directions (`forward` sums both) and averaged over the
+batch to get the final scalar loss.
 
 ## `resize_with_padding(img, target_size=256, fill=255)`
 

@@ -12,7 +12,7 @@ import json
 import os
 
 
-def convert_json_to_yolo(json_path: str, save_path: str = "../../data/yolo_data"):
+def convert_json_to_yolo(json_path: str, save_path: str = "../../data/newbbs/txt/"):
     """Convert one LabelMe JSON annotation into a YOLO segmentation label.
 
     Writes `<save_path>/<same filename>.txt` with a single line:
@@ -34,15 +34,26 @@ def convert_json_to_yolo(json_path: str, save_path: str = "../../data/yolo_data"
     image_height = data["imageHeight"]
     image_width = data["imageWidth"]
 
-    file = f"1 "
+    file = f"0 "
     points = data["shapes"][0]['points']
 
-    for point in points:
-        x = point[0]
-        y = point[1]
-        normalized_x = x / image_width
-        normalized_y = y / image_height
-        file += f"{normalized_x} {normalized_y} "
+    point1x = points[0][0]
+    point1y = points[0][1]
+    point2x = points[1][0]
+    point2y = points[1][1]
+
+    width = point2x - point1x
+    height = point2y - point1y
+
+    x_center = point1x+(width/2)
+    y_center = point1y+(height/2)
+
+    n_width = width/image_width
+    n_height = height/image_height
+    nx_center = x_center/image_width
+    ny_center = y_center/image_height
+
+    file += f"{nx_center} {ny_center} {n_width} {n_height} "
 
     # Save the YOLO formatted data to a text file
     save_path = save_path + "/" + json_path.split("/")[-1].replace(".json", ".txt")
@@ -50,7 +61,7 @@ def convert_json_to_yolo(json_path: str, save_path: str = "../../data/yolo_data"
         f.write(file)
 
 if __name__ == "__main__":
-    root_path = "../../data/interim/test/json"
+    root_path = "../../data/newbbs"
 
     # Iterate through all JSON files in the directory
     for json_file in os.listdir(root_path):

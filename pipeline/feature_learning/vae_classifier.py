@@ -13,6 +13,7 @@ import torch.optim as optim
 from pathlib import Path
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
+from pipeline.feature_learning.early_stopping import EarlyStopping
 from pipeline.preprocessing.dataset import ImageDataset, collect_image_paths
 
 from sklearn.model_selection import train_test_split
@@ -289,12 +290,13 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             lr=lr,
         )
 
+        early_stopping = EarlyStopping(
+            patience=early_stopping_patience,
+            min_delta=early_stopping_min_delta,
+            smoothing_window=early_stopping_smoothing_window,
+            mode="max",
+        )
         history = []
-        val_acc_history = []
-        best_smoothed_val_acc = -1.0
-        best_epoch = 0
-        best_state_dict = None
-        epochs_without_improvement = 0
 
         for epoch in range(epochs):
             self.train()
@@ -344,10 +346,7 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             val_acc = val_correct / val_count
             average_loss = train_loss / train_count
 
-            val_acc_history.append(val_acc)
-            smoothed_val_acc = sum(
-                val_acc_history[-early_stopping_smoothing_window:]
-            ) / len(val_acc_history[-early_stopping_smoothing_window:])
+            smoothed_val_acc, should_stop = early_stopping.step(val_acc, epoch + 1, model=self)
 
             history.append({
                 "epoch": epoch + 1,
@@ -368,26 +367,15 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             # Early stopping runs on the moving average of val_acc rather
             # than the raw per-epoch value, so a single noisy epoch can't
             # trigger it while the underlying trend is still improving.
-            if smoothed_val_acc > best_smoothed_val_acc + early_stopping_min_delta:
-                best_smoothed_val_acc = smoothed_val_acc
-                best_epoch = epoch + 1
-                best_state_dict = {
-                    key: value.detach().cpu().clone()
-                    for key, value in self.state_dict().items()
-                }
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-                if epochs_without_improvement >= early_stopping_patience:
-                    print(
-                        f"Early stopping at epoch {epoch + 1} "
-                        f"(no improvement in smoothed val_acc for {early_stopping_patience} epochs, "
-                        f"best smoothed={best_smoothed_val_acc:.4f} @ epoch {best_epoch})"
-                    )
-                    break
+            if should_stop:
+                print(
+                    f"Early stopping at epoch {epoch + 1} "
+                    f"(no improvement in smoothed val_acc for {early_stopping_patience} epochs, "
+                    f"best smoothed={early_stopping.best_smoothed:.4f} @ epoch {early_stopping.best_epoch})"
+                )
+                break
 
-        if best_state_dict is not None:
-            self.load_state_dict(best_state_dict)
+        early_stopping.restore_best(self)
 
         output_dir = Path(self.output_path or "classifier_results")
         output_dir.mkdir(parents=True, exist_ok=True)

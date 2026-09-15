@@ -17,7 +17,7 @@ preprocessing  ->  feature_learning  ->  clustering  ->  evaluation (optional)
 | Stage | Package | Purpose |
 |---|---|---|
 | Preprocessing | [`pipeline/preprocessing`](preprocessing/README.md) | Clean up raw photos: remove background, repair broken line drawings, normalize size. |
-| Feature learning | [`pipeline/feature_learning`](feature_learning/README.md) | Turn preprocessed images into fixed-length feature vectors (unsupervised VAE) or predict pottery type directly (supervised classifier). |
+| Feature learning | [`pipeline/feature_learning`](feature_learning/README.md) | Turn preprocessed images into fixed-length feature vectors (unsupervised VAE, SimCLR, or BYOL) or predict pottery type directly (supervised classifier). |
 | Clustering | [`pipeline/clustering`](clustering/README.md) | Group feature vectors into clusters, e.g. hierarchical clustering. |
 | Evaluation | [`pipeline/evaluation`](evaluation/README.md) | Score cluster/classifier output against ground truth (or unsupervised, via silhouette score). |
 
@@ -107,7 +107,7 @@ pipeline/
 ├── pipeline.py              # Pipeline orchestrator class
 ├── steps/                   # Step: shared abstract base for every stage
 ├── preprocessing/           # BackgroundEraser, Repair, Normalizer, Augmentor + shared image-loading helpers
-├── feature_learning/        # VAE, VAEClassifier
+├── feature_learning/        # VAE, SimCLR, BYOL, VAEClassifier
 ├── clustering/               # HierarchicalClustering
 └── evaluation/                # EvaluationWithGroundTruth, EvaluationWithNoGroundTruth
 ```

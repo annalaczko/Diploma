@@ -26,6 +26,7 @@ from pathlib import Path
 from PIL import ImageOps
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
+from pipeline.feature_learning.early_stopping import EarlyStopping
 from pipeline.preprocessing.dataset import ImageDataset, collect_image_paths
 
 
@@ -83,7 +84,10 @@ class VAE(nn.Module, FeatureLearningStep):
         *,
         epochs=10,
         lr=1e-6,
-        batch_size=32
+        batch_size=32,
+        early_stopping_patience=15,
+        early_stopping_min_delta=0.0,
+        early_stopping_smoothing_window=10,
     ) -> pd.DataFrame:
         """Either train the VAE from scratch, or just embed `input_path`'s
         images with the current (e.g. previously loaded) weights.
@@ -93,9 +97,17 @@ class VAE(nn.Module, FeatureLearningStep):
                 extracts features from the trained model; 'extract_features'
                 (default) skips training and just runs inference - use
                 this once you already have trained weights loaded.
-            epochs: training epochs, only used when mode='train_model'.
+            epochs: maximum training epochs, only used when
+                mode='train_model' (may stop earlier via early stopping).
             lr: Adam learning rate, only used when mode='train_model'.
             batch_size: batch size for both training and feature extraction.
+            early_stopping_patience: stop after this many consecutive
+                epochs with no improvement in the smoothed training loss.
+            early_stopping_min_delta: minimum decrease in smoothed
+                training loss to count as an improvement.
+            early_stopping_smoothing_window: number of most recent epochs
+                averaged together for the early-stopping signal, so a
+                single noisy epoch can't trigger a stop on its own.
 
         Returns:
             A DataFrame with one 'filename' and 'features' (latent vector)
@@ -116,6 +128,9 @@ class VAE(nn.Module, FeatureLearningStep):
                 epochs=epochs,
                 lr=lr,
                 batch_size=batch_size,
+                early_stopping_patience=early_stopping_patience,
+                early_stopping_min_delta=early_stopping_min_delta,
+                early_stopping_smoothing_window=early_stopping_smoothing_window,
             )
 
         return self.extract_features(folder, batch_size=batch_size)
@@ -139,17 +154,41 @@ class VAE(nn.Module, FeatureLearningStep):
         x_reconstructed = self.decoder(z)
         return x_reconstructed, mu, sigma
 
-    def train_model(self, folder, epochs=10, lr=1e-6, batch_size=32):
+    def train_model(
+        self,
+        folder,
+        epochs=10,
+        lr=1e-6,
+        batch_size=32,
+        early_stopping_patience=15,
+        early_stopping_min_delta=0.0,
+        early_stopping_smoothing_window=10,
+    ):
         """Train the VAE (encoder + decoder) to reconstruct images from
         `folder`, using a cyclically annealed KL weight (`beta`, see
         `_cyclical_beta`) to avoid posterior collapse, then extract and
         return features from the trained model.
 
+        There's no validation split here (this is unsupervised
+        reconstruction, not classification), so early stopping instead
+        watches a smoothed moving average of the *training* loss - see
+        `EarlyStopping` - and stops once it's stopped improving for
+        `early_stopping_patience` epochs, restoring the best-epoch
+        weights before returning.
+
         Args:
             folder: image folder to train on (passed to `ImageDataset`).
-            epochs: number of training epochs.
+            epochs: maximum number of training epochs (may stop earlier
+                via early stopping).
             lr: Adam learning rate.
             batch_size: training batch size.
+            early_stopping_patience: stop after this many consecutive
+                epochs with no improvement in the smoothed training loss.
+            early_stopping_min_delta: minimum decrease in smoothed
+                training loss to count as an improvement.
+            early_stopping_smoothing_window: number of most recent epochs
+                averaged together for the early-stopping signal, so a
+                single noisy epoch can't trigger a stop on its own.
 
         Returns:
             The DataFrame from `extract_features` (filenames + latent
@@ -167,6 +206,12 @@ class VAE(nn.Module, FeatureLearningStep):
             num_workers=16, pin_memory=True, persistent_workers=True
         )
         optimizer = optim.Adam(self.parameters(), lr=lr)
+        early_stopping = EarlyStopping(
+            patience=early_stopping_patience,
+            min_delta=early_stopping_min_delta,
+            smoothing_window=early_stopping_smoothing_window,
+            mode="min",
+        )
 
         self.train()
         for epoch in range(epochs):
@@ -180,7 +225,23 @@ class VAE(nn.Module, FeatureLearningStep):
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
-            print(f'[epoch {epoch+1}] loss: {train_loss / len(loader):.3f} | beta: {beta:.3f}')
+
+            average_loss = train_loss / len(loader)
+            smoothed_loss, should_stop = early_stopping.step(average_loss, epoch + 1, model=self)
+            print(
+                f'[epoch {epoch+1}] loss: {average_loss:.3f} | '
+                f'smoothed: {smoothed_loss:.3f} | beta: {beta:.3f}'
+            )
+
+            if should_stop:
+                print(
+                    f"Early stopping at epoch {epoch + 1} "
+                    f"(no improvement in smoothed loss for {early_stopping_patience} epochs, "
+                    f"best smoothed={early_stopping.best_smoothed:.3f} @ epoch {early_stopping.best_epoch})"
+                )
+                break
+
+        early_stopping.restore_best(self)
 
         return self.extract_features(batch_size=batch_size)
 

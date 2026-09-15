@@ -46,7 +46,7 @@ def test_augmentor_keep_original_false_omits_unaugmented_copy(tmp_path):
     assert output_names == {"sample_aug0.png", "sample_aug1.png"}
 
 
-def test_augmentor_preserves_image_size_and_mode(tmp_path):
+def test_augmentor_resizes_augmented_copies_to_output_size_and_preserves_mode(tmp_path):
     source_dir = tmp_path / "source"
     source_dir.mkdir()
     Image.new("L", (64, 48), 200).save(source_dir / "sample.png")
@@ -56,13 +56,20 @@ def test_augmentor_preserves_image_size_and_mode(tmp_path):
         input_path=str(source_dir),
         output_path=str(output_dir),
         num_augmentations=1,
+        output_size=32,
     )
 
     augmentor.run()
 
+    # The random-resized-crop always produces a square output_size x
+    # output_size image, regardless of the source image's own size/shape.
     augmented = Image.open(output_dir / "sample_aug0.png")
-    assert augmented.size == (64, 48)
+    assert augmented.size == (32, 32)
     assert augmented.mode == "L"
+
+    # The kept, unaugmented original is left completely untouched.
+    original = Image.open(output_dir / "sample.png")
+    assert original.size == (64, 48)
 
 
 def test_augmentor_zero_augmentations_with_keep_original_just_copies(tmp_path):

@@ -1,6 +1,6 @@
 """Data-augmentation preprocessing step: writes randomly perturbed copies
-of each input image (rotation, flips, mild scale/translation jitter) to
-grow a small labelled dataset without collecting more real images.
+of each input image (crop+resize, color jitter, blur, flip) to grow a
+small labelled dataset without collecting more real images.
 """
 
 from pathlib import Path
@@ -14,32 +14,68 @@ from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 from pipeline.preprocessing.dataset import collect_image_paths, DEFAULT_IMAGE_EXTENSIONS
 
 
-class Augmentor(PreprocessingStep):
-    """Generates randomly augmented copies of each input image: rotation,
-    horizontal/vertical flips, and mild scale/translation jitter.
+def build_augmentation_transform(
+    output_size=256,
+    crop_scale=(0.6, 1.0),
+    crop_ratio=(0.9, 1.1),
+    brightness=0.2,
+    contrast=0.2,
+    blur_kernel_size=5,
+    blur_sigma=(0.1, 2.0),
+    blur_probability=0.5,
+    horizontal_flip=True,
+):
+    """Build a random crop+resize / color-jitter / blur / flip pipeline.
 
-    Pottery sherds have no canonical orientation, so rotation and flips
-    are safe (and useful) augmentations here, unlike for e.g. natural
-    photographs where "up" usually matters. This is meant to sit right
-    before a training step (VAE / VAEClassifier) that would otherwise
-    overfit on a small labelled dataset.
+    Factored out of `Augmentor` so the same augmentation recipe can be
+    reused wherever on-the-fly random views of an image are needed - e.g.
+    `pipeline.feature_learning.simclr.SimCLRDataset` generates its two
+    positive-pair views this way, instead of duplicating the transform
+    definition. See `Augmentor`'s docstring for what each argument means.
+    """
+    return transforms.Compose([
+        transforms.RandomResizedCrop(output_size, scale=crop_scale, ratio=crop_ratio),
+        transforms.ColorJitter(brightness=brightness, contrast=contrast),
+        transforms.RandomApply(
+            [transforms.GaussianBlur(blur_kernel_size, sigma=blur_sigma)],
+            p=blur_probability,
+        ),
+        transforms.RandomHorizontalFlip(p=0.5 if horizontal_flip else 0.0),
+    ])
+
+
+class Augmentor(PreprocessingStep):
+    """Generates randomly augmented copies of each input image: random
+    cropping+resizing, brightness/contrast jitter, occasional Gaussian
+    blur, and a random horizontal flip.
+
+    This is meant to sit right before a training step (VAE / VAEClassifier)
+    that would otherwise overfit on a small labelled dataset.
 
     Config (all optional, sensible defaults provided):
         num_augmentations: number of randomly augmented copies to
             generate per input image.
         keep_original: if True, also copies each source image into
             output_path unchanged, alongside its augmented copies.
-        rotation_degrees: images are rotated by a random angle in
-            [-rotation_degrees, rotation_degrees].
-        horizontal_flip / vertical_flip: whether to randomly (p=0.5)
-            mirror images along that axis.
-        scale_range: (min, max) random zoom factor applied per copy.
-        translate_fraction: max random shift, as a fraction of image
-            width/height, applied independently on each axis.
-        fill_value: background fill (0-255) used for any pixels that
-            rotation/translation/scaling expose outside the original
-            image content; automatically expanded to match the image's
-            mode (grayscale vs. RGB/RGBA).
+        output_size: side length (px) each augmented copy is resized to
+            after cropping. The kept-original copy (if any) is left at
+            its own size.
+        crop_scale: (min, max) fraction of the original image area that
+            the random crop covers before being resized to output_size -
+            e.g. (0.8, 1.0) crops anywhere from 80% to 100% of the image.
+        crop_ratio: (min, max) aspect ratio range for the random crop;
+            kept close to 1.0 so sherds aren't visibly stretched.
+        brightness / contrast: jitter strength passed to
+            `torchvision.transforms.ColorJitter` (e.g. 0.2 means the
+            factor is drawn from [0.8, 1.2]).
+        blur_kernel_size: kernel size (must be odd) for the occasional
+            Gaussian blur.
+        blur_sigma: (min, max) blur standard deviation, randomized each
+            time the blur is applied.
+        blur_probability: chance that Gaussian blur is applied at all to
+            a given augmented copy, in [0, 1].
+        horizontal_flip: whether to randomly (p=0.5) mirror images
+            left-right.
         seed: if given, seeds torch's RNG once at the start of `run()`
             for reproducible augmentations.
         image_extensions: file suffixes treated as input images.
@@ -54,12 +90,15 @@ class Augmentor(PreprocessingStep):
         run_id="default_run",
         num_augmentations=1,
         keep_original=True,
-        rotation_degrees=180,
+        output_size=256,
+        crop_scale=(0.8, 1.0),
+        crop_ratio=(0.9, 1.1),
+        brightness=0.2,
+        contrast=0.2,
+        blur_kernel_size=5,
+        blur_sigma=(0.1, 2.0),
+        blur_probability=0.5,
         horizontal_flip=True,
-        vertical_flip=True,
-        scale_range=(0.9, 1.1),
-        translate_fraction=0.05,
-        fill_value=255,
         seed=None,
         image_extensions: tuple[str, ...] = DEFAULT_IMAGE_EXTENSIONS,
     ):
@@ -77,14 +116,29 @@ class Augmentor(PreprocessingStep):
 
         self.num_augmentations = num_augmentations
         self.keep_original = keep_original
-        self.rotation_degrees = rotation_degrees
+        self.output_size = output_size
+        self.crop_scale = crop_scale
+        self.crop_ratio = crop_ratio
+        self.brightness = brightness
+        self.contrast = contrast
+        self.blur_kernel_size = blur_kernel_size
+        self.blur_sigma = blur_sigma
+        self.blur_probability = blur_probability
         self.horizontal_flip = horizontal_flip
-        self.vertical_flip = vertical_flip
-        self.scale_range = scale_range
-        self.translate_fraction = translate_fraction
-        self.fill_value = fill_value
         self.seed = seed
         self.image_extensions = image_extensions
+
+        self.transform = build_augmentation_transform(
+            output_size=self.output_size,
+            crop_scale=self.crop_scale,
+            crop_ratio=self.crop_ratio,
+            brightness=self.brightness,
+            contrast=self.contrast,
+            blur_kernel_size=self.blur_kernel_size,
+            blur_sigma=self.blur_sigma,
+            blur_probability=self.blur_probability,
+            horizontal_flip=self.horizontal_flip,
+        )
 
     def run(self) -> Path:
         """Generate `num_augmentations` randomly augmented copies of every
@@ -114,9 +168,8 @@ class Augmentor(PreprocessingStep):
             if self.keep_original:
                 image.save(output_dir / image_path.name)
 
-            transform = self._build_transform(image.mode)
             for i in range(self.num_augmentations):
-                augmented = transform(image)
+                augmented = self.transform(image)
                 out_path = output_dir / f"{image_path.stem}_aug{i}{image_path.suffix}"
                 augmented.save(out_path)
 
@@ -124,27 +177,3 @@ class Augmentor(PreprocessingStep):
             self.delete_input_data()
 
         return output_dir
-
-    def _build_transform(self, mode: str):
-        """Build a fresh random-augmentation pipeline, with its fill color
-        matched to `mode` (a plain int for grayscale, an RGB(A) tuple
-        otherwise) since torchvision requires the fill to match the
-        image's channel count.
-        """
-        if mode == "L":
-            fill = self.fill_value
-        elif mode == "RGBA":
-            fill = (self.fill_value, self.fill_value, self.fill_value, 255)
-        else:
-            fill = (self.fill_value, self.fill_value, self.fill_value)
-
-        return transforms.Compose([
-            transforms.RandomAffine(
-                degrees=self.rotation_degrees,
-                translate=(self.translate_fraction, self.translate_fraction),
-                scale=self.scale_range,
-                fill=fill,
-            ),
-            transforms.RandomHorizontalFlip(p=0.5 if self.horizontal_flip else 0.0),
-            transforms.RandomVerticalFlip(p=0.5 if self.vertical_flip else 0.0),
-        ])
