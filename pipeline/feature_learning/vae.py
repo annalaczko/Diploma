@@ -88,6 +88,9 @@ class VAE(nn.Module, FeatureLearningStep):
         early_stopping_patience=15,
         early_stopping_min_delta=0.0,
         early_stopping_smoothing_window=10,
+        lr_scheduler_factor=0.5,
+        lr_scheduler_patience=5,
+        min_lr=1e-8,
     ) -> pd.DataFrame:
         """Either train the VAE from scratch, or just embed `input_path`'s
         images with the current (e.g. previously loaded) weights.
@@ -102,12 +105,17 @@ class VAE(nn.Module, FeatureLearningStep):
             lr: Adam learning rate, only used when mode='train_model'.
             batch_size: batch size for both training and feature extraction.
             early_stopping_patience: stop after this many consecutive
-                epochs with no improvement in the smoothed training loss.
+                epochs with no improvement in the smoothed training ELBO.
             early_stopping_min_delta: minimum decrease in smoothed
-                training loss to count as an improvement.
+                training ELBO to count as an improvement.
             early_stopping_smoothing_window: number of most recent epochs
                 averaged together for the early-stopping signal, so a
                 single noisy epoch can't trigger a stop on its own.
+            lr_scheduler_factor: multiplier applied to the learning rate
+                when the ELBO plateaus (ReduceLROnPlateau).
+            lr_scheduler_patience: epochs with no ELBO improvement before
+                the learning rate is reduced.
+            min_lr: lower bound the learning rate is never reduced below.
 
         Returns:
             A DataFrame with one 'filename' and 'features' (latent vector)
@@ -131,6 +139,9 @@ class VAE(nn.Module, FeatureLearningStep):
                 early_stopping_patience=early_stopping_patience,
                 early_stopping_min_delta=early_stopping_min_delta,
                 early_stopping_smoothing_window=early_stopping_smoothing_window,
+                lr_scheduler_factor=lr_scheduler_factor,
+                lr_scheduler_patience=lr_scheduler_patience,
+                min_lr=min_lr,
             )
 
         return self.extract_features(folder, batch_size=batch_size)
@@ -163,6 +174,9 @@ class VAE(nn.Module, FeatureLearningStep):
         early_stopping_patience=15,
         early_stopping_min_delta=0.0,
         early_stopping_smoothing_window=10,
+        lr_scheduler_factor=0.5,
+        lr_scheduler_patience=5,
+        min_lr=1e-8,
     ):
         """Train the VAE (encoder + decoder) to reconstruct images from
         `folder`, using a cyclically annealed KL weight (`beta`, see
@@ -171,10 +185,17 @@ class VAE(nn.Module, FeatureLearningStep):
 
         There's no validation split here (this is unsupervised
         reconstruction, not classification), so early stopping instead
-        watches a smoothed moving average of the *training* loss - see
+        watches a smoothed moving average of the *training* ELBO - see
         `EarlyStopping` - and stops once it's stopped improving for
         `early_stopping_patience` epochs, restoring the best-epoch
         weights before returning.
+
+        The learning rate is adapted with `ReduceLROnPlateau`, also driven
+        by the ELBO. Both monitor the unweighted ELBO (BCE + KLD) rather
+        than the beta-weighted loss: the cyclical beta makes the weighted
+        loss rise whenever beta ramps up (it's lowest at beta=0, where the
+        KL term is ignored entirely), so it would make an unregularized
+        early epoch look "best" and trigger spurious plateaus.
 
         Args:
             folder: image folder to train on (passed to `ImageDataset`).
@@ -183,12 +204,17 @@ class VAE(nn.Module, FeatureLearningStep):
             lr: Adam learning rate.
             batch_size: training batch size.
             early_stopping_patience: stop after this many consecutive
-                epochs with no improvement in the smoothed training loss.
+                epochs with no improvement in the smoothed training ELBO.
             early_stopping_min_delta: minimum decrease in smoothed
-                training loss to count as an improvement.
+                training ELBO to count as an improvement.
             early_stopping_smoothing_window: number of most recent epochs
                 averaged together for the early-stopping signal, so a
                 single noisy epoch can't trigger a stop on its own.
+            lr_scheduler_factor: multiplier applied to the learning rate
+                when the ELBO plateaus (ReduceLROnPlateau).
+            lr_scheduler_patience: epochs with no ELBO improvement before
+                the learning rate is reduced.
+            min_lr: lower bound the learning rate is never reduced below.
 
         Returns:
             The DataFrame from `extract_features` (filenames + latent
@@ -206,6 +232,13 @@ class VAE(nn.Module, FeatureLearningStep):
             num_workers=16, pin_memory=True, persistent_workers=True
         )
         optimizer = optim.Adam(self.parameters(), lr=lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=lr_scheduler_factor,
+            patience=lr_scheduler_patience,
+            min_lr=min_lr,
+        )
         early_stopping = EarlyStopping(
             patience=early_stopping_patience,
             min_delta=early_stopping_min_delta,
@@ -216,27 +249,38 @@ class VAE(nn.Module, FeatureLearningStep):
         self.train()
         for epoch in range(epochs):
             train_loss = 0.0
+            train_elbo = 0.0
             beta = self._cyclical_beta(epoch+1, epochs, 4)
             for i, inputs in enumerate(loader):
                 inputs = inputs.to(device, non_blocking=True)
                 optimizer.zero_grad()
                 outputs, mu, sigma = self(inputs)
-                loss = self._loss_function(outputs, inputs, mu, sigma, beta)
+                bce, kld = self._loss_terms(outputs, inputs, mu, sigma)
+                loss = bce + beta * kld
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite VAE loss at epoch {epoch + 1}, batch {i} "
+                        f"(bce={bce.item()}, kld={kld.item()}) - try a lower lr."
+                    )
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
+                train_elbo += (bce + kld).item()
 
             average_loss = train_loss / len(loader)
-            smoothed_loss, should_stop = early_stopping.step(average_loss, epoch + 1, model=self)
+            average_elbo = train_elbo / len(loader)
+            scheduler.step(average_elbo)
+            smoothed_elbo, should_stop = early_stopping.step(average_elbo, epoch + 1, model=self)
             print(
                 f'[epoch {epoch+1}] loss: {average_loss:.3f} | '
-                f'smoothed: {smoothed_loss:.3f} | beta: {beta:.3f}'
+                f'elbo: {average_elbo:.3f} | smoothed elbo: {smoothed_elbo:.3f} | '
+                f'beta: {beta:.3f} | lr: {optimizer.param_groups[0]["lr"]:.2e}'
             )
 
             if should_stop:
                 print(
                     f"Early stopping at epoch {epoch + 1} "
-                    f"(no improvement in smoothed loss for {early_stopping_patience} epochs, "
+                    f"(no improvement in smoothed ELBO for {early_stopping_patience} epochs, "
                     f"best smoothed={early_stopping.best_smoothed:.3f} @ epoch {early_stopping.best_epoch})"
                 )
                 break
@@ -305,9 +349,18 @@ class VAE(nn.Module, FeatureLearningStep):
         space that's more disentangled/regularized (better for downstream
         clustering, worse for pixel-perfect reconstructions).
         """
+        BCE, KLD = VAE._loss_terms(recon_x, x, mu, logvar)
+        return BCE + beta * KLD
+
+    @staticmethod
+    def _loss_terms(recon_x, x, mu, logvar):
+        """The two unweighted components of `_loss_function`: the BCE
+        reconstruction error and the KL divergence. Kept separate so the
+        training loop can also track the beta-independent ELBO (BCE + KLD).
+        """
         BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return BCE + beta * KLD
+        return BCE, KLD
 
     @staticmethod
     def _cyclical_beta(epoch, T, M, R=0.5):
@@ -412,7 +465,9 @@ class Encoder(nn.Module):
         #block4
         x = x.view(x.size(0), -1)
         mu = self.fc_mu(x)
-        sigma = self.fc_sigma(x)
+        # Clamp the log-variance: unbounded, exp(sigma) in the KL term can
+        # overflow to inf, which turns gradients - and then weights - into NaN.
+        sigma = torch.clamp(self.fc_sigma(x), min=-10.0, max=10.0)
 
         return mu, sigma
 

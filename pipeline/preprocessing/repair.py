@@ -48,9 +48,15 @@ class Repair(PreprocessingStep):
         min_component_size: connected components smaller than this
             (in px) are treated as noise and removed before repairing.
             Set to 0 to disable this noise-filtering step.
+        skeletonize: if True (default), thin lines to a 1px skeleton
+            and run the endpoint gap-repair step. If False, both are
+            skipped entirely - the pipeline only binarizes (threshold
+            + dilate) and, if `output_thickness > 1`, thickens the
+            result, without any skeleton-based contour repair.
         re_skeletonize: if True, re-thin the result after connecting
             gaps, so the output stays a clean 1px skeleton instead of
-            having slightly thicker joins.
+            having slightly thicker joins. Only relevant when
+            `skeletonize` is True.
         output_thickness: final line thickness (in px) of the output
             image. 1 keeps the raw 1px skeleton; any larger odd value
             (3, 5, ...) dilates the repaired skeleton uniformly to
@@ -72,6 +78,7 @@ class Repair(PreprocessingStep):
         max_distance: int = 15,
         line_thickness: int = 1,
         min_component_size: int = 0,
+        skeletonize: bool = True,
         re_skeletonize: bool = True,
         output_thickness: int = 1,
         image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
@@ -89,6 +96,7 @@ class Repair(PreprocessingStep):
         self.max_distance = max_distance
         self.line_thickness = line_thickness
         self.min_component_size = min_component_size
+        self.skeletonize = skeletonize
         self.re_skeletonize = re_skeletonize
         self.output_thickness = output_thickness
         self.image_extensions = image_extensions
@@ -129,24 +137,31 @@ class Repair(PreprocessingStep):
     def process_image(self, img: Image.Image) -> np.ndarray:
         """Full pipeline on a single raw (grayscale) PIL image.
 
-        contrast enhance -> threshold + dilate -> skeletonize -> repair gaps.
+        contrast enhance -> threshold + dilate -> (if `skeletonize`) skeletonize
+        -> repair gaps -> (if `output_thickness > 1`) thicken.
         Every internal stage works with the white-lines-on-black convention
         (see `threshold_and_dilate`), but the final result is inverted back
         to black lines on a white background before being returned, since
         that's the convention the rest of the pipeline (and a human looking
         at the file) expects.
 
-        Returns a uint8 array (0/255), the final repaired skeleton.
+        Returns a uint8 array (0/255), the final processed image.
         """
         enhanced = self.enhance_contrast(img)
         dilated = self.threshold_and_dilate(enhanced)
-        skeleton = self.to_skeleton(dilated)
-        repaired = self.repair_skeleton(skeleton)
+
+        if self.skeletonize:
+            skeleton = self.to_skeleton(dilated)
+            processed = self.repair_skeleton(skeleton)
+        else:
+            processed = dilated
+            if self.min_component_size > 0:
+                processed = self._remove_small_components(processed, self.min_component_size)
 
         if self.output_thickness > 1:
-            repaired = self.thicken(repaired, self.output_thickness)
+            processed = self.thicken(processed, self.output_thickness)
 
-        return 255 - repaired
+        return 255 - processed
 
     # ------------------------------------------------------------------ #
     # Pipeline stages (each also usable standalone)

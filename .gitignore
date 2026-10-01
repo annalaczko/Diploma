@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 DeepStructurePriors/
 PyPotteryInk/
+
+giapetto/
+giappetto/

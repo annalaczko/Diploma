@@ -23,7 +23,7 @@ class BackgroundEraser(PreprocessingStep):
     def __init__(self,
                  input_path=None,
                  mode = 'detection',
-                 model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolo26m_legion.pt',
+                 model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt',
                  run_id="default_run",
                  batch_size=256,
                  box_margin=0.15,
