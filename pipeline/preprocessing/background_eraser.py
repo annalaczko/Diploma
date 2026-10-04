@@ -27,12 +27,17 @@ class BackgroundEraser(PreprocessingStep):
                  run_id="default_run",
                  batch_size=256,
                  box_margin=0.15,
+                 mask_margin=0.10,
+                 debug_images=10,
                  image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
                  **kwargs):
         """
         Args:
             input_path: path to the root folder containing images. Defaults to None.
-            mode: detection mode; only 'segmentation' is implemented. Defaults to 'segmentation'.
+            mode: 'detection' (default) whites out everything outside the
+                (padded) bounding box; 'segmentation' whites out everything
+                outside the YOLO segmentation mask (grown by `mask_margin`)
+                and crops around that mask.
             model: path to the YOLO segmentation weights to use.
             run_id: identifier used to namespace the default output path (see Step).
             batch_size: number of images YOLO processes per inference batch
@@ -48,6 +53,18 @@ class BackgroundEraser(PreprocessingStep):
                 a thin protruding detail (a handle, spout, ...) from
                 being clipped. 0.15 (the default) grows the box by 15% of
                 its own size on each side, clamped to the image bounds.
+            mask_margin: how much to grow the segmentation mask before
+                whiting-out and cropping (`mode='segmentation'` only), as a
+                fraction of the mask's longer side: 0.10 (the default)
+                makes the mask ~10% larger overall, i.e. a uniform border
+                of 5% of its size all around (see `_dilate_mask`). Like
+                `box_margin`, this keeps a slightly-too-tight mask from
+                clipping the shard's outline.
+            debug_images: how many of the first processed images also get
+                a debug overlay (original image with the YOLO mask/box, the
+                grown mask and the crop square drawn on it), written to a
+                sibling `<output folder>_debug` directory (see
+                `_save_debug_image`). 0 disables it.
             image_extensions: file suffixes treated as input images.
             **kwargs: extra options, e.g. device='cuda'/'cpu' for inference.
         """
@@ -57,6 +74,8 @@ class BackgroundEraser(PreprocessingStep):
         self.model = model
         self.batch_size = batch_size
         self.box_margin = box_margin
+        self.mask_margin = mask_margin
+        self.debug_images = debug_images
         self.kwargs = kwargs
         self.image_extensions = image_extensions
 
@@ -81,7 +100,14 @@ class BackgroundEraser(PreprocessingStep):
             print("Detecting shards...")
             shards = self._detect_shards(model, tmp_dir, path_map, batch_size=self.batch_size)
             print("Clearing images...")
-            self._clear_images(shards, output_dir=self.output_path, crop=True, box_margin=self.box_margin)
+            # Sibling folder, not a subfolder: later steps collect their
+            # input images recursively, so debug overlays inside the output
+            # folder would be picked up as training data.
+            output = Path(self.output_path)
+            debug_dir = output.parent / f"{output.name}_debug"
+            self._clear_images(shards, output_dir=self.output_path, crop=True,
+                               box_margin=self.box_margin, mask_margin=self.mask_margin,
+                               debug_dir=debug_dir, debug_images=self.debug_images)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         return self.output_path if keep_results else None
@@ -187,7 +213,8 @@ class BackgroundEraser(PreprocessingStep):
 
         return results_formatted
     
-    def _clear_images(self, image_dict, output_dir=None, crop=True, box_margin=0.15):
+    def _clear_images(self, image_dict, output_dir=None, crop=True, box_margin=0.15, mask_margin=0.10,
+                      debug_dir=None, debug_images=0):
         """Whites out every pixel outside the detected mask for each image
         and, if `crop` is True, crops to a square canvas centered on its
         detection box (padded with white where the box runs off-image).
@@ -205,11 +232,19 @@ class BackgroundEraser(PreprocessingStep):
                 before it's used for whiting-out (detection mode) and
                 for cropping, so a tightly-drawn box doesn't clip a
                 detail right at its edge.
+            mask_margin: see `__init__`'s docstring - how much the
+                segmentation mask is grown (via `_dilate_mask`) before
+                whiting-out; the crop is then centered on the grown
+                mask's bounding rectangle instead of the detection box.
+            debug_dir: where to write debug overlays (see
+                `_save_debug_image`); None disables them.
+            debug_images: how many of the first images get a debug overlay.
 
         Returns:
             list of dicts with 'path' and the processed 'image' array.
         """
         results = []
+        debug_saved = 0
         for item in tqdm(image_dict, desc="Clearing images"):
             path = item['path']
 
@@ -242,14 +277,27 @@ class BackgroundEraser(PreprocessingStep):
             # Rasterize a binary mask from the polygon
             mask = np.zeros((h, w), dtype=np.uint8)
             cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
+
+            if 'masks' in item and item['masks']:
+                mask = self._dilate_mask(mask, mask_margin)
+                # Crop around the grown mask itself rather than the YOLO
+                # box, so the canvas fits exactly what was kept. Falls
+                # back to the padded box if the polygon was degenerate.
+                ys, xs = np.nonzero(mask)
+                if len(xs):
+                    x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+
+            debug_mask = mask
             mask = mask.astype(bool)
 
             white_bg = np.full_like(img, 255)
             out = np.where(mask[..., None], img, white_bg)
 
+            square_coords = None
             if crop:
                 # Build a square canvas centered on the (already padded)
-                # detection box, big enough to fit its longer side, and
+                # detection box - or, in segmentation mode, the grown
+                # mask's bounding rectangle - big enough to fit its longer side, and
                 # white-pad wherever the square runs off the edge of the
                 # original image.
                 box_w = x2 - x1
@@ -290,6 +338,14 @@ class BackgroundEraser(PreprocessingStep):
                     square[dst_y1:dst_y2, dst_x1:dst_x2] = out[src_y1:src_y2, src_x1:src_x2]
 
                 out = square
+                square_coords = (sq_x1_i, sq_y1_i, sq_x2_i, sq_y2_i)
+
+            if debug_dir is not None and debug_saved < debug_images:
+                self._save_debug_image(
+                    img, box, polygon, debug_mask, square_coords,
+                    Path(debug_dir) / self._flatten_output_name(path),
+                )
+                debug_saved += 1
 
             results.append({'path': path, 'image': out})
 
@@ -299,6 +355,67 @@ class BackgroundEraser(PreprocessingStep):
                 cv2.imwrite(out_path, out)
 
         return results
+
+    @staticmethod
+    def _save_debug_image(img, box, polygon, mask, square, out_path):
+        """Write the original image with what the eraser did drawn on it:
+            red   - the raw YOLO detection box,
+            yellow - the raw YOLO mask polygon (in detection mode this is
+                     just the padded box),
+            green - the outline of the final (grown) mask; everything
+                    outside it was whited out,
+            blue  - the square crop window (may run off-image, where the
+                    output is white-padded).
+
+        Args:
+            img: the original BGR image (not modified).
+            box: raw YOLO box `(x1, y1, x2, y2)`.
+            polygon: (N, 2) polygon the mask was rasterized from.
+            mask: (H, W) uint8 final mask.
+            square: crop square `(x1, y1, x2, y2)`, or None if not cropping.
+            out_path: file to write.
+        """
+        vis = img.copy()
+        t = max(2, round(max(img.shape[:2]) / 300))  # line width scaled to image size
+        bx1, by1, bx2, by2 = (int(round(v)) for v in box)
+        cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 0, 255), t)
+        cv2.polylines(vis, [polygon.astype(np.int32)], True, (0, 255, 255), t)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, contours, -1, (0, 255, 0), t)
+        if square is not None:
+            cv2.rectangle(vis, square[:2], square[2:], (255, 0, 0), t)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_path), vis)
+
+    @staticmethod
+    def _dilate_mask(mask, margin):
+        """Grow a binary uint8 mask by a uniform border, so the result is
+        about `margin` larger than the original along its longer side
+        (`margin / 2` of that side added all around).
+
+        Uses morphological dilation with a disk-shaped kernel rather than
+        scaling the polygon about its center: dilation adds the same
+        border everywhere, so a concave or elongated shard's thin edges
+        get the same safety margin as its bulk.
+
+        Args:
+            mask: (H, W) uint8 mask, nonzero inside the shard.
+            margin: growth as a fraction of the mask's longer side; <= 0
+                returns the mask unchanged.
+
+        Returns:
+            The dilated (H, W) uint8 mask (clipped to the image by
+            construction).
+        """
+        ys, xs = np.nonzero(mask)
+        if margin <= 0 or not len(xs):
+            return mask
+        size = max(xs.max() - xs.min(), ys.max() - ys.min()) + 1
+        radius = int(round(size * margin / 2))
+        if radius < 1:
+            return mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+        return cv2.dilate(mask, kernel)
 
     @staticmethod
     def _expand_box(box, image_width, image_height, margin):

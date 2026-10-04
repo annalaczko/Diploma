@@ -27,6 +27,7 @@ from PIL import ImageOps
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
+from pipeline.feature_learning.reconstruction_losses import get_reconstruction_loss
 from pipeline.preprocessing.dataset import ImageDataset, collect_image_paths
 
 
@@ -44,6 +45,7 @@ class VAE(nn.Module, FeatureLearningStep):
         n=3,
         s=1,
         k=128,
+        recon_loss="bce",
         output_path=None,
         name=None,
         delete_input_data=False,
@@ -62,6 +64,10 @@ class VAE(nn.Module, FeatureLearningStep):
                 uses stride s (see Encoder/Decoder for the exact layout).
             k: latent dimensionality (the feature vector size `mu`/`sigma`
                 end up with, and what downstream clustering operates on).
+            recon_loss: reconstruction term of the loss - 'bce' (default),
+                'dice', 'iou' or 'bce_dice' (see
+                `pipeline.feature_learning.reconstruction_losses`), or any
+                callable `loss(recon_x, x) -> scalar`.
             output_path: where extracted features / checkpoints are saved.
                 Defaults to the Step-computed run-scoped directory.
         """
@@ -77,6 +83,7 @@ class VAE(nn.Module, FeatureLearningStep):
         )
         self.encoder = Encoder(f, n, s, k)
         self.decoder = Decoder(f, n, s, k)
+        self.recon_loss = get_reconstruction_loss(recon_loss)
 
     def run(
         self,
@@ -191,7 +198,7 @@ class VAE(nn.Module, FeatureLearningStep):
         weights before returning.
 
         The learning rate is adapted with `ReduceLROnPlateau`, also driven
-        by the ELBO. Both monitor the unweighted ELBO (BCE + KLD) rather
+        by the ELBO. Both monitor the unweighted ELBO (recon + KLD) rather
         than the beta-weighted loss: the cyclical beta makes the weighted
         loss rise whenever beta ramps up (it's lowest at beta=0, where the
         KL term is ignored entirely), so it would make an unregularized
@@ -255,17 +262,17 @@ class VAE(nn.Module, FeatureLearningStep):
                 inputs = inputs.to(device, non_blocking=True)
                 optimizer.zero_grad()
                 outputs, mu, sigma = self(inputs)
-                bce, kld = self._loss_terms(outputs, inputs, mu, sigma)
-                loss = bce + beta * kld
+                recon, kld = self._loss_terms(outputs, inputs, mu, sigma)
+                loss = recon + beta * kld
                 if not torch.isfinite(loss):
                     raise RuntimeError(
                         f"Non-finite VAE loss at epoch {epoch + 1}, batch {i} "
-                        f"(bce={bce.item()}, kld={kld.item()}) - try a lower lr."
+                        f"(recon={recon.item()}, kld={kld.item()}) - try a lower lr."
                     )
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
-                train_elbo += (bce + kld).item()
+                train_elbo += (recon + kld).item()
 
             average_loss = train_loss / len(loader)
             average_elbo = train_elbo / len(loader)
@@ -340,27 +347,26 @@ class VAE(nn.Module, FeatureLearningStep):
         result.to_csv(output_file, index=False)
         return result
 
-    @staticmethod
-    def _loss_function(recon_x, x, mu, logvar, beta=1.0):
-        """Standard beta-VAE loss: pixel-wise reconstruction error (BCE,
-        since pixels are in [0, 1]) plus a KL-divergence term pulling the
+    def _loss_function(self, recon_x, x, mu, logvar, beta=1.0):
+        """Standard beta-VAE loss: reconstruction error (`self.recon_loss`,
+        BCE by default) plus a KL-divergence term pulling the
         latent distribution toward a standard normal, weighted by `beta`.
         A higher `beta` trades off reconstruction quality for a latent
         space that's more disentangled/regularized (better for downstream
         clustering, worse for pixel-perfect reconstructions).
         """
-        BCE, KLD = VAE._loss_terms(recon_x, x, mu, logvar)
-        return BCE + beta * KLD
+        recon, KLD = self._loss_terms(recon_x, x, mu, logvar)
+        return recon + beta * KLD
 
-    @staticmethod
-    def _loss_terms(recon_x, x, mu, logvar):
-        """The two unweighted components of `_loss_function`: the BCE
-        reconstruction error and the KL divergence. Kept separate so the
-        training loop can also track the beta-independent ELBO (BCE + KLD).
+    def _loss_terms(self, recon_x, x, mu, logvar):
+        """The two unweighted components of `_loss_function`: the
+        reconstruction error (`self.recon_loss`) and the KL divergence.
+        Kept separate so the training loop can also track the
+        beta-independent ELBO (recon + KLD).
         """
-        BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
+        recon = self.recon_loss(recon_x, x)
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return BCE, KLD
+        return recon, KLD
 
     @staticmethod
     def _cyclical_beta(epoch, T, M, R=0.5):
