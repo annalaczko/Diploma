@@ -63,6 +63,10 @@ class Repair(PreprocessingStep):
             that width as the very last step.
         image_extensions: file suffixes considered as input images
             when input_path points to a directory.
+        debug_images: how many of the first images also get a debug
+            strip (every intermediate stage side by side, see
+            `_save_debug_image`), written to a sibling
+            `<output folder>_debug` directory. 0 disables it.
     """
 
     def __init__(
@@ -81,6 +85,7 @@ class Repair(PreprocessingStep):
         skeletonize: bool = True,
         re_skeletonize: bool = True,
         output_thickness: int = 1,
+        debug_images: int = 10,
         image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
     ):
         super().__init__(
@@ -100,6 +105,7 @@ class Repair(PreprocessingStep):
         self.re_skeletonize = re_skeletonize
         self.output_thickness = output_thickness
         self.image_extensions = image_extensions
+        self.debug_images = debug_images
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -122,9 +128,18 @@ class Repair(PreprocessingStep):
                 f"No existing images with extensions {self.image_extensions} found under {source_description}"
             )
 
-        for image_path in tqdm(input_paths, desc="Repairing images", unit="image"):
+        # Sibling folder, not a subfolder: later steps collect their input
+        # images recursively, so debug strips inside the output folder
+        # would be picked up as training data.
+        debug_dir = output_dir.parent / f"{output_dir.name}_debug"
+
+        for idx, image_path in enumerate(tqdm(input_paths, desc="Repairing images", unit="image")):
             img = Image.open(image_path).convert("L")
-            repaired = self.process_image(img)
+            if idx < self.debug_images:
+                repaired, stages = self.process_image(img, return_stages=True)
+                self._save_debug_image(stages, debug_dir / image_path.name)
+            else:
+                repaired = self.process_image(img)
 
             out_path = output_dir / image_path.name
             Image.fromarray(repaired).save(out_path)
@@ -134,7 +149,7 @@ class Repair(PreprocessingStep):
 
         return output_dir
 
-    def process_image(self, img: Image.Image) -> np.ndarray:
+    def process_image(self, img: Image.Image, return_stages: bool = False):
         """Full pipeline on a single raw (grayscale) PIL image.
 
         contrast enhance -> threshold + dilate -> (if `skeletonize`) skeletonize
@@ -145,23 +160,37 @@ class Repair(PreprocessingStep):
         that's the convention the rest of the pipeline (and a human looking
         at the file) expects.
 
-        Returns a uint8 array (0/255), the final processed image.
+        Returns a uint8 array (0/255), the final processed image. With
+        `return_stages=True`, returns `(image, stages)` instead, where
+        `stages` is an ordered `{label: image}` dict of every intermediate
+        result (grayscale arrays, or BGR overlays for the steps that add or
+        remove pixels), for `_save_debug_image`.
         """
+        stages = {"input": np.array(img)}
         enhanced = self.enhance_contrast(img)
+        stages["contrast"] = np.array(enhanced)
         dilated = self.threshold_and_dilate(enhanced)
+        stages["threshold+dilate"] = 255 - dilated
 
         if self.skeletonize:
             skeleton = self.to_skeleton(dilated)
+            stages["skeleton"] = 255 - skeleton
             processed = self.repair_skeleton(skeleton)
+            stages["repair (red=added, blue=removed)"] = self._diff_overlay(skeleton, processed)
         else:
             processed = dilated
             if self.min_component_size > 0:
                 processed = self._remove_small_components(processed, self.min_component_size)
+                stages["small comps (blue=removed)"] = self._diff_overlay(dilated, processed)
 
         if self.output_thickness > 1:
             processed = self.thicken(processed, self.output_thickness)
 
-        return 255 - processed
+        result = 255 - processed
+        stages["output"] = result
+        if return_stages:
+            return result, stages
+        return result
 
     # ------------------------------------------------------------------ #
     # Pipeline stages (each also usable standalone)
@@ -230,6 +259,33 @@ class Repair(PreprocessingStep):
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _diff_overlay(before: np.ndarray, after: np.ndarray) -> np.ndarray:
+        """BGR image comparing two white-lines-on-black masks, drawn as
+        dark lines on white: black = in both, red = only in `after`
+        (added), blue = only in `before` (removed)."""
+        b, a = before > 0, after > 0
+        vis = np.full((*before.shape, 3), 255, np.uint8)
+        vis[b & a] = (0, 0, 0)
+        vis[a & ~b] = (0, 0, 255)
+        vis[b & ~a] = (255, 0, 0)
+        return vis
+
+    @staticmethod
+    def _save_debug_image(stages: dict, out_path: Path) -> None:
+        """Write every stage from `process_image(..., return_stages=True)`
+        side by side, each with its label above it."""
+        panels = []
+        for label, arr in stages.items():
+            panel = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR) if arr.ndim == 2 else arr
+            header = np.full((24, panel.shape[1], 3), 255, np.uint8)
+            cv2.putText(header, label, (4, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+            panels.append(np.vstack([header, panel]))
+            # thin gray separator between panels
+            panels.append(np.full((panels[-1].shape[0], 4, 3), 128, np.uint8))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_path), np.hstack(panels[:-1]))
 
     @staticmethod
     def _remove_small_components(binary: np.ndarray, min_size: int) -> np.ndarray:

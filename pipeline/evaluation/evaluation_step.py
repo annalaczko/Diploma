@@ -73,6 +73,7 @@ class EvaluationWithGroundTruth(EvaluationStep):
         self.acc=0
         self.ari=0
         self.nmi=0
+        self.per_class = None
 
     def run(self) -> None:
         self.evaluate(self.ground_truth, self.predicted)
@@ -82,6 +83,7 @@ class EvaluationWithGroundTruth(EvaluationStep):
         self.ari = adjusted_rand_score(y_true, y_pred)
         self.nmi = normalized_mutual_info_score(y_true, y_pred)
         self.acc = self.clustering_accuracy(y_true, y_pred)
+        self.per_class = self.per_class_accuracy(y_true, y_pred)
         print(self)
 
     def __str__(self):
@@ -109,6 +111,62 @@ class EvaluationWithGroundTruth(EvaluationStep):
             Fraction of samples whose predicted cluster matches its true
             class under the best possible matching, in [0, 1].
         """
+        matrix, _, _, row_ind, col_ind = self._best_matching(y_true, y_pred)
+        matched = matrix[row_ind, col_ind].sum()
+        return matched / matrix.sum()
+
+    def per_class_accuracy(self, y_true, y_pred):
+        """Accuracy broken down by true class, under the same optimal
+        one-to-one cluster <-> class matching that `clustering_accuracy`
+        uses - so the overall ACC is exactly these per-class correct
+        counts summed and divided by the total.
+
+        A class's accuracy is the fraction of its samples that landed in
+        the cluster matched to it. With fewer clusters than classes some
+        classes get no cluster at all (accuracy 0, `matched_cluster`
+        None) - `top_cluster`/`top_cluster_share` still show where most
+        of such a class's samples went, independent of the matching.
+
+        Returns:
+            A DataFrame with one row per true class, sorted by class size:
+            'class', 'n', 'matched_cluster', 'correct', 'accuracy',
+            'top_cluster', 'top_cluster_share'.
+        """
+        matrix, true_labels, pred_labels, row_ind, col_ind = self._best_matching(y_true, y_pred)
+        matched = dict(zip(row_ind, col_ind))
+
+        rows = []
+        for i, label in enumerate(true_labels):
+            n = int(matrix[i].sum())
+            j = matched.get(i)
+            correct = int(matrix[i, j]) if j is not None else 0
+            top = int(matrix[i].argmax())
+            rows.append({
+                "class": label,
+                "n": n,
+                "matched_cluster": pred_labels[j] if j is not None else None,
+                "correct": correct,
+                "accuracy": correct / n,
+                "top_cluster": pred_labels[top],
+                "top_cluster_share": matrix[i, top] / n,
+            })
+        df = pd.DataFrame(rows)
+        # Keep cluster ids as-is: a None (unmatched class) would otherwise
+        # make pandas turn the whole column into floats (0 -> 0.0, None -> NaN).
+        df["matched_cluster"] = pd.Series([r["matched_cluster"] for r in rows], dtype=object)
+        return df.sort_values("n", ascending=False).reset_index(drop=True)
+
+    @staticmethod
+    def _best_matching(y_true, y_pred):
+        """Build the (true classes x predicted clusters) contingency matrix
+        and find the one-to-one class <-> cluster matching maximizing the
+        number of matched samples (Hungarian algorithm).
+
+        Returns:
+            (matrix, true_labels, pred_labels, row_ind, col_ind): the
+            contingency matrix, the label values its rows/columns stand
+            for, and the matched (row, column) index pairs.
+        """
         y_true = np.asarray(y_true, dtype=object)
         y_pred = np.asarray(y_pred, dtype=object)
 
@@ -119,8 +177,8 @@ class EvaluationWithGroundTruth(EvaluationStep):
 
         # Map arbitrary label values to dense integer ids so they can index
         # a contingency matrix.
-        true_codes, _ = pd.factorize(y_true, sort=False)
-        pred_codes, _ = pd.factorize(y_pred, sort=False)
+        true_codes, true_labels = pd.factorize(y_true, sort=False)
+        pred_codes, pred_labels = pd.factorize(y_pred, sort=False)
         matrix = np.zeros(
             (true_codes.max() + 1, pred_codes.max() + 1),
             dtype=np.int64,
@@ -130,6 +188,4 @@ class EvaluationWithGroundTruth(EvaluationStep):
         # linear_sum_assignment minimizes cost, so negate the counts to
         # turn "maximize matches" into "minimize -matches".
         row_ind, col_ind = linear_sum_assignment(-matrix)
-
-        matched = matrix[row_ind, col_ind].sum()
-        return matched / len(y_true)
+        return matrix, true_labels, pred_labels, row_ind, col_ind

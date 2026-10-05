@@ -98,6 +98,7 @@ class VAE(nn.Module, FeatureLearningStep):
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=5,
         min_lr=1e-8,
+        beta_max=1.0,
     ) -> pd.DataFrame:
         """Either train the VAE from scratch, or just embed `input_path`'s
         images with the current (e.g. previously loaded) weights.
@@ -123,6 +124,8 @@ class VAE(nn.Module, FeatureLearningStep):
             lr_scheduler_patience: epochs with no ELBO improvement before
                 the learning rate is reduced.
             min_lr: lower bound the learning rate is never reduced below.
+            beta_max: KL weight reached on the flat stage of each beta cycle
+                (see `train_model`); 1.0 is the plain VAE, > 1 a beta-VAE.
 
         Returns:
             A DataFrame with one 'filename' and 'features' (latent vector)
@@ -149,6 +152,7 @@ class VAE(nn.Module, FeatureLearningStep):
                 lr_scheduler_factor=lr_scheduler_factor,
                 lr_scheduler_patience=lr_scheduler_patience,
                 min_lr=min_lr,
+                beta_max=beta_max,
             )
 
         return self.extract_features(folder, batch_size=batch_size)
@@ -184,6 +188,7 @@ class VAE(nn.Module, FeatureLearningStep):
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=5,
         min_lr=1e-8,
+        beta_max=1.0,
     ):
         """Train the VAE (encoder + decoder) to reconstruct images from
         `folder`, using a cyclically annealed KL weight (`beta`, see
@@ -197,12 +202,30 @@ class VAE(nn.Module, FeatureLearningStep):
         `early_stopping_patience` epochs, restoring the best-epoch
         weights before returning.
 
+        The KL weight follows a cyclical schedule (`_cyclical_beta`) scaled
+        by `beta_max`: each cycle ramps beta from 0 to `beta_max`, then
+        holds it there. `beta_max > 1` (a beta-VAE) makes information in
+        the latent code more expensive: the reconstruction term is summed
+        over all 256x256 pixels but the KL only over the `k` latent dims,
+        so at beta=1 the model can afford to spend latent capacity on
+        pixel-level detail (line thickness, small breaks) instead of just
+        the shard's shape - which is what downstream clustering needs.
+
         The learning rate is adapted with `ReduceLROnPlateau`, also driven
-        by the ELBO. Both monitor the unweighted ELBO (recon + KLD) rather
-        than the beta-weighted loss: the cyclical beta makes the weighted
-        loss rise whenever beta ramps up (it's lowest at beta=0, where the
-        KL term is ignored entirely), so it would make an unregularized
-        early epoch look "best" and trigger spurious plateaus.
+        by the monitored loss. Both are only fed epochs from the *flat*
+        stage of each cycle (beta == beta_max), skipping the ramp
+        entirely: there beta is constant, so the beta-weighted loss -
+        the objective actually being optimized - is comparable from
+        epoch to epoch, also across cycles. During the ramp it isn't (it
+        rises with beta), and when beta drops back to 0 at a cycle
+        restart, the unregularized KL blows up for several epochs, which
+        would otherwise exhaust the early-stopping patience (and halve the
+        LR) right at the start of every new cycle. Skipped epochs don't
+        enter the smoothing window or count toward patience, and the
+        restored "best" weights are always from a beta == beta_max epoch.
+        (With beta_max=1 the monitored loss equals the ELBO; monitoring
+        the ELBO itself for beta_max > 1 would instead reward epochs that
+        encode *more* in the latent - the opposite of the point.)
 
         Args:
             folder: image folder to train on (passed to `ImageDataset`).
@@ -222,6 +245,8 @@ class VAE(nn.Module, FeatureLearningStep):
             lr_scheduler_patience: epochs with no ELBO improvement before
                 the learning rate is reduced.
             min_lr: lower bound the learning rate is never reduced below.
+            beta_max: KL weight reached on the flat stage of each beta cycle
+                (see `train_model`); 1.0 is the plain VAE, > 1 a beta-VAE.
 
         Returns:
             The DataFrame from `extract_features` (filenames + latent
@@ -257,7 +282,8 @@ class VAE(nn.Module, FeatureLearningStep):
         for epoch in range(epochs):
             train_loss = 0.0
             train_elbo = 0.0
-            beta = self._cyclical_beta(epoch+1, epochs, 4)
+            cycle_frac = self._cyclical_beta(epoch+1, epochs, 4)
+            beta = beta_max * cycle_frac
             for i, inputs in enumerate(loader):
                 inputs = inputs.to(device, non_blocking=True)
                 optimizer.zero_grad()
@@ -276,18 +302,24 @@ class VAE(nn.Module, FeatureLearningStep):
 
             average_loss = train_loss / len(loader)
             average_elbo = train_elbo / len(loader)
-            scheduler.step(average_elbo)
-            smoothed_elbo, should_stop = early_stopping.step(average_elbo, epoch + 1, model=self)
+            # Only monitor the flat (beta == beta_max) stage - see the docstring.
+            if cycle_frac >= 1.0:
+                scheduler.step(average_loss)
+                smoothed_loss, should_stop = early_stopping.step(average_loss, epoch + 1, model=self)
+                smoothed_str = f'{smoothed_loss:.3f}'
+            else:
+                should_stop = False
+                smoothed_str = '- (ramp, not monitored)'
             print(
                 f'[epoch {epoch+1}] loss: {average_loss:.3f} | '
-                f'elbo: {average_elbo:.3f} | smoothed elbo: {smoothed_elbo:.3f} | '
+                f'elbo: {average_elbo:.3f} | smoothed loss: {smoothed_str} | '
                 f'beta: {beta:.3f} | lr: {optimizer.param_groups[0]["lr"]:.2e}'
             )
 
             if should_stop:
                 print(
                     f"Early stopping at epoch {epoch + 1} "
-                    f"(no improvement in smoothed ELBO for {early_stopping_patience} epochs, "
+                    f"(no improvement in smoothed loss for {early_stopping_patience} flat-stage epochs, "
                     f"best smoothed={early_stopping.best_smoothed:.3f} @ epoch {early_stopping.best_epoch})"
                 )
                 break
@@ -385,7 +417,7 @@ class VAE(nn.Module, FeatureLearningStep):
             R: proportion of each cycle spent annealing (fraction that ramps 0->1).
 
         Returns:
-            The beta weight to use for this epoch's loss, in [0, 1].
+            The fraction of `beta_max` to use for this epoch's loss, in [0, 1].
         """
         period = T / M
         tau = ((epoch - 1) % math.ceil(period)) / period
@@ -499,7 +531,9 @@ class Decoder(nn.Module):
         # Projects the k-dim latent vector up to the flattened conv shape;
         # applied externally (see VAE.forward) before conv0 runs.
         self.fc = nn.Linear(k, 2**(f+3) * 32 * 32)
-        self.conv0 = nn.ConvTranspose2d(k, 2**(f+3), kernel_size=n, stride=s, padding=p)
+        # Input is fc's output reshaped to 2**(f+3) channels (see VAE.forward),
+        # not the k-dim latent - so in_channels must not depend on k.
+        self.conv0 = nn.ConvTranspose2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s, padding=p)
 
         # block1: upsample (stride s+1, mirrors Encoder's block3 downsample)
         self.conv1_0 = nn.ConvTranspose2d(2**(f+3), 2**(f+3), kernel_size=n, stride=s, padding=p)

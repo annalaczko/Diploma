@@ -132,7 +132,9 @@ class BackgroundEraser(PreprocessingStep):
             path = Path(p)
             ext = path.suffix
             link_path = os.path.join(tmp_dir, f"{i:06d}{ext}")
-            os.symlink(str(path), link_path)
+            # Absolute target: a relative one would resolve against tmp_dir,
+            # leaving a dangling link that YOLO silently skips.
+            os.symlink(os.path.abspath(path), link_path)
             path_map[link_path] = str(path)
         return tmp_dir, path_map
 
