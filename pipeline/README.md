@@ -76,6 +76,12 @@ result = pipe.run(source_folder, mode="disk", feature_mode="train_model", epochs
 # result = {"output_path": <last preprocessing folder>, "features": ..., "labels": ...}
 ```
 
+- `save_preprocessed` (memory mode only) also writes preprocessed images to
+  disk, into each step's `output_path`, the same folders disk mode uses:
+  `None` (default) writes nothing, `"last"` only the final images (what
+  feature learning gets; `result["output_path"]` points at them), `"all"`
+  every step's output. An `Augmentor` is not a step in memory mode, so its
+  random views are never saved. Disk mode always writes every step.
 - `feature_mode` is passed as the feature step's `mode`
   (`"train_model"` / `"extract_features"`). Every other keyword argument
   (`epochs`, `lr`, `batch_size`, ...) goes to the feature step's `run()`.
@@ -97,6 +103,49 @@ result = pipe.run(source_folder, mode="disk", feature_mode="train_model", epochs
   comparable between the two.
 - `SimCLR`/`BYOL` already augment their own two views, so in memory mode
   they ignore the `Augmentor` (and print a warning).
+
+## Experiment tracking (MLflow)
+
+`pipeline/tracking.py` logs every stage to MLflow. Pass `experiment_name`
+(and optionally `run_name`) to `Pipeline.run` to record the whole run:
+
+```python
+result = pipe.run(source_folder, mode="memory", feature_mode="train_model", epochs=500,
+                  experiment_name="vae_k128", run_name="mask0.02_axes")
+```
+
+What ends up in the run:
+
+| Stage | Params | Metrics | Artifacts |
+|---|---|---|---|
+| Pipeline | `input_path`, `mode`, `feature_mode`, step chain, `feature/train/*` | `preprocessing/n_images` (memory mode) | |
+| `BackgroundEraser(2)` | `preprocessing/<step>/*` (its settings) | `n_images`, `no_shard_count`, `no_axes_count` | `preprocessing/<step>/no_shard.txt`, `no_axes.txt`: names of the images without a shard / coordinate system, one per line |
+| Feature learning | `feature/<step>/*` (architecture, e.g. `k`, `recon_loss`), `feature/train/*` (all training arguments) | per epoch: `feature/loss`, `smoothed_loss`, `lr` (+ VAE: `elbo`, `recon`, `kld`, `beta`; `VAEClassifier`: accuracies); `best_epoch`, `stopped_epoch` | `feature/features.csv` (`VAEClassifier`: `training_history.csv`) |
+| Clustering | `clustering/cluster_num`, `method`, `metric` | `n_clusters`, cluster size min/max/mean, `singleton_clusters` (`compare_all`: `best_cophenetic`) | `clustering/clusters.csv` (filename -> cluster), `compare_all.csv` |
+| Evaluation | | `eval/acc`, `ari`, `nmi` or `eval/silhouette` | `eval/per_class_accuracy.csv` |
+
+Image names use the flat `<subfolder>__<file>` form in both modes.
+
+Steps called one by one (as in the notebook) log the same way inside a run:
+
+```python
+from pipeline import tracking
+
+with tracking.start_run("vae_k128", run_name="notebook"):
+    vae.run(mode="train_model", epochs=100)
+    labels = HierarchicalClustering(input_path=csv, cluster_num=55).run()
+    metrics = EvaluationWithGroundTruth(y_true, labels).run()
+```
+
+Without an active run (and without mlflow installed) the steps log nothing.
+Runs are stored in the repo, independent of the working directory:
+`mlflow.db` (SQLite) and `mlartifacts/` (both gitignored). Set
+`MLFLOW_TRACKING_URI` to use another store or a tracking server. Browse
+the runs from the repo root with:
+
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
 
 ## Typical run (end to end)
 
@@ -155,6 +204,7 @@ grouped together and separate from other runs.
 ```
 pipeline/
 ├── pipeline.py              # Pipeline orchestrator: disk or in-memory mode
+├── tracking.py              # optional MLflow logging used by every stage
 ├── steps/                   # Step: shared abstract base for every stage
 ├── preprocessing/           # BackgroundEraser, Repair, Normalizer, Augmentor + shared image-loading helpers
 ├── feature_learning/        # VAE, SimCLR, BYOL, VAEClassifier

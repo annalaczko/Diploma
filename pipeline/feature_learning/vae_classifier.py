@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
 
+from pipeline import tracking
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
 from pipeline.preprocessing.dataset import ImageDataset, InMemoryImages, image_entries
@@ -66,6 +67,8 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
                 defaults to `vae.input_path` if not given.
         """
         nn.Module.__init__(self)
+        # Architecture settings, logged to MLflow with each training run.
+        self.hparams = {"num_classes": num_classes, "freeze_encoder": freeze_encoder, **getattr(vae, "hparams", {})}
 
         FeatureLearningStep.__init__(
             self,
@@ -181,6 +184,7 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
 
         # Checking label path correctness and reading labels
 
+        self._log_training_start(**{k: v for k, v in locals().items() if k not in ("self", "folder")})
         if not self.labels_path:
             raise ValueError("labels_path is required")
 
@@ -359,6 +363,13 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
 
             smoothed_val_acc, should_stop = early_stopping.step(val_acc, epoch + 1, model=self)
 
+            self._log_epoch(
+                epoch + 1,
+                loss=average_loss,
+                train_accuracy=train_acc,
+                validation_accuracy=val_acc,
+                validation_accuracy_smoothed=smoothed_val_acc,
+            )
             history.append({
                 "epoch": epoch + 1,
                 "loss": average_loss,
@@ -386,6 +397,7 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
                 )
                 break
 
+        self._log_training_end(early_stopping, epoch + 1)
         early_stopping.restore_best(self)
 
         output_dir = Path(self.output_path or "classifier_results")
@@ -401,6 +413,7 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
 
         history_df = pd.DataFrame(history)
         history_df.to_csv(output_dir / "training_history.csv", index=False)
+        tracking.log_artifact(output_dir / "training_history.csv", artifact_path="feature")
 
         return history_df
 

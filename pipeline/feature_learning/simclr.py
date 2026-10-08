@@ -185,6 +185,8 @@ class SimCLR(nn.Module, FeatureLearningStep):
                 compressed space than the features actually extracted).
         """
         nn.Module.__init__(self)
+        # Architecture settings, logged to MLflow with each training run.
+        self.hparams = {"f": f, "n": n, "s": s, "k": k, "projection_dim": projection_dim}
         FeatureLearningStep.__init__(
             self,
             input_path=input_path or "",
@@ -347,6 +349,7 @@ class SimCLR(nn.Module, FeatureLearningStep):
             The DataFrame from `extract_features` (filenames + latent
             vectors), run once training is complete.
         """
+        self._log_training_start(**{k: v for k, v in locals().items() if k not in ("self", "folder")})
         device = next(self.parameters()).device
 
         if view_transform is None:
@@ -393,6 +396,8 @@ class SimCLR(nn.Module, FeatureLearningStep):
 
             average_loss = train_loss / len(loader)
             smoothed_loss, should_stop = early_stopping.step(average_loss, epoch + 1, model=self)
+            self._log_epoch(epoch + 1, loss=average_loss, smoothed_loss=smoothed_loss,
+                            lr=optimizer.param_groups[0]["lr"])
             print(
                 f"[epoch {epoch + 1}/{epochs}] loss: {average_loss:.3f} | "
                 f"smoothed: {smoothed_loss:.3f}"
@@ -406,6 +411,7 @@ class SimCLR(nn.Module, FeatureLearningStep):
                 )
                 break
 
+        self._log_training_end(early_stopping, epoch + 1)
         early_stopping.restore_best(self)
 
         return self.extract_features(batch_size=batch_size)
@@ -452,6 +458,7 @@ class SimCLR(nn.Module, FeatureLearningStep):
         output_file = Path(self.output_path) / "features.csv"
         output_file.parent.mkdir(parents=True, exist_ok=True)
         result.to_csv(output_file, index=False)
+        self._log_features(output_file)
         return result
 
     @staticmethod

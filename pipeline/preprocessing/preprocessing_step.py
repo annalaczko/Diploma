@@ -53,3 +53,13 @@ class PreprocessingStep(Step):
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support in-memory (batch) mode"
         )
+
+    def begin_run(self) -> None:
+        """Reset per-run bookkeeping (e.g. lists of skipped images) before
+        a pass over the dataset. `Pipeline` calls it before in-memory
+        preprocessing; disk-mode `run()`s call it themselves."""
+
+    def log_summary(self) -> None:
+        """Report per-run bookkeeping to the active MLflow run (see
+        `pipeline.tracking`) after a pass over the dataset. Counterpart of
+        `begin_run`; does nothing by default."""

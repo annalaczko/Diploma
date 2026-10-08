@@ -11,3 +11,8 @@ giappetto/
 
 *.pt
 external/
+
+# MLflow tracking store (pipeline/tracking.py)
+mlflow.db
+mlartifacts/
+mlruns/

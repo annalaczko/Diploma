@@ -3,6 +3,7 @@
 import numpy as np
 import re as regex_module
 
+from pipeline import tracking
 from pipeline.clustering.clustering_step import ClusteringStep
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import pdist
@@ -41,7 +42,9 @@ class HierarchicalClustering(ClusteringStep):
             save_results=True,
             run_id=run_id,
         )
-        self.vectors = self.parse_feature_string(pd.read_csv(input_path)['features'].values)
+        features = pd.read_csv(input_path)
+        self.vectors = self.parse_feature_string(features['features'].values)
+        self.filenames = features['filename'].tolist() if 'filename' in features else None
         self.methods=['single', 'complete', 'average', 'weighted', 'centroid', 'ward']
         self.metrics=['euclidean', 'cityblock', 'chebyshev', 'cosine'] 
 
@@ -62,7 +65,30 @@ class HierarchicalClustering(ClusteringStep):
         """
 
         result = hierarchy.fclusterdata(self.vectors, t=self.cluster_num, criterion="maxclust", metric=self.best_metric, method=self.best_method)
+        self._log_run(result)
         return result
+
+    def _log_run(self, labels):
+        """Log the clustering setup, cluster size statistics and a
+        clusters.csv (filename -> cluster) to the active MLflow run."""
+        tracking.log_params({
+            "cluster_num": self.cluster_num,
+            "method": self.best_method,
+            "metric": self.best_metric,
+            "n_samples": len(labels),
+            "n_features": self.vectors.shape[1],
+        }, prefix="clustering/")
+        sizes = np.bincount(labels)[1:]  # fcluster ids start at 1
+        sizes = sizes[sizes > 0]
+        tracking.log_metrics({
+            "n_clusters": len(sizes),
+            "cluster_size_min": sizes.min(),
+            "cluster_size_max": sizes.max(),
+            "cluster_size_mean": sizes.mean(),
+            "singleton_clusters": int((sizes == 1).sum()),
+        }, prefix="clustering/")
+        names = self.filenames if self.filenames is not None else range(len(labels))
+        tracking.log_table(pd.DataFrame({"filename": names, "cluster": labels}), "clustering/clusters.csv")
 
     def compare_all(self):
         """Try every (method, metric) combination and rank them by
@@ -102,6 +128,17 @@ class HierarchicalClustering(ClusteringStep):
         self.best_method = best_result['method']
         self.best_metric = best_result['metric']
 
+        # cophenet(Z, Y) returns (coefficient, cophenetic distances); log
+        # only the coefficient.
+        def _coefficient(score):
+            return score[0] if isinstance(score, tuple) else score
+        table = pd.DataFrame([
+            {**r, 'cophenetic coefficient score': _coefficient(r['cophenetic coefficient score'])}
+            for r in results
+        ])
+        tracking.log_table(table, "clustering/compare_all.csv")
+        tracking.log_metrics({"best_cophenetic": _coefficient(best_result['cophenetic coefficient score'])},
+                             prefix="clustering/")
         return results
 
     def parse_feature_string(self, values):

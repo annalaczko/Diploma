@@ -3,6 +3,7 @@ learning and (optionally) clustering and evaluation - either through
 intermediate folders on disk, or batch by batch in memory."""
 
 import inspect
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Iterator, Literal
 
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from pipeline import tracking
 from pipeline.clustering.clustering_step import ClusteringStep
 from pipeline.evaluation.evaluation_step import EvaluationStep
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
@@ -79,9 +81,19 @@ class Pipeline:
         mode: Literal["memory", "disk"] = "memory",
         preprocess_batch_size: int = 64,
         feature_mode: str | None = "extract_features",
+        save_preprocessed: Literal["last", "all"] | None = None,
+        experiment_name: str | None = None,
+        run_name: str | None = None,
         **feature_kwargs,
     ) -> dict:
         """Run the pipeline end to end on the raw images under `input_path`.
+
+        With `experiment_name`, everything is tracked in one MLflow run (see
+        `pipeline.tracking`): every step's configuration, the images each
+        BackgroundEraser skipped, the feature-learning curves and
+        features.csv, the clusters and the evaluation metrics. Without it,
+        the same is logged into an MLflow run that is already active (e.g.
+        `with tracking.start_run(...)`), or nothing at all.
 
         Args:
             input_path: raw image file/folder (or list of them) for the
@@ -95,19 +107,50 @@ class Pipeline:
             feature_mode: passed as the feature-learning step's `mode`
                 ('train_model' or 'extract_features'); ignored for steps
                 whose `run()` has no `mode` (e.g. `VAEClassifier`).
+            save_preprocessed: memory mode only - also write preprocessed
+                images to disk, each into its step's `output_path` (the
+                same folder disk mode would use): None (default) writes
+                nothing, 'last' only the final images (after the last
+                image-transforming step, i.e. what feature learning gets),
+                'all' the output of every step. Disk mode always writes
+                every step's output, so it ignores this.
+            experiment_name: MLflow experiment to open a run in; None
+                logs into the active run, if any.
+            run_name: name of that MLflow run (MLflow picks one if None).
             **feature_kwargs: forwarded to the feature-learning step's
                 `run()` (epochs, lr, batch_size, ...).
 
         Returns:
             A dict with 'images' (memory mode: the preprocessed
-            `InMemoryImages`) or 'output_path' (disk mode: the last
-            preprocessing output folder), plus 'features' (whatever the
+            `InMemoryImages`; with `save_preprocessed`, also
+            'output_path', the folder of the final images) or
+            'output_path' (disk mode: the last preprocessing output folder), plus 'features' (whatever the
             feature step's `run()` returned), 'labels' and 'metrics' when
             clustering/evaluation factories were given.
         """
+        if mode not in ("memory", "disk"):
+            raise ValueError("mode must be either 'memory' or 'disk'")
+        if save_preprocessed not in (None, "last", "all"):
+            raise ValueError("save_preprocessed must be None, 'last' or 'all'")
+        run_context = (
+            tracking.start_run(experiment_name, run_name=run_name)
+            if experiment_name is not None
+            else nullcontext()
+        )
+        with run_context:
+            self._log_config(input_path, mode, preprocess_batch_size, feature_mode, feature_kwargs)
+            tracking.log_params({"save_preprocessed": save_preprocessed})
+            return self._run(input_path, mode, preprocess_batch_size, feature_mode, feature_kwargs,
+                             save_preprocessed)
+
+    def _run(self, input_path, mode, preprocess_batch_size, feature_mode, feature_kwargs,
+             save_preprocessed=None) -> dict:
         if mode == "memory":
-            images = self.preprocess_in_memory(input_path, preprocess_batch_size)
+            images = self.preprocess_in_memory(input_path, preprocess_batch_size, save=save_preprocessed)
             result = {"images": images}
+            if save_preprocessed is not None:
+                result["output_path"] = Path(self._batch_steps()[-1].output_path)
+                print(f"Preprocessed images saved under {result['output_path']}")
             if self.feature_learning_step is not None:
                 self.feature_learning_step.set_images(images, train_transform=self._train_transform())
         elif mode == "disk":
@@ -116,8 +159,6 @@ class Pipeline:
             if self.feature_learning_step is not None:
                 self.feature_learning_step.set_images(None)
                 self.feature_learning_step.input_path = str(output_path)
-        else:
-            raise ValueError("mode must be either 'memory' or 'disk'")
 
         if self.feature_learning_step is None:
             return result
@@ -131,16 +172,38 @@ class Pipeline:
                 result["metrics"] = self.evaluation_factory(result["labels"]).run()
         return result
 
+    def _log_config(self, input_path, mode, preprocess_batch_size, feature_mode, feature_kwargs):
+        """Log the run setup and every step's configuration (no-op without
+        an active MLflow run). Steps log their own results as they run."""
+        tracking.log_params({
+            "input_path": str(input_path),
+            "mode": mode,
+            "preprocess_batch_size": preprocess_batch_size,
+            "feature_mode": feature_mode,
+            "preprocessing_steps": " -> ".join(step.name for step in self.preprocessing_steps),
+        })
+        # Same prefix the steps use themselves (e.g. BackgroundEraser.log_summary).
+        for step in self.preprocessing_steps:
+            tracking.log_params(tracking.params_of(step), prefix=f"preprocessing/{step.name}/")
+        tracking.log_params(feature_kwargs, prefix="feature/train/")
+
     # ------------------------------------------------------------------ #
     # Preprocessing
     # ------------------------------------------------------------------ #
 
-    def iter_batches(self, input_path, batch_size: int = 64) -> Iterator[list[ImageRecord]]:
+    def iter_batches(self, input_path, batch_size: int = 64, save=None) -> Iterator[list[ImageRecord]]:
         """Yield preprocessed batches: each batch of raw images from
         `input_path` passed through every step's `process_batch` in order
         (`Augmentor`s skipped, see the class docstring). Handy on its own,
-        e.g. to look at a few preprocessed images in a notebook."""
+        e.g. to look at a few preprocessed images in a notebook.
+
+        Args:
+            save: None, 'last' or 'all' - write the last step's / every
+                step's output batch to that step's `output_path` (see
+                `run`'s `save_preprocessed`).
+        """
         steps = self._batch_steps()
+        saving = {"last": steps[-1:], "all": steps}.get(save, [])
         n_images = len(collect_image_paths(input_path))
         with tqdm(total=n_images, desc="Preprocessing", unit="image") as progress:
             for batch in iter_image_batches(input_path, batch_size):
@@ -149,16 +212,34 @@ class Pipeline:
                     batch = step.process_batch(batch)
                     if not batch:
                         break
+                    if step in saving:
+                        self._save_batch(batch, step.output_path)
                 progress.update(n_loaded)
                 if batch:
                     yield batch
 
-    def preprocess_in_memory(self, input_path, batch_size: int = 64) -> InMemoryImages:
+    @staticmethod
+    def _save_batch(records: list[ImageRecord], output_dir) -> None:
+        """Write a batch under its names, like a step's disk-mode `run()`."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for record in records:
+            record.image.save(output_dir / record.name)
+
+    def preprocess_in_memory(self, input_path, batch_size: int = 64, save=None) -> InMemoryImages:
         """Run every batch through the preprocessing steps and keep only
-        the final images, stacked into one `InMemoryImages`."""
-        records = [record for batch in self.iter_batches(input_path, batch_size) for record in batch]
+        the final images, stacked into one `InMemoryImages` (optionally
+        also written to disk, see `iter_batches`'s `save`)."""
+        steps = self._batch_steps()
+        for step in steps:
+            step.begin_run()
+        records = [record for batch in self.iter_batches(input_path, batch_size, save=save)
+                   for record in batch]
+        for step in steps:
+            step.log_summary()
         images = InMemoryImages.from_records(records)
         print(f"Preprocessed {len(images)} images in memory, shape {images.images.shape}")
+        tracking.log_metrics({"n_images": len(images)}, prefix="preprocessing/")
         return images
 
     def preprocess_on_disk(self, input_path) -> Path:

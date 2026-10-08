@@ -8,6 +8,8 @@ they (and `pipeline.feature_learning`) all use.
 pipeline/preprocessing/
 ├── preprocessing_step.py   # PreprocessingStep: abstract base
 ├── background_eraser.py    # BackgroundEraser
+├── background_eraser2.py   # BackgroundEraser2: BackgroundEraser + keeps the coordinate system
+├── axis_detection.py       # detect_axes: finds the drawing's coordinate system on a raw scan
 ├── repair.py                # Repair
 ├── normalizer.py            # Normalizer
 ├── augmentation.py           # Augmentor
@@ -43,6 +45,12 @@ Common contract for all preprocessing steps. Each step supports two modes
   images with no detection. `Augmentor` has no `process_batch`: in memory
   mode `Pipeline` applies its `transform` on the fly during training instead.
 
+`begin_run()` / `log_summary()`: hooks around one pass over the dataset.
+`begin_run` resets per-run bookkeeping, and `log_summary` reports it to the
+active MLflow run (see `pipeline/tracking.py`). Both do nothing by default.
+In memory mode `Pipeline` calls them before and after preprocessing;
+`BackgroundEraser.run()` calls them itself.
+
 Both call the same per-image code (`Normalizer.normalize`,
 `Repair.process_image`, `BackgroundEraser._clear_one`), so the two modes
 produce the same images. See
@@ -64,6 +72,7 @@ YOLO output types via `mode`:
 ```python
 BackgroundEraser(
     input_path=None,
+    output_path=None,           # auto-derived from run_id when omitted (see Step)
     mode='detection',           # 'detection' or 'segmentation'
     model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt',  # absolute path
     run_id="default_run",
@@ -147,6 +156,63 @@ e.g. `2012_Survey Gladiatorenschule__006.jpg` for
 basename if `path` isn't under `input_path` at all.
 
 Returns `self.output_path` (or `None` if `keep_results=False`).
+
+Skipped images: the flat names (`_flatten_output_name`) of images on which
+YOLO found no shard are collected in `eraser.no_shard`, in both modes.
+`log_summary()` logs `n_images` and `no_shard_count` as metrics and the names
+as `preprocessing/<step name>/no_shard.txt` (one per line), together with
+the step's settings as parameters (see `failure_lists()`).
+
+`_extend_mask(img, item, mask, region) -> (mask, region)`: hook called by
+`_clear_one` after the shard mask and the crop region are built, before
+whiting-out and cropping. The default returns both unchanged; subclasses
+(`BackgroundEraser2`) use it to keep more of the image.
+
+## `BackgroundEraser2`
+
+`BackgroundEraser` that also keeps the drawing's coordinate system: the long
+vertical rotation axis and the horizontal rim/base line it meets. For each
+image it runs `axis_detection.detect_axes` on the original scan, draws the
+two detected segments into the shard mask, dilates them in every direction
+by `axis_margin`, and crops around the shard and the axes together. The
+output therefore shows the sherd with its coordinate system. Works in both
+disk and in-memory mode (it only overrides `_extend_mask`).
+
+```python
+BackgroundEraser2(
+    axis_margin=0.005,   # axis dilation, fraction of the image's shorter side (~1 mm on A4)
+    **kwargs,            # everything BackgroundEraser takes (mode, model, mask_margin, ...)
+)
+```
+
+When no coordinate system is found, the image is processed exactly like
+`BackgroundEraser` would (shard only), and its flat name is added to
+`eraser.no_axes`, which `log_summary()` logs as `no_axes_count` and
+`preprocessing/BackgroundEraser2/no_axes.txt`. `eraser.axes`
+maps each processed image name to its `AxisDetection` (origin, the two
+segments in pixels, confidence), or `None` when nothing was found.
+
+On sheets where a line runs through the origin (T or cross shaped axes, e.g.
+the 1976 and 2012 series) the whole detected line is kept, so the crop also
+covers the part of the axis on the far side of the profile.
+
+### `axis_detection.detect_axes(gray) -> AxisDetection | None`
+
+Finds the coordinate system on a grayscale A4 scan (ported from
+`giappetto/pottery_axes_batch.py`). It works on a copy downscaled to a
+1600 px long side:
+1. Blackhat filtering enhances thin dark lines, then a deliberately low fixed
+   threshold (`LINE_THRESHOLD`) keeps faint pencil lines (Otsu would be
+   pulled up by the dark ink handwriting). The sheet border (punch holes,
+   scanner edges) is blanked out.
+2. Morphological openings with long horizontal / vertical kernels keep only
+   straight ruler lines; each remaining component becomes a fitted segment.
+3. Every vertical/horizontal pair is scored: long lines that meet win, gaps
+   at the corner are penalized, and so are verticals with a lot of ink right
+   beside them (`CLUTTER_WEIGHT`), since the rotation axis runs through
+   empty paper while lines drawn along the profile do not.
+
+Returns `None` when there is no pair of lines that meet.
 
 ## `Repair`
 

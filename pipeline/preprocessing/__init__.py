@@ -4,6 +4,7 @@ torch-Dataset helpers they - and the feature-learning models - all use."""
 
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 from pipeline.preprocessing.background_eraser import BackgroundEraser
+from pipeline.preprocessing.background_eraser2 import BackgroundEraser2
 from pipeline.preprocessing.repair import Repair
 from pipeline.preprocessing.normalizer import Normalizer
 from pipeline.preprocessing.augmentation import Augmentor
@@ -19,6 +20,7 @@ from pipeline.preprocessing.dataset import (
 __all__ = [
     "PreprocessingStep",
     "BackgroundEraser",
+    "BackgroundEraser2",
     "Repair",
     "Normalizer",
     "Augmentor",

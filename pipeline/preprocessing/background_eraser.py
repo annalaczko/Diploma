@@ -12,6 +12,7 @@ import torch
 from ultralytics import YOLO
 from tqdm import tqdm
 
+from pipeline import tracking
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 from PIL import Image
 
@@ -24,6 +25,7 @@ class BackgroundEraser(PreprocessingStep):
     """
     def __init__(self,
                  input_path=None,
+                 output_path=None,
                  mode = 'detection',
                  model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt',
                  run_id="default_run",
@@ -36,6 +38,8 @@ class BackgroundEraser(PreprocessingStep):
         """
         Args:
             input_path: path to the root folder containing images. Defaults to None.
+            output_path: where cleaned images are written; auto-derived
+                from `run_id` when omitted (see Step).
             mode: 'detection' (default) whites out everything outside the
                 (padded) bounding box; 'segmentation' whites out everything
                 outside the YOLO segmentation mask (grown by `mask_margin`)
@@ -71,7 +75,7 @@ class BackgroundEraser(PreprocessingStep):
             **kwargs: extra options, e.g. device='cuda'/'cpu' for inference.
         """
 
-        super().__init__(input_path=input_path, run_id=run_id)
+        super().__init__(input_path=input_path, output_path=output_path, run_id=run_id)
         self.mode = mode
         self.model = model
         self.batch_size = batch_size
@@ -82,6 +86,11 @@ class BackgroundEraser(PreprocessingStep):
         self.image_extensions = image_extensions
         self._model = None
         self._debug_saved = 0  # in-memory mode: debug overlays saved so far, across batches
+        # Flat names (see `_flatten_output_name`) of the images skipped
+        # because YOLO found no shard on them, and how many images were
+        # seen in total; reset by `begin_run`, reported by `log_summary`.
+        self.no_shard: list[str] = []
+        self._n_seen = 0
 
     def _get_model(self):
         """Load the YOLO model once and reuse it (in-memory mode calls
@@ -114,10 +123,12 @@ class BackgroundEraser(PreprocessingStep):
         )
 
         output = []
+        self._n_seen += len(records)
         for record, img, model_result in zip(records, images_bgr, model_results):
             item = self._format_result(model_result, record.name)
             if item is None:
                 print(f"No shard detected, skipping: {record.name}")
+                self.no_shard.append(record.name)
                 continue
             out, debug_info = self._clear_one(img, item, crop=True, box_margin=self.box_margin,
                                               mask_margin=self.mask_margin)
@@ -142,6 +153,8 @@ class BackgroundEraser(PreprocessingStep):
                 f"No existing images with extensions {self.image_extensions} found under {self.input_path}"
             )
 
+        self.begin_run()
+        self._n_seen = len(image_paths)
         model = self._get_model()
         tmp_dir, path_map = self._make_flat_symlink_dir(image_paths)
         try:
@@ -153,7 +166,33 @@ class BackgroundEraser(PreprocessingStep):
                                debug_dir=self._debug_dir(), debug_images=self.debug_images)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+        self.log_summary()
         return self.output_path if keep_results else None
+
+    def begin_run(self):
+        """Forget the images skipped in a previous run."""
+        self._debug_saved = 0
+        self.no_shard = []
+        self._n_seen = 0
+
+    def failure_lists(self) -> dict[str, list[str]]:
+        """Image names skipped or only partly processed, by reason. Each
+        entry becomes `<reason>.txt` and `<reason>_count` in MLflow."""
+        return {"no_shard": self.no_shard}
+
+    def log_summary(self):
+        """Log how many images were seen and, per failure reason, how many
+        failed plus their names (a text file, one name per line) to the
+        active MLflow run, under `preprocessing/<step name>/`."""
+        prefix = f"preprocessing/{self.name}"
+        tracking.log_params(tracking.params_of(self), prefix=f"{prefix}/")
+        metrics = {"n_images": self._n_seen}
+        for reason, names in self.failure_lists().items():
+            metrics[f"{reason}_count"] = len(names)
+            tracking.log_lines(names, f"{prefix}/{reason}.txt")
+            if names:
+                print(f"{self.name}: {len(names)} image(s) with {reason}")
+        tracking.log_metrics(metrics, prefix=f"{prefix}/")
 
     def _make_flat_symlink_dir(self, paths):
         """Symlink every image into a single flat temp directory with
@@ -236,6 +275,7 @@ class BackgroundEraser(PreprocessingStep):
             except Exception as e:
                 print(f"Error processing image {original_path} (index {idx}): {e}")
                 failed_paths.append(original_path)
+        self.no_shard.extend(self._flatten_output_name(p) for p in failed_paths)
 
         print(f"Detected {len(results_formatted)} shard(s), failed on {len(failed_paths)}")
         if failed_paths:
@@ -371,6 +411,8 @@ class BackgroundEraser(PreprocessingStep):
             if len(xs):
                 x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
 
+        mask, (x1, y1, x2, y2) = self._extend_mask(img, item, mask, (x1, y1, x2, y2))
+
         debug_mask = mask
         mask = mask.astype(bool)
 
@@ -425,6 +467,22 @@ class BackgroundEraser(PreprocessingStep):
             square_coords = (sq_x1_i, sq_y1_i, sq_x2_i, sq_y2_i)
 
         return out, (box, polygon, debug_mask, square_coords)
+
+    def _extend_mask(self, img, item, mask, region):
+        """Hook for subclasses to add pixels to the kept area before
+        whiting-out and cropping (see `BackgroundEraser2`). The default
+        keeps the mask as it is.
+
+        Args:
+            img: the original BGR image.
+            item: the `_format_result` dict for this image.
+            mask: (H, W) uint8 mask of the (grown) shard.
+            region: `(x1, y1, x2, y2)` the crop is centered on.
+
+        Returns:
+            `(mask, region)`, possibly extended.
+        """
+        return mask, region
 
     @staticmethod
     def _save_debug_image(img, box, polygon, mask, square, out_path):

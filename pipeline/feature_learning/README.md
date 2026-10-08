@@ -53,6 +53,14 @@ is applied on the fly to training images only, never during feature
 extraction or validation, so extracted features stay deterministic.
 `set_images(None)` switches back to `input_path`.
 
+MLflow logging (no-ops without an active run, see `pipeline/tracking.py`):
+every training loop calls `_log_training_start(**train_args)` (the model's
+`hparams`, e.g. `f/n/s/k/recon_loss`, and the training arguments), then
+`_log_epoch(epoch, ...)` once per epoch (`feature/loss`, `smoothed_loss`,
+`lr`, and model-specific values) and `_log_training_end(early_stopping,
+last_epoch)` (`best_epoch`, `stopped_epoch`, `best_smoothed`).
+`extract_features` attaches `features.csv` via `_log_features`.
+
 ## `EarlyStopping` — shared early-stopping logic
 
 ```python
@@ -104,6 +112,7 @@ VAE(
     s=1,    # base stride (see Encoder/Decoder below for the exact layout)
     k=128,  # latent dimensionality — the feature vector size
     recon_loss="bce",  # 'bce', 'dice', 'iou', 'bce_dice', or any callable loss(recon_x, x) -> scalar
+    beta_max=1.0,      # KL weight on the flat stage of each beta cycle (see below); 1.0 = plain VAE
     output_path=None,
     run_id="default_run",
 )
@@ -113,7 +122,7 @@ Input images must already be 256×256 (e.g. after `Normalizer`). The VAE's
 `ImageDataset` is built with `target_size=None`, so a wrongly sized image
 fails when the `DataLoader` batches it instead of being silently resized.
 
-### `run(mode="extract_features", *, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10, lr_scheduler_factor=0.5, lr_scheduler_patience=5, min_lr=1e-8, beta_max=1.0)`
+### `run(mode="extract_features", *, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10, lr_scheduler_factor=0.5, lr_scheduler_patience=5, min_lr=1e-8, beta_max=None)`
 
 - `mode="train_model"`: trains for up to `epochs` epochs (may stop earlier
   via early stopping), then extracts features from the trained model.
@@ -131,7 +140,7 @@ N(0, I)`), and decodes it back into a reconstruction. Returns
 `(x_reconstructed, mu, sigma)` — `sigma` is a **log-variance**, not a raw
 variance.
 
-### `train_model(folder, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10, lr_scheduler_factor=0.5, lr_scheduler_patience=5, min_lr=1e-8, beta_max=1.0)`
+### `train_model(folder, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10, lr_scheduler_factor=0.5, lr_scheduler_patience=5, min_lr=1e-8, beta_max=None)`
 
 `folder` is ignored in in-memory mode (see `set_images` above).
 
@@ -154,7 +163,10 @@ beta ramps linearly from 0 to `beta_max` over the first half, then holds at
 `beta_max` for the second half. This avoids *posterior collapse* (the
 decoder learning to ignore the latent code, which a constant high beta from
 epoch 1 tends to cause) while still reaching full KL regularization in each
-cycle. `beta_max=1.0` is the plain VAE. `beta_max > 1` is a beta-VAE: the
+cycle. `beta_max` is set in the constructor (so a `Pipeline` can configure
+it with the model); a `beta_max` passed to `run` / `train_model` overrides it
+for that training run, and the default `None` keeps the constructor's
+value. `beta_max=1.0` is the plain VAE. `beta_max > 1` is a beta-VAE: the
 reconstruction term is summed over all 256×256 pixels but the KL only over
 the `k` latent dims, so at beta=1 the model can afford to spend latent
 capacity on pixel-level detail (line thickness, small breaks) rather than

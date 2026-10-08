@@ -59,7 +59,10 @@ Clusters `self.vectors` into `self.cluster_num` flat clusters using
 `self.best_method` / `self.best_metric` (either passed in at construction,
 or whatever `compare_all()` last picked as the winner), via
 `scipy.cluster.hierarchy.fclusterdata`. Returns an `(n_samples,)` array of
-cluster ids.
+cluster ids. Inside an MLflow run it also logs `cluster_num`, `method` and
+`metric`, cluster size statistics (`clustering/n_clusters`,
+`cluster_size_min/max/mean`, `singleton_clusters`) and
+`clustering/clusters.csv` (`filename` from the features CSV -> cluster).
 
 ### `compare_all()`
 
@@ -71,3 +74,5 @@ the true data geometry. As a side effect, updates `self.best_method` /
 uses it. Returns a list of dicts, one per combination, with keys `method`,
 `metric` and `cophenetic coefficient score` — useful for sweeping and
 plotting to pick a configuration before committing to a final `run()`.
+Inside an MLflow run it also logs the ranking as `clustering/compare_all.csv`
+and the winner's coefficient as `clustering/best_cophenetic`.

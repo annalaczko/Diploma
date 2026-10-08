@@ -164,3 +164,32 @@ def test_pipeline_memory_mode_augments_on_the_fly(tmp_path):
     disk = pipe.run(str(source), mode="disk")
     assert len(disk["features"]) == 4 * 3  # originals + 2 copies each
     assert vae.images is None
+
+
+@pytest.mark.parametrize("save", ["last", "all"])
+def test_memory_mode_saves_preprocessed_images_like_disk_mode(tmp_path, save):
+    source = _line_drawings(tmp_path / "raw")
+    disk_steps = [
+        Normalizer(output_path=str(tmp_path / "disk_normalized"), background_color=(255, 255, 255)),
+        Repair(output_path=str(tmp_path / "disk_repaired"), skeletonize=False, debug_images=0),
+    ]
+    Pipeline(disk_steps).run(str(source), mode="disk")
+
+    result = Pipeline(_steps(tmp_path)).run(str(source), mode="memory", save_preprocessed=save)
+
+    assert result["output_path"] == tmp_path / "repaired"
+    assert _disk_images(tmp_path / "repaired").keys() == set(result["images"].names)
+    for name, array in _disk_images(tmp_path / "disk_repaired").items():
+        np.testing.assert_array_equal(_disk_images(tmp_path / "repaired")[name], array)
+    # 'last' writes only the final step's folder, 'all' every step's.
+    normalized = list((tmp_path / "normalized").glob("*.png")) if (tmp_path / "normalized").exists() else []
+    assert len(normalized) == (4 if save == "all" else 0)
+
+
+def test_memory_mode_saves_nothing_by_default(tmp_path):
+    source = _line_drawings(tmp_path / "raw")
+
+    result = Pipeline(_steps(tmp_path)).run(str(source), mode="memory")
+
+    assert "output_path" not in result
+    assert not list((tmp_path / "repaired").glob("*.png"))

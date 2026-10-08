@@ -46,6 +46,7 @@ class VAE(nn.Module, FeatureLearningStep):
         s=1,
         k=128,
         recon_loss="bce",
+        beta_max=1.0,
         output_path=None,
         name=None,
         delete_input_data=False,
@@ -68,10 +69,17 @@ class VAE(nn.Module, FeatureLearningStep):
                 'dice', 'iou' or 'bce_dice' (see
                 `pipeline.feature_learning.reconstruction_losses`), or any
                 callable `loss(recon_x, x) -> scalar`.
+            beta_max: KL weight reached on the flat stage of each beta
+                cycle (see `train_model`); 1.0 is the plain VAE, > 1 a
+                beta-VAE. Used by every training run unless `run` /
+                `train_model` is given its own `beta_max`.
             output_path: where extracted features / checkpoints are saved.
                 Defaults to the Step-computed run-scoped directory.
         """
         nn.Module.__init__(self)
+        # Architecture settings, logged to MLflow with each training run.
+        self.hparams = {"f": f, "n": n, "s": s, "k": k,
+                        "recon_loss": getattr(recon_loss, "__name__", recon_loss), "beta_max": beta_max}
         FeatureLearningStep.__init__(
             self,
             input_path=input_path or "",
@@ -84,6 +92,7 @@ class VAE(nn.Module, FeatureLearningStep):
         self.encoder = Encoder(f, n, s, k)
         self.decoder = Decoder(f, n, s, k)
         self.recon_loss = get_reconstruction_loss(recon_loss)
+        self.beta_max = beta_max
 
     def run(
         self,
@@ -98,7 +107,7 @@ class VAE(nn.Module, FeatureLearningStep):
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=5,
         min_lr=1e-8,
-        beta_max=1.0,
+        beta_max=None,
     ) -> pd.DataFrame:
         """Either train the VAE from scratch, or just embed `input_path`'s
         images with the current (e.g. previously loaded) weights.
@@ -126,6 +135,7 @@ class VAE(nn.Module, FeatureLearningStep):
             min_lr: lower bound the learning rate is never reduced below.
             beta_max: KL weight reached on the flat stage of each beta cycle
                 (see `train_model`); 1.0 is the plain VAE, > 1 a beta-VAE.
+                None (default) uses the value given to the constructor.
 
         Returns:
             A DataFrame with one 'filename' and 'features' (latent vector)
@@ -186,7 +196,7 @@ class VAE(nn.Module, FeatureLearningStep):
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=5,
         min_lr=1e-8,
-        beta_max=1.0,
+        beta_max=None,
     ):
         """Train the VAE (encoder + decoder) to reconstruct images from
         `folder`, using a cyclically annealed KL weight (`beta`, see
@@ -246,11 +256,15 @@ class VAE(nn.Module, FeatureLearningStep):
             min_lr: lower bound the learning rate is never reduced below.
             beta_max: KL weight reached on the flat stage of each beta cycle
                 (see `train_model`); 1.0 is the plain VAE, > 1 a beta-VAE.
+                None (default) uses the value given to the constructor.
 
         Returns:
             The DataFrame from `extract_features` (filenames + latent
             vectors), run once training is complete.
         """
+        if beta_max is None:
+            beta_max = self.beta_max
+        self._log_training_start(**{k: v for k, v in locals().items() if k not in ("self", "folder")})
         device = next(self.parameters()).device
         # target_size=None: this pipeline's Normalizer step already makes every
         # image 256x256, so resizing here would just be repeated wasted work
@@ -283,6 +297,8 @@ class VAE(nn.Module, FeatureLearningStep):
         for epoch in range(epochs):
             train_loss = 0.0
             train_elbo = 0.0
+            train_recon = 0.0
+            train_kld = 0.0
             cycle_frac = self._cyclical_beta(epoch+1, epochs, 4)
             beta = beta_max * cycle_frac
             for i, inputs in enumerate(loader):
@@ -300,6 +316,8 @@ class VAE(nn.Module, FeatureLearningStep):
                 optimizer.step()
                 train_loss += loss.item()
                 train_elbo += (recon + kld).item()
+                train_recon += recon.item()
+                train_kld += kld.item()
 
             average_loss = train_loss / len(loader)
             average_elbo = train_elbo / len(loader)
@@ -309,8 +327,19 @@ class VAE(nn.Module, FeatureLearningStep):
                 smoothed_loss, should_stop = early_stopping.step(average_loss, epoch + 1, model=self)
                 smoothed_str = f'{smoothed_loss:.3f}'
             else:
+                smoothed_loss = None
                 should_stop = False
                 smoothed_str = '- (ramp, not monitored)'
+            self._log_epoch(
+                epoch + 1,
+                loss=average_loss,
+                elbo=average_elbo,
+                recon=train_recon / len(loader),
+                kld=train_kld / len(loader),
+                smoothed_loss=smoothed_loss,
+                beta=beta,
+                lr=optimizer.param_groups[0]["lr"],
+            )
             print(
                 f'[epoch {epoch+1}] loss: {average_loss:.3f} | '
                 f'elbo: {average_elbo:.3f} | smoothed loss: {smoothed_str} | '
@@ -325,6 +354,7 @@ class VAE(nn.Module, FeatureLearningStep):
                 )
                 break
 
+        self._log_training_end(early_stopping, epoch + 1)
         early_stopping.restore_best(self)
 
         return self.extract_features(batch_size=batch_size)
@@ -378,6 +408,7 @@ class VAE(nn.Module, FeatureLearningStep):
         output_file = Path(self.output_path) / "features.csv"
         output_file.parent.mkdir(parents=True, exist_ok=True)
         result.to_csv(output_file, index=False)
+        self._log_features(output_file)
         return result
 
     def _loss_function(self, recon_x, x, mu, logvar, beta=1.0):

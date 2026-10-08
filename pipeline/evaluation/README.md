@@ -19,7 +19,8 @@ from pipeline.evaluation import EvaluationStep
 Common contract for evaluation methods (ARI, NMI, F-measure, precision@k,
 nearest-neighbour retrieval, silhouette). `run()` takes predicted labels
 (and ground truth / features as needed, passed at construction — see the
-two concrete subclasses below) and computes a dict/set of metric values.
+two concrete subclasses below) and returns a dict of metric values, which
+is also logged to the active MLflow run as `eval/<name>`.
 
 ## `EvaluationWithNoGroundTruth`
 
@@ -30,7 +31,7 @@ fully labelled.
 ```python
 EvaluationWithNoGroundTruth(features, y_pred)   # features: (n_samples, n_features); y_pred: (n_samples,)
 step = EvaluationWithNoGroundTruth(features, y_pred)
-step.run()                # computes and prints step.silhouette
+step.run()                # computes and prints step.silhouette, returns {"silhouette": ...}
 ```
 
 ## `EvaluationWithGroundTruth`
@@ -42,6 +43,7 @@ known true labels.
 EvaluationWithGroundTruth(y_true, y_pred)   # both (n_samples,)
 step = EvaluationWithGroundTruth(y_true=true_labels, y_pred=cluster_labels)
 step.run()   # computes step.ari, step.nmi, step.acc, step.per_class and prints the first three
+             # returns {"acc": ..., "ari": ..., "nmi": ...}; per_class is logged as eval/per_class_accuracy.csv
 ```
 
 Computes:

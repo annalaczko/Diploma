@@ -4,6 +4,7 @@ from abc import abstractmethod
 from typing import Any, Dict
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
 
+from pipeline import tracking
 from pipeline.steps.step import Step
 import pandas as pd
 import numpy as np
@@ -15,11 +16,12 @@ class EvaluationStep(Step):
     (ARI, NMI, F-measure, precision@k, nearest-neighbour retrieval, silhouette).
 
     `run` takes predicted labels (and ground truth / features as needed)
-    and returns a dict of metric name -> value.
+    and returns a dict of metric name -> value, also logged to the active
+    MLflow run as 'eval/<name>'.
     """
 
     @abstractmethod
-    def run(self) -> None:
+    def run(self) -> Dict[str, float]:
         raise NotImplementedError
 
 class EvaluationWithNoGroundTruth(EvaluationStep):
@@ -39,8 +41,11 @@ class EvaluationWithNoGroundTruth(EvaluationStep):
         self.predicted = y_pred
         print ("Predicted labels:", self.predicted)
 
-    def run(self) -> None:
+    def run(self) -> Dict[str, float]:
         self.evaluate(self.features, self.predicted)
+        metrics = {"silhouette": self.silhouette}
+        tracking.log_metrics(metrics, prefix="eval/")
+        return metrics
 
     def evaluate(self, features, y_pred) -> None:
         """Compute and store the silhouette score in `self.silhouette`."""
@@ -75,8 +80,12 @@ class EvaluationWithGroundTruth(EvaluationStep):
         self.nmi=0
         self.per_class = None
 
-    def run(self) -> None:
+    def run(self) -> Dict[str, float]:
         self.evaluate(self.ground_truth, self.predicted)
+        metrics = {"acc": self.acc, "ari": self.ari, "nmi": self.nmi}
+        tracking.log_metrics(metrics, prefix="eval/")
+        tracking.log_table(self.per_class, "eval/per_class_accuracy.csv")
+        return metrics
 
     def evaluate(self, y_true, y_pred) -> None:
         """Compute ARI, NMI and clustering accuracy, storing each on `self`."""
