@@ -28,7 +28,7 @@ from PIL import ImageOps
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
 from pipeline.feature_learning.reconstruction_losses import get_reconstruction_loss
-from pipeline.preprocessing.dataset import ImageDataset, collect_image_paths
+from pipeline.preprocessing.dataset import ImageDataset
 
 
 class VAE(nn.Module, FeatureLearningStep):
@@ -40,7 +40,7 @@ class VAE(nn.Module, FeatureLearningStep):
 
     def __init__(
         self,
-        input_path: str,
+        input_path: str | None = None,
         f=4,
         n=3,
         s=1,
@@ -137,8 +137,6 @@ class VAE(nn.Module, FeatureLearningStep):
             )
 
         folder = self.input_path
-        if not folder:
-            raise ValueError("input_path is required to run the VAE feature step")
 
         if mode == "train_model":
             return self.train_model(
@@ -155,7 +153,7 @@ class VAE(nn.Module, FeatureLearningStep):
                 beta_max=beta_max,
             )
 
-        return self.extract_features(folder, batch_size=batch_size)
+        return self.extract_features(batch_size=batch_size)
 
     def forward(self, x):
         """Encode `x`, sample a latent `z` via the reparameterization 
@@ -228,7 +226,8 @@ class VAE(nn.Module, FeatureLearningStep):
         encode *more* in the latent - the opposite of the point.)
 
         Args:
-            folder: image folder to train on (passed to `ImageDataset`).
+            folder: image folder to train on (passed to `ImageDataset`);
+                ignored in in-memory mode (see `set_images`).
             epochs: maximum number of training epochs (may stop earlier
                 via early stopping).
             lr: Adam learning rate.
@@ -257,7 +256,9 @@ class VAE(nn.Module, FeatureLearningStep):
         # image 256x256, so resizing here would just be repeated wasted work
         # (every image, every epoch); a wrong-sized image will fail loudly when
         # DataLoader tries to batch it, rather than being silently resized.
-        dataset = ImageDataset(collect_image_paths(folder), grayscale=True, target_size=None)
+        # train_transform: on-the-fly augmentation in in-memory mode (see set_images).
+        dataset = ImageDataset(self._collect_inputs(folder), grayscale=True, target_size=None,
+                               transform=self.train_transform)
         print(f"Dataset size: {dataset.__len__()}")
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True,
@@ -349,13 +350,13 @@ class VAE(nn.Module, FeatureLearningStep):
         """
         device = next(self.parameters()).device
         # See train_model's ImageDataset call for why target_size=None here.
-        dataset = ImageDataset(collect_image_paths(self.input_path), grayscale=True, target_size=None)
+        dataset = ImageDataset(self._collect_inputs(), grayscale=True, target_size=None)
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=False,
             num_workers=16, pin_memory=True, persistent_workers=True
         )
 
-        filenames = [Path(p).name for p in dataset.paths]
+        filenames = dataset.names
         self.eval()
         all_mu = []
         all_sigma = []

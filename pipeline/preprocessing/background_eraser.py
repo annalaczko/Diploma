@@ -13,7 +13,9 @@ from ultralytics import YOLO
 from tqdm import tqdm
 
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
-from pipeline.preprocessing.dataset import collect_image_paths
+from PIL import Image
+
+from pipeline.preprocessing.dataset import ImageRecord, collect_image_paths, flatten_name
 
 class BackgroundEraser(PreprocessingStep):
     """Runs a YOLO segmentation model on each image, whites out everything
@@ -78,6 +80,52 @@ class BackgroundEraser(PreprocessingStep):
         self.debug_images = debug_images
         self.kwargs = kwargs
         self.image_extensions = image_extensions
+        self._model = None
+        self._debug_saved = 0  # in-memory mode: debug overlays saved so far, across batches
+
+    def _get_model(self):
+        """Load the YOLO model once and reuse it (in-memory mode calls
+        `process_batch` many times)."""
+        if self._model is None:
+            self._model = YOLO(self.model)
+        return self._model
+
+    def _device(self):
+        return self.kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+
+    def _debug_dir(self) -> Path:
+        # Sibling folder, not a subfolder: later steps collect their input
+        # images recursively, so debug overlays inside the output folder
+        # would be picked up as training data.
+        output = Path(self.output_path)
+        return output.parent / f"{output.name}_debug"
+
+    def process_batch(self, records: list[ImageRecord]) -> list[ImageRecord]:
+        """In-memory mode: run YOLO on one batch of images and return the
+        background-erased, cropped versions (RGB), keeping their names.
+        Images with no detection are dropped and logged, as in `run()`."""
+        images_bgr = [cv2.cvtColor(np.asarray(r.image.convert("RGB")), cv2.COLOR_RGB2BGR) for r in records]
+        model_results = self._get_model().predict(
+            images_bgr,
+            verbose=False,
+            batch=self.batch_size,
+            iou=0.3,
+            device=self._device(),
+        )
+
+        output = []
+        for record, img, model_result in zip(records, images_bgr, model_results):
+            item = self._format_result(model_result, record.name)
+            if item is None:
+                print(f"No shard detected, skipping: {record.name}")
+                continue
+            out, debug_info = self._clear_one(img, item, crop=True, box_margin=self.box_margin,
+                                              mask_margin=self.mask_margin)
+            if self._debug_saved < self.debug_images:
+                self._save_debug_image(img, *debug_info, self._debug_dir() / record.name)
+                self._debug_saved += 1
+            output.append(ImageRecord(record.name, Image.fromarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))))
+        return output
 
     def run(self, keep_results=True):
         """Run YOLO segmentation on every input image and write cleaned
@@ -94,20 +142,15 @@ class BackgroundEraser(PreprocessingStep):
                 f"No existing images with extensions {self.image_extensions} found under {self.input_path}"
             )
 
-        model = YOLO(self.model)
+        model = self._get_model()
         tmp_dir, path_map = self._make_flat_symlink_dir(image_paths)
         try:
             print("Detecting shards...")
             shards = self._detect_shards(model, tmp_dir, path_map, batch_size=self.batch_size)
             print("Clearing images...")
-            # Sibling folder, not a subfolder: later steps collect their
-            # input images recursively, so debug overlays inside the output
-            # folder would be picked up as training data.
-            output = Path(self.output_path)
-            debug_dir = output.parent / f"{output.name}_debug"
             self._clear_images(shards, output_dir=self.output_path, crop=True,
                                box_margin=self.box_margin, mask_margin=self.mask_margin,
-                               debug_dir=debug_dir, debug_images=self.debug_images)
+                               debug_dir=self._debug_dir(), debug_images=self.debug_images)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         return self.output_path if keep_results else None
@@ -161,7 +204,7 @@ class BackgroundEraser(PreprocessingStep):
             detected mask, or that raised during processing, are skipped
             and logged instead of raising.
         """
-        device = self.kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        device = self._device()
 
         try:
             model_results = model.predict(
@@ -185,24 +228,10 @@ class BackgroundEraser(PreprocessingStep):
             symlink_path = model_result.path
             original_path = path_map.get(symlink_path, symlink_path)
             try:
-                result = {"path": original_path}
-                if self.mode == "segmentation":
-                    if getattr(model_result, "masks", None) is None:
-                        failed_paths.append(original_path)
-                        continue
-                    result["masks"] = model_result.masks.xy
-                    result["boxes"] = model_result.boxes.xyxy
-                elif self.mode == "detection":
-                    # No mask to check here - a detection with zero
-                    # predicted boxes is the equivalent "nothing found"
-                    # case, so it needs the same skip-and-log treatment
-                    # as a missing mask above (otherwise `_clear_images`
-                    # would later index into an empty boxes tensor).
-                    boxes = model_result.boxes.xyxy
-                    if boxes is None or len(boxes) == 0:
-                        failed_paths.append(original_path)
-                        continue
-                    result["boxes"] = boxes
+                result = self._format_result(model_result, original_path)
+                if result is None:
+                    failed_paths.append(original_path)
+                    continue
                 results_formatted.append(result)
             except Exception as e:
                 print(f"Error processing image {original_path} (index {idx}): {e}")
@@ -215,6 +244,26 @@ class BackgroundEraser(PreprocessingStep):
 
         return results_formatted
     
+    def _format_result(self, model_result, path):
+        """Turn one YOLO result into the `{'path', 'masks'?, 'boxes'}` dict
+        `_clear_one` expects, or None if nothing was detected."""
+        result = {"path": path}
+        if self.mode == "segmentation":
+            if getattr(model_result, "masks", None) is None:
+                return None
+            result["masks"] = model_result.masks.xy
+            result["boxes"] = model_result.boxes.xyxy
+        elif self.mode == "detection":
+            # No mask to check here - a detection with zero predicted
+            # boxes is the equivalent "nothing found" case, so it needs the
+            # same skip-and-log treatment as a missing mask above
+            # (otherwise `_clear_one` would index into an empty boxes tensor).
+            boxes = model_result.boxes.xyxy
+            if boxes is None or len(boxes) == 0:
+                return None
+            result["boxes"] = boxes
+        return result
+
     def _clear_images(self, image_dict, output_dir=None, crop=True, box_margin=0.15, mask_margin=0.10,
                       debug_dir=None, debug_images=0):
         """Whites out every pixel outside the detected mask for each image
@@ -255,97 +304,12 @@ class BackgroundEraser(PreprocessingStep):
                 print(f"Failed to read image: {path}")
                 continue
 
-            h, w = img.shape[:2]
-
-            # .cpu() first since YOLO's boxes are a CUDA tensor when
-            # running on GPU. Computed once and expanded here so both the
-            # detection-mode polygon below and the crop further down use
-            # the exact same padded box.
-            box = np.asarray(item['boxes'][0].cpu(), dtype=np.float32).reshape(-1)  # (x1, y1, x2, y2)
-            x1, y1, x2, y2 = self._expand_box(box, w, h, box_margin)
-
-            if 'masks' not in item or not item['masks']:
-                # Detection mode has no segmentation mask, only a
-                # bounding box - turn its (padded) corners into an
-                # explicit 4-corner rectangle, a valid (N, 2) polygon for
-                # cv2.fillPoly below, same shape as the segmentation-mask
-                # branch produces.
-                polygon = np.array(
-                    [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
-                )
-            else:
-                polygon = np.asarray(item['masks'][0], dtype=np.float32)  # (N, 2) point list
-
-            # Rasterize a binary mask from the polygon
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
-
-            if 'masks' in item and item['masks']:
-                mask = self._dilate_mask(mask, mask_margin)
-                # Crop around the grown mask itself rather than the YOLO
-                # box, so the canvas fits exactly what was kept. Falls
-                # back to the padded box if the polygon was degenerate.
-                ys, xs = np.nonzero(mask)
-                if len(xs):
-                    x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
-
-            debug_mask = mask
-            mask = mask.astype(bool)
-
-            white_bg = np.full_like(img, 255)
-            out = np.where(mask[..., None], img, white_bg)
-
-            square_coords = None
-            if crop:
-                # Build a square canvas centered on the (already padded)
-                # detection box - or, in segmentation mode, the grown
-                # mask's bounding rectangle - big enough to fit its longer side, and
-                # white-pad wherever the square runs off the edge of the
-                # original image.
-                box_w = x2 - x1
-                box_h = y2 - y1
-                side = max(box_w, box_h)
-
-                cx = (x1 + x2) / 2.0
-                cy = (y1 + y2) / 2.0
-                half = side / 2.0
-
-                # Single integer half-size shared by both axes so the
-                # square canvas always has equal width and height
-                half_i = int(round(half))
-                side_i = 2 * half_i
-
-                cx_i = int(round(cx))
-                cy_i = int(round(cy))
-
-                sq_x1_i = cx_i - half_i
-                sq_x2_i = cx_i + half_i
-                sq_y1_i = cy_i - half_i
-                sq_y2_i = cy_i + half_i
-
-                # Valid region that actually overlaps the image
-                src_x1 = max(sq_x1_i, 0)
-                src_y1 = max(sq_y1_i, 0)
-                src_x2 = min(sq_x2_i, w)
-                src_y2 = min(sq_y2_i, h)
-
-                # Where that region lands inside the (white) square canvas
-                dst_x1 = src_x1 - sq_x1_i
-                dst_y1 = src_y1 - sq_y1_i
-                dst_x2 = dst_x1 + (src_x2 - src_x1)
-                dst_y2 = dst_y1 + (src_y2 - src_y1)
-
-                square = np.full((side_i, side_i, img.shape[2]), 255, dtype=out.dtype)
-                if src_x2 > src_x1 and src_y2 > src_y1:
-                    square[dst_y1:dst_y2, dst_x1:dst_x2] = out[src_y1:src_y2, src_x1:src_x2]
-
-                out = square
-                square_coords = (sq_x1_i, sq_y1_i, sq_x2_i, sq_y2_i)
+            out, debug_info = self._clear_one(img, item, crop=crop, box_margin=box_margin,
+                                              mask_margin=mask_margin)
 
             if debug_dir is not None and debug_saved < debug_images:
                 self._save_debug_image(
-                    img, box, polygon, debug_mask, square_coords,
-                    Path(debug_dir) / self._flatten_output_name(path),
+                    img, *debug_info, Path(debug_dir) / self._flatten_output_name(path),
                 )
                 debug_saved += 1
 
@@ -357,6 +321,110 @@ class BackgroundEraser(PreprocessingStep):
                 cv2.imwrite(out_path, out)
 
         return results
+
+    def _clear_one(self, img, item, crop=True, box_margin=0.15, mask_margin=0.10):
+        """Whiten everything outside the detected shard in one BGR image
+        and (if `crop`) cut a white-padded square around it. Shared by the
+        disk (`_clear_images`) and in-memory (`process_batch`) modes.
+
+        Args:
+            img: the original BGR image.
+            item: one `_format_result` dict ('boxes', and 'masks' in
+                segmentation mode).
+            crop, box_margin, mask_margin: see `_clear_images`.
+
+        Returns:
+            (out, debug_info): the processed BGR image, and the
+            `(box, polygon, mask, square)` tuple `_save_debug_image` draws.
+        """
+        h, w = img.shape[:2]
+
+        # .cpu() first since YOLO's boxes are a CUDA tensor when
+        # running on GPU. Computed once and expanded here so both the
+        # detection-mode polygon below and the crop further down use
+        # the exact same padded box.
+        box = np.asarray(item['boxes'][0].cpu(), dtype=np.float32).reshape(-1)  # (x1, y1, x2, y2)
+        x1, y1, x2, y2 = self._expand_box(box, w, h, box_margin)
+
+        if 'masks' not in item or not item['masks']:
+            # Detection mode has no segmentation mask, only a
+            # bounding box - turn its (padded) corners into an
+            # explicit 4-corner rectangle, a valid (N, 2) polygon for
+            # cv2.fillPoly below, same shape as the segmentation-mask
+            # branch produces.
+            polygon = np.array(
+                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
+            )
+        else:
+            polygon = np.asarray(item['masks'][0], dtype=np.float32)  # (N, 2) point list
+
+        # Rasterize a binary mask from the polygon
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
+
+        if 'masks' in item and item['masks']:
+            mask = self._dilate_mask(mask, mask_margin)
+            # Crop around the grown mask itself rather than the YOLO
+            # box, so the canvas fits exactly what was kept. Falls
+            # back to the padded box if the polygon was degenerate.
+            ys, xs = np.nonzero(mask)
+            if len(xs):
+                x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+
+        debug_mask = mask
+        mask = mask.astype(bool)
+
+        white_bg = np.full_like(img, 255)
+        out = np.where(mask[..., None], img, white_bg)
+
+        square_coords = None
+        if crop:
+            # Build a square canvas centered on the (already padded)
+            # detection box - or, in segmentation mode, the grown
+            # mask's bounding rectangle - big enough to fit its longer side, and
+            # white-pad wherever the square runs off the edge of the
+            # original image.
+            box_w = x2 - x1
+            box_h = y2 - y1
+            side = max(box_w, box_h)
+
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            half = side / 2.0
+
+            # Single integer half-size shared by both axes so the
+            # square canvas always has equal width and height
+            half_i = int(round(half))
+            side_i = 2 * half_i
+
+            cx_i = int(round(cx))
+            cy_i = int(round(cy))
+
+            sq_x1_i = cx_i - half_i
+            sq_x2_i = cx_i + half_i
+            sq_y1_i = cy_i - half_i
+            sq_y2_i = cy_i + half_i
+
+            # Valid region that actually overlaps the image
+            src_x1 = max(sq_x1_i, 0)
+            src_y1 = max(sq_y1_i, 0)
+            src_x2 = min(sq_x2_i, w)
+            src_y2 = min(sq_y2_i, h)
+
+            # Where that region lands inside the (white) square canvas
+            dst_x1 = src_x1 - sq_x1_i
+            dst_y1 = src_y1 - sq_y1_i
+            dst_x2 = dst_x1 + (src_x2 - src_x1)
+            dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+            square = np.full((side_i, side_i, img.shape[2]), 255, dtype=out.dtype)
+            if src_x2 > src_x1 and src_y2 > src_y1:
+                square[dst_y1:dst_y2, dst_x1:dst_x2] = out[src_y1:src_y2, src_x1:src_x2]
+
+            out = square
+            square_coords = (sq_x1_i, sq_y1_i, sq_x2_i, sq_y2_i)
+
+        return out, (box, polygon, debug_mask, square_coords)
 
     @staticmethod
     def _save_debug_image(img, box, polygon, mask, square, out_path):
@@ -474,11 +542,4 @@ class BackgroundEraser(PreprocessingStep):
             `self.input_path` (e.g. `input_path` was a list of paths
             rather than one common root directory).
         """
-        path = Path(path)
-        try:
-            relative = path.resolve().relative_to(Path(self.input_path).resolve())
-            ancestor_dirs = relative.parts[:-1]
-        except (TypeError, ValueError):
-            ancestor_dirs = ()
-
-        return "__".join([*ancestor_dirs, path.name])
+        return flatten_name(path, self.input_path)

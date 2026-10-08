@@ -14,6 +14,7 @@ pipeline/feature_learning/
 ├── featurelearning_step.py   # FeatureLearningStep: abstract base
 ├── early_stopping.py          # EarlyStopping: shared moving-average stopping logic
 ├── vae.py                     # VAE, Encoder, Decoder, resize_with_padding
+├── reconstruction_losses.py   # interchangeable VAE reconstruction losses (BCE, Dice, soft-IoU, BCE+Dice)
 ├── vae_classifier.py          # VAEClassifier
 ├── simclr.py                  # SimCLR, SimCLREncoder, SimCLRDataset
 └── byol.py                    # BYOL
@@ -40,6 +41,17 @@ FeatureLearningStep.l2_normalize(vectors: np.ndarray) -> np.ndarray
 
 L2-normalizes feature vectors row-wise — required before distance/cosine
 similarity comparisons.
+
+```python
+step.set_images(images: InMemoryImages, train_transform=None)
+```
+
+In-memory mode (see `Pipeline` in [`pipeline/README.md`](../README.md)):
+the step then trains on / extracts features from these images instead of
+reading `input_path`. If given, `train_transform` (e.g. `Augmentor.transform`)
+is applied on the fly to training images only, never during feature
+extraction or validation, so extracted features stay deterministic.
+`set_images(None)` switches back to `input_path`.
 
 ## `EarlyStopping` — shared early-stopping logic
 
@@ -86,23 +98,30 @@ used as a fixed-length feature vector per image for downstream clustering.
 
 ```python
 VAE(
-    input_path: str,   # folder of images (searched recursively)
+    input_path=None,   # folder of images (searched recursively); optional in in-memory mode (set_images)
     f=4,    # base channel-width exponent; block i uses 2**(f+i) channels
     n=3,    # convolution kernel size
     s=1,    # base stride (see Encoder/Decoder below for the exact layout)
     k=128,  # latent dimensionality — the feature vector size
+    recon_loss="bce",  # 'bce', 'dice', 'iou', 'bce_dice', or any callable loss(recon_x, x) -> scalar
     output_path=None,
     run_id="default_run",
 )
 ```
 
-### `run(mode="extract_features", *, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
+Input images must already be 256×256 (e.g. after `Normalizer`). The VAE's
+`ImageDataset` is built with `target_size=None`, so a wrongly sized image
+fails when the `DataLoader` batches it instead of being silently resized.
+
+### `run(mode="extract_features", *, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10, lr_scheduler_factor=0.5, lr_scheduler_patience=5, min_lr=1e-8, beta_max=1.0)`
 
 - `mode="train_model"`: trains for up to `epochs` epochs (may stop earlier
   via early stopping), then extracts features from the trained model.
 - `mode="extract_features"` (default): skips training, just runs
   inference — use this once you already have trained weights loaded (e.g.
   via `vae.load_state_dict(...)`).
+
+The remaining arguments are passed through to `train_model` (below).
 
 ### `forward(x)`
 
@@ -112,43 +131,90 @@ N(0, I)`), and decodes it back into a reconstruction. Returns
 `(x_reconstructed, mu, sigma)` — `sigma` is a **log-variance**, not a raw
 variance.
 
-### `train_model(folder, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
+### `train_model(folder, epochs=10, lr=1e-6, batch_size=32, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10, lr_scheduler_factor=0.5, lr_scheduler_patience=5, min_lr=1e-8, beta_max=1.0)`
 
-Standard VAE training loop, with two twists: the KL-divergence weight
-(`beta`) is annealed on a **cyclical schedule** (`_cyclical_beta`, after Fu
-et al., "Cyclical Annealing Schedule", 2019) instead of held constant. Beta
-ramps linearly from 0 to 1 over the first half of each cycle, then holds at
-1 for the rest of the cycle, repeating for 4 cycles across training. This
-avoids *posterior collapse* (the decoder learning to ignore the latent code
-entirely, which a constant high beta from epoch 1 tends to cause) while
-still reaching full KL regularization within each cycle.
-
-The second twist: there's no validation split here (this is unsupervised
-reconstruction, not classification), so early stopping (see
-[`EarlyStopping`](#earlystopping--shared-early-stopping-logic) above)
-instead watches a smoothed moving average of the epoch's **training
-loss** (`mode="min"`), stopping once it's stopped decreasing for
-`early_stopping_patience` epochs and restoring the best-epoch weights
-before extracting features.
+`folder` is ignored in in-memory mode (see `set_images` above).
 
 Loss (`_loss_function`, a standard beta-VAE loss):
 
 ```
-loss = BCE(reconstruction, input) + beta * KLD(mu, logvar)
+loss = recon_loss(reconstruction, input) + beta * KLD(mu, logvar)
 ```
 
-`BCE` is a pixel-wise reconstruction error (pixels are in `[0, 1]`); `KLD`
-pulls the latent distribution toward a standard normal. A higher `beta`
-trades reconstruction quality for a more disentangled/regularized latent
-space (generally better for downstream clustering).
+The reconstruction term is `self.recon_loss` (BCE by default, see
+[Reconstruction losses](#reconstruction-losses) below). `KLD` pulls the
+latent distribution toward a standard normal. A higher `beta` trades
+reconstruction quality for a more disentangled/regularized latent space,
+which is generally better for downstream clustering.
+
+**Cyclical beta.** The KL weight is annealed on a cyclical schedule
+(`_cyclical_beta`, after Fu et al., "Cyclical Annealing Schedule", 2019)
+instead of held constant. Training is split into 4 cycles. In each cycle,
+beta ramps linearly from 0 to `beta_max` over the first half, then holds at
+`beta_max` for the second half. This avoids *posterior collapse* (the
+decoder learning to ignore the latent code, which a constant high beta from
+epoch 1 tends to cause) while still reaching full KL regularization in each
+cycle. `beta_max=1.0` is the plain VAE. `beta_max > 1` is a beta-VAE: the
+reconstruction term is summed over all 256×256 pixels but the KL only over
+the `k` latent dims, so at beta=1 the model can afford to spend latent
+capacity on pixel-level detail (line thickness, small breaks) rather than
+the sherd's shape.
+
+**Early stopping and LR schedule.** There's no validation split (this is
+unsupervised reconstruction), so early stopping (see
+[`EarlyStopping`](#earlystopping--shared-early-stopping-logic) above) watches
+a smoothed moving average of the epoch's **training loss** (`mode="min"`).
+The learning rate is lowered by `ReduceLROnPlateau` (`lr_scheduler_factor`,
+`lr_scheduler_patience`, `min_lr`) on the same loss. Both only see epochs
+from the *flat* stage of each cycle (beta == `beta_max`). During the ramp the
+loss rises with beta, and when beta drops back to 0 at a cycle restart the
+KL term blows up for several epochs. Without this rule, every new cycle
+would use up the patience and halve the LR. Ramp epochs don't enter the
+smoothing window or count toward patience, so the restored best weights
+always come from a flat-stage epoch.
+
+Each epoch prints the loss, the beta-independent ELBO (recon + KLD), the
+smoothed loss, beta and the current LR. A non-finite loss raises a
+`RuntimeError` (usually a sign that `lr` is too high).
 
 ### `extract_features(batch_size=32) -> pd.DataFrame`
 
-Runs the encoder over every image in `self.input_path` in eval mode and
-collects the latent **mean** (`mu`, not a sampled `z`, so features are
-deterministic and reproducible) as each image's feature vector. Returns —
-and also writes to `<output_path>/features.csv` — a DataFrame with one
-`filename` and `features` row per image.
+Runs the encoder over every image (from `input_path`, or the in-memory
+images) in eval mode. It collects the latent **mean** (`mu`, not a sampled
+`z`, so features are deterministic and reproducible) as each image's
+feature vector, plus the log-variance. Returns, and also writes to
+`<output_path>/features.csv`, a DataFrame with one row per image and
+columns `filename`, `features` (`mu`) and `sigma` (log-variance). `sigma`
+shows how uncertain the encoder is per latent dimension. Downstream steps
+only use `features`.
+
+### Reconstruction losses
+
+`reconstruction_losses.py` defines interchangeable losses with the same
+signature, `loss(recon_x, x) -> scalar`, for `(batch, 1, H, W)` inputs in
+`[0, 1]`. `VAE(recon_loss=...)` takes one by name or any callable with that
+signature (e.g. `functools.partial(dice_loss, smooth=0.1)`):
+
+| Name | Function | What it measures |
+|---|---|---|
+| `"bce"` | `bce_loss` | Pixel-wise binary cross-entropy, summed (the original VAE loss). |
+| `"dice"` | `dice_loss(smooth=1.0, ink_is_dark=True)` | Soft Dice on the ink pixels: `1 - 2·|P∩T| / (|P| + |T|)`. |
+| `"iou"` | `soft_iou_loss(smooth=1.0, ink_is_dark=True)` | Soft IoU (Jaccard) on the ink pixels; penalizes partial overlap more harshly than Dice. |
+| `"bce_dice"` | `bce_dice_loss(dice_weight=1.0)` | BCE + Dice. Dice drives outline overlap, BCE keeps per-pixel gradients (Dice alone can be unstable early, while predicted ink is a uniform gray). |
+
+The images are thin dark outlines on a mostly white background. A
+pixel-averaged loss like BCE is dominated by that background, so a
+reconstruction that misses most of the outline still scores a small error.
+Dice and IoU measure how well the reconstruction's *ink* overlaps the
+target's, so background size doesn't matter, while ink drawn where there is
+none is still penalized. `ink_is_dark=True` inverts pixel values first,
+because `ToTensor` makes the white background 1 and the black outline 0.
+
+To keep the beta-weighted KL term at about the same relative strength
+whichever loss is used, the overlap losses are computed per image in
+`[0, 1]` and multiplied by the pixel count. That puts them on the same scale
+as the summed BCE. An unknown name raises `ValueError`
+(`get_reconstruction_loss`).
 
 ## `Encoder` / `Decoder`
 
@@ -232,7 +298,11 @@ What happens, in order:
 3. **Stratified train/val split** (`validation_size`, `random_state=42`).
    `self.val_paths_` / `self.val_labels_` / `self.classes_` are saved on the
    instance afterward — handy for building a confusion matrix or other
-   evaluation once `run()` returns, without re-deriving the split.
+   evaluation once `run()` returns, without re-deriving the split. In
+   in-memory mode `val_paths_` is an `InMemoryImages` subset rather than a
+   list of paths. `ImageDataset` accepts either, so the confusion-matrix
+   example below works in both modes. If `set_images` was given a
+   `train_transform`, it is applied to the training split only.
 4. **Optionally class-weighted loss** (`class_weighted_loss=True` by
    default): `sklearn.utils.class_weight.compute_class_weight("balanced",
    ...)` on the *train* split only (validation stays untouched, so
@@ -307,7 +377,7 @@ no equivalent collapse mode, so its `Encoder` never needed BatchNorm.
 
 ```python
 SimCLR(
-    input_path: str,   # folder of images (searched recursively)
+    input_path=None,   # folder of images (searched recursively); optional in in-memory mode (set_images)
     f=4, n=3, s=1, k=128,  # SimCLREncoder architecture - match your VAE's values
     projection_dim=64,      # output size of the projection head used for the loss
     output_path=None,
@@ -415,7 +485,7 @@ BatchNorm.
 
 ```python
 BYOL(
-    input_path: str,   # folder of images (searched recursively)
+    input_path=None,   # folder of images (searched recursively); optional in in-memory mode (set_images)
     f=4, n=3, s=1, k=128,  # SimCLREncoder architecture - match your VAE's/SimCLR's values
     hidden_dim=256,          # projector/predictor MLP hidden size
     projection_dim=64,       # projector/predictor output size

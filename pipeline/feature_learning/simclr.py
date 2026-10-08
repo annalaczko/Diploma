@@ -28,14 +28,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
 from pipeline.preprocessing.augmentation import build_augmentation_transform
-from pipeline.preprocessing.dataset import ImageDataset, collect_image_paths
+from pipeline.preprocessing.dataset import ImageDataset, image_entries, open_image
 
 
 class SimCLREncoder(nn.Module):
@@ -129,23 +128,22 @@ class SimCLRDataset(Dataset):
     def __init__(self, paths, transform):
         """
         Args:
-            paths: sequence of image file paths.
+            paths: sequence of image file paths, or an `InMemoryImages`.
             transform: a torchvision transform (PIL in, PIL out) applied
                 independently twice per image to produce the two views;
                 typically `build_augmentation_transform(...)` composed
                 with `transforms.ToTensor()`.
         """
-        self.paths = list(paths)
+        self.paths, _ = image_entries(paths)
         self.transform = transform
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        with Image.open(self.paths[idx]) as image:
-            image = image.convert("L")
-            view1 = self.transform(image)
-            view2 = self.transform(image)
+        image = open_image(self.paths, idx).convert("L")
+        view1 = self.transform(image)
+        view2 = self.transform(image)
         return view1, view2
 
 
@@ -161,7 +159,7 @@ class SimCLR(nn.Module, FeatureLearningStep):
 
     def __init__(
         self,
-        input_path: str,
+        input_path: str | None = None,
         f=4,
         n=3,
         s=1,
@@ -273,8 +271,6 @@ class SimCLR(nn.Module, FeatureLearningStep):
             )
 
         folder = self.input_path
-        if not folder:
-            raise ValueError("input_path is required to run the SimCLR feature step")
 
         if mode == "train_model":
             return self.train_model(
@@ -361,7 +357,12 @@ class SimCLR(nn.Module, FeatureLearningStep):
                 build_augmentation_transform(),
                 transforms.ToTensor(),
             ])
-        dataset = SimCLRDataset(collect_image_paths(folder), view_transform)
+        if self.train_transform is not None:
+            print(
+                f"Warning: {self.name} makes its own augmented views (view_transform); "
+                "the pipeline's train_transform (Augmentor) is ignored."
+            )
+        dataset = SimCLRDataset(self._collect_inputs(folder), view_transform)
         print(f"Dataset size: {len(dataset)}")
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True, drop_last=True,
@@ -427,13 +428,13 @@ class SimCLR(nn.Module, FeatureLearningStep):
         device = next(self.parameters()).device
         # target_size=None: this pipeline's Normalizer step already makes
         # every image the same size, so resizing here would be redundant.
-        dataset = ImageDataset(collect_image_paths(self.input_path), grayscale=True, target_size=None)
+        dataset = ImageDataset(self._collect_inputs(), grayscale=True, target_size=None)
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=False,
             num_workers=16, pin_memory=True, persistent_workers=True,
         )
 
-        filenames = [Path(p).name for p in dataset.paths]
+        filenames = dataset.names
         self.eval()
         all_features = []
         with torch.no_grad():

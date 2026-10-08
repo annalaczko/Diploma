@@ -52,6 +52,11 @@ class Augmentor(PreprocessingStep):
     This is meant to sit right before a training step (VAE / VAEClassifier)
     that would otherwise overfit on a small labelled dataset.
 
+    In a `Pipeline` run with mode="memory", this step doesn't write
+    copies at all: its `transform` is applied on the fly to the training
+    images instead, so every epoch sees a fresh random view of each image
+    (`num_augmentations` and `keep_original` then have no effect).
+
     Config (all optional, sensible defaults provided):
         num_augmentations: number of randomly augmented copies to
             generate per input image.
@@ -83,7 +88,7 @@ class Augmentor(PreprocessingStep):
 
     def __init__(
         self,
-        input_path,
+        input_path=None,
         output_path=None,
         name=None,
         delete_input_data=False,

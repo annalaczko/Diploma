@@ -4,6 +4,7 @@ from abc import abstractmethod
 from pathlib import Path
 from typing import Any
 
+from pipeline.preprocessing.dataset import ImageRecord
 from pipeline.steps.step import Step
 
 
@@ -11,9 +12,15 @@ class PreprocessingStep(Step):
     """Common contract for all preprocessing steps
     (e.g. image enhancement, object detection).
 
-    Preprocessing steps are usually chained one after another,
-    so `run` should take an image (or batch) and return the
-    same type, ready for the next step in the chain.
+    Preprocessing steps are usually chained one after another, in one of
+    two modes:
+      - disk mode: `run()` reads every image under `self.input_path` and
+        writes its results to `self.output_path`, which the next step
+        then uses as its `input_path`.
+      - in-memory mode: `process_batch(records)` takes a list of
+        `ImageRecord`s and returns the processed list, nothing is written
+        (see `pipeline.pipeline.Pipeline`).
+    Both modes should call the same per-image code, so they can't drift apart.
     """
 
     def __init__(
@@ -39,3 +46,10 @@ class PreprocessingStep(Step):
     @abstractmethod
     def run(self) -> Path:
         raise NotImplementedError
+
+    def process_batch(self, records: list[ImageRecord]) -> list[ImageRecord]:
+        """In-memory counterpart of `run()`: process one batch of images
+        and return the results (images that fail may be dropped)."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support in-memory (batch) mode"
+        )

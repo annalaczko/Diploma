@@ -6,6 +6,12 @@ from pathlib import Path
 from typing import Any
 
 
+# Where steps write when no output_path is given: <repo>/data/pipeline,
+# anchored to this file rather than the working directory, so a notebook
+# in notebooks/ and a script run from the repo root write to the same place.
+DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "data" / "pipeline"
+
+
 class Step(ABC):
     """Abstract base class for every stage in the pipeline
     (preprocessing, feature learning, clustering, evaluation).
@@ -49,21 +55,12 @@ class Step(ABC):
             self.output_path = output_path
         else:
             # Group outputs as data/pipeline/<run_id>/<stage>/<step>, where
-            # <stage> is the immediate abstract base (e.g. PreprocessingStep)
-            # and <step> is the concrete class (e.g. Normalizer). Falls back
-            # to using the concrete class name twice if there's no such base
-            # (e.g. Step is instantiated directly, or subclassed only once).
-            parent_class = (
-                self.__class__.__mro__[1].__name__
-                if len(self.__class__.__mro__) > 2
-                else self.__class__.__name__
-            )
+            # <stage> is the step's stage base class (e.g. PreprocessingStep)
+            # and <step> is the concrete class (e.g. Normalizer).
             default_output = (
-                Path("..")
-                / "data"
-                / "pipeline"
+                DEFAULT_OUTPUT_ROOT
                 / run_id
-                / parent_class
+                / self._stage_name()
                 / self.__class__.__name__
             )
             default_output.mkdir(parents=True, exist_ok=True)
@@ -73,6 +70,17 @@ class Step(ABC):
         self.delete_input_data_flag = delete_input_data
         print("Output path for step", self.name, ":", self.output_path)
 
+
+    def _stage_name(self) -> str:
+        """Name of the stage base class this step belongs to: the first
+        class in its MRO that is a strict subclass of `Step` other than the
+        concrete class itself (e.g. `FeatureLearningStep` for `VAE`, even
+        though `VAE` lists `nn.Module` first). Falls back to the concrete
+        class name for a step that subclasses `Step` directly."""
+        for cls in self.__class__.__mro__[1:]:
+            if issubclass(cls, Step) and cls is not Step:
+                return cls.__name__
+        return self.__class__.__name__
 
     @abstractmethod
     def run(self, data: Any) -> Any:

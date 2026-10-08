@@ -7,7 +7,14 @@ from pipeline.preprocessing.background_eraser import BackgroundEraser
 from pipeline.preprocessing.repair import Repair
 from pipeline.preprocessing.normalizer import Normalizer
 from pipeline.preprocessing.augmentation import Augmentor
-from pipeline.preprocessing.dataset import collect_image_paths, ImageDataset, DEFAULT_IMAGE_EXTENSIONS
+from pipeline.preprocessing.dataset import (
+    collect_image_paths,
+    ImageDataset,
+    DEFAULT_IMAGE_EXTENSIONS,
+    ImageRecord,
+    InMemoryImages,
+    iter_image_batches,
+)
 
 __all__ = [
     "PreprocessingStep",
@@ -18,4 +25,7 @@ __all__ = [
     "collect_image_paths",
     "ImageDataset",
     "DEFAULT_IMAGE_EXTENSIONS",
+    "ImageRecord",
+    "InMemoryImages",
+    "iter_image_batches",
 ]

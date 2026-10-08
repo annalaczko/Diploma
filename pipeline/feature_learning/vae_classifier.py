@@ -14,7 +14,7 @@ from pathlib import Path
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
-from pipeline.preprocessing.dataset import ImageDataset, collect_image_paths
+from pipeline.preprocessing.dataset import ImageDataset, InMemoryImages, image_entries
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -206,26 +206,31 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
 
         # Filtering the dataset to include only labelled images
 
-        paths = sorted(
-            path for path in collect_image_paths(self.input_path)
-            if path.stem in labels_by_id
+        # Work with indices into `entries` rather than the paths
+        # themselves, so the same code serves image paths on disk and
+        # in-memory images (see `set_images`).
+        entries, names = image_entries(self._collect_inputs())
+        in_memory = isinstance(entries, InMemoryImages)
+        indices = sorted(
+            (i for i, name in enumerate(names) if Path(name).stem in labels_by_id),
+            key=(lambda i: names[i]) if in_memory else (lambda i: entries[i]),
         )
 
-        print(f"Found {len(paths)} labelled images in {self.input_path}")
+        print(f"Found {len(indices)} labelled images in {'memory' if in_memory else self.input_path}")
 
-        if not paths:
+        if not indices:
             raise ValueError("No labelled images found")
 
-        labels = [labels_by_id[path.stem] for path in paths]
+        labels = [labels_by_id[Path(names[i]).stem] for i in indices]
 
-        paths, labels, label_order = self._filter_rare_classes(
-            paths, labels, min_samples_per_class
+        indices, labels, label_order = self._filter_rare_classes(
+            indices, labels, min_samples_per_class
         )
 
         classes = encoder.classes_[label_order]
         self.classes_ = classes.tolist()
         print(
-            f"Using {len(classes)} classes and {len(paths)} labelled images "
+            f"Using {len(classes)} classes and {len(indices)} labelled images "
             f"after excluding classes with fewer than {min_samples_per_class} samples"
         )
         classifier_device = next(self.parameters()).device
@@ -236,13 +241,18 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
 
 
 
-        train_paths, val_paths, train_labels, val_labels = train_test_split(
-            paths,
+        train_idx, val_idx, train_labels, val_labels = train_test_split(
+            indices,
             labels,
             test_size=validation_size,
             random_state=42,
             stratify=labels,
         )
+        if in_memory:
+            train_paths, val_paths = entries.subset(train_idx), entries.subset(val_idx)
+        else:
+            train_paths = [entries[i] for i in train_idx]
+            val_paths = [entries[i] for i in val_idx]
         # Kept for downstream evaluation (e.g. confusion matrix) once run() returns.
         self.val_paths_ = val_paths
         self.val_labels_ = val_labels
@@ -258,7 +268,8 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         # (every image, every epoch); a wrong-sized image will fail loudly when
         # DataLoader tries to batch it, rather than being silently resized.
         train_loader = torch.utils.data.DataLoader(
-            ImageDataset(train_paths, labels=train_labels, grayscale=True, target_size=None),
+            ImageDataset(train_paths, labels=train_labels, grayscale=True, target_size=None,
+                         transform=self.train_transform),
             shuffle=True,
             **loader_kwargs,
         )
@@ -401,7 +412,7 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         output layer size and CrossEntropyLoss both assume contiguous ids).
 
         Args:
-            paths: sequence of image paths, one per sample.
+            paths: one entry per sample (image paths, or indices into them).
             labels: sequence of original (encoder-assigned) label ids,
                 aligned with `paths`.
             min_samples_per_class: classes with fewer labelled images than

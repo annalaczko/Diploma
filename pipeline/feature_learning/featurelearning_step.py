@@ -6,6 +6,7 @@ import pandas as pd
 
 import numpy as np
 
+from pipeline.preprocessing.dataset import InMemoryImages, collect_image_paths
 from pipeline.steps.step import Step
 
 
@@ -36,6 +37,35 @@ class FeatureLearningStep(Step):
             save_results=save_results,
             run_id=run_id,
         )
+        # In-memory pipeline mode (see `set_images`); None = read from input_path.
+        self.images: InMemoryImages | None = None
+        self.train_transform = None
+
+    def set_images(self, images: InMemoryImages, train_transform=None) -> None:
+        """Use already-preprocessed in-memory images instead of reading
+        `input_path` from disk (see `pipeline.pipeline.Pipeline`).
+
+        Args:
+            images: the preprocessed images.
+            train_transform: optional PIL -> PIL transform applied on the
+                fly to training images only (e.g. `Augmentor.transform`),
+                never to feature extraction or validation.
+        """
+        self.images = images
+        self.train_transform = train_transform
+
+    def _collect_inputs(self, folder=None):
+        """The images this step works on: the in-memory ones if
+        `set_images` was called, otherwise every image under `folder`
+        (defaults to `input_path`)."""
+        if self.images is not None:
+            return self.images
+        folder = folder or self.input_path
+        if not folder:
+            raise ValueError(
+                f"{self.name} needs either input_path or in-memory images (set_images)"
+            )
+        return collect_image_paths(folder)
 
     @abstractmethod
     def run(self) -> pd.DataFrame:

@@ -27,7 +27,7 @@ from skimage.morphology import skeletonize
 from tqdm import tqdm
 
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
-from pipeline.preprocessing.dataset import collect_image_paths
+from pipeline.preprocessing.dataset import ImageRecord, collect_image_paths
 
 
 class Repair(PreprocessingStep):
@@ -71,7 +71,7 @@ class Repair(PreprocessingStep):
 
     def __init__(
         self,
-        input_path: str,
+        input_path: str | None = None,
         output_path: str | None = None,
         name: str | None = None,
         delete_input_data: bool = False,
@@ -106,6 +106,7 @@ class Repair(PreprocessingStep):
         self.output_thickness = output_thickness
         self.image_extensions = image_extensions
         self.debug_images = debug_images
+        self._debug_saved = 0  # debug strips saved so far (counts across batches)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -133,21 +134,37 @@ class Repair(PreprocessingStep):
         # would be picked up as training data.
         debug_dir = output_dir.parent / f"{output_dir.name}_debug"
 
-        for idx, image_path in enumerate(tqdm(input_paths, desc="Repairing images", unit="image")):
-            img = Image.open(image_path).convert("L")
-            if idx < self.debug_images:
-                repaired, stages = self.process_image(img, return_stages=True)
-                self._save_debug_image(stages, debug_dir / image_path.name)
-            else:
-                repaired = self.process_image(img)
-
-            out_path = output_dir / image_path.name
-            Image.fromarray(repaired).save(out_path)
+        self._debug_saved = 0
+        for image_path in tqdm(input_paths, desc="Repairing images", unit="image"):
+            repaired = self._repair_one(Image.open(image_path), image_path.name, debug_dir)
+            Image.fromarray(repaired).save(output_dir / image_path.name)
 
         if self.delete_input_data_flag:
             self.delete_input_data()
 
         return output_dir
+
+    def process_batch(self, records: list[ImageRecord]) -> list[ImageRecord]:
+        """In-memory mode: repair each image, keeping its name. Debug strips
+        (if `debug_images > 0`) still go to the `<output folder>_debug`
+        directory, for the first `debug_images` images across all batches."""
+        output_dir = Path(self.output_path)
+        debug_dir = output_dir.parent / f"{output_dir.name}_debug"
+        return [
+            ImageRecord(r.name, Image.fromarray(self._repair_one(r.image, r.name, debug_dir)))
+            for r in records
+        ]
+
+    def _repair_one(self, img: Image.Image, name: str, debug_dir: Path) -> np.ndarray:
+        """`process_image` on one image, also saving its debug strip while
+        fewer than `debug_images` have been saved so far."""
+        img = img.convert("L")
+        if self._debug_saved < self.debug_images:
+            repaired, stages = self.process_image(img, return_stages=True)
+            self._save_debug_image(stages, debug_dir / name)
+            self._debug_saved += 1
+            return repaired
+        return self.process_image(img)
 
     def process_image(self, img: Image.Image, return_stages: bool = False):
         """Full pipeline on a single raw (grayscale) PIL image.

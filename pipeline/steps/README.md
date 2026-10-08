@@ -40,14 +40,20 @@ If `output_path` is not given, `Step.__init__` builds one and creates it on
 disk immediately:
 
 ```
-../data/pipeline/<run_id>/<parent_class>/<concrete_class>/
+<repo>/data/pipeline/<run_id>/<stage_class>/<concrete_class>/
 ```
 
-`<parent_class>` is the step's immediate abstract base (e.g.
-`PreprocessingStep` for `Normalizer`), so outputs from different kinds of
-steps land in separate, predictable subtrees. If a class has no such base in
-its MRO (e.g. `Step` is subclassed directly, with nothing in between), the
-concrete class name is used for both segments.
+The root is `DEFAULT_OUTPUT_ROOT` in `pipeline/steps/step.py`. It is
+anchored to the repository, not the working directory, so a notebook in
+`notebooks/` and a script run from the repo root write to the same place.
+Tests redirect it to a temp folder (`tests/conftest.py`).
+
+`<stage_class>` is the step's stage base class: the first strict `Step`
+subclass in its MRO (e.g. `PreprocessingStep` for `Normalizer`,
+`FeatureLearningStep` for `VAE` even though `VAE` lists `nn.Module` first).
+Outputs from different kinds of steps therefore land in separate, predictable
+subtrees. If a class subclasses `Step` directly, the concrete class name is
+used for both segments.
 
 ### `run(data)`
 

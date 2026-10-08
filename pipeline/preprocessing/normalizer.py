@@ -4,7 +4,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
-from pipeline.preprocessing.dataset import collect_image_paths
+from pipeline.preprocessing.dataset import ImageRecord, collect_image_paths
 
 
 class Normalizer(PreprocessingStep):
@@ -70,15 +70,21 @@ class Normalizer(PreprocessingStep):
             )
 
         for image_path in tqdm(image_paths, desc="Normalizing images", unit="image"):
-            image = Image.open(image_path).convert("RGB")
-            padded = self.pad_to_square(image, fill_color=self.background_color)
-            resized = padded.resize((self.target_size, self.target_size), Image.Resampling.LANCZOS)
-            resized.save(output_dir / image_path.name)
+            self.normalize(Image.open(image_path)).save(output_dir / image_path.name)
 
         if self.delete_input_data_flag:
             self.delete_input_data()
 
         return output_dir
+
+    def process_batch(self, records: list[ImageRecord]) -> list[ImageRecord]:
+        """In-memory mode: normalize each image, keeping its name."""
+        return [ImageRecord(r.name, self.normalize(r.image)) for r in records]
+
+    def normalize(self, image: Image.Image) -> Image.Image:
+        """Pad one image to a square and resize it to `target_size`."""
+        padded = self.pad_to_square(image.convert("RGB"), fill_color=self.background_color)
+        return padded.resize((self.target_size, self.target_size), Image.Resampling.LANCZOS)
 
     def pad_to_square(self, image: Image.Image, fill_color=(0, 0, 0)) -> Image.Image:
         """Pad the image with a background color to the nearest square size.

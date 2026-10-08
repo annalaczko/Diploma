@@ -24,31 +24,79 @@ preprocessing  ->  feature_learning  ->  clustering  ->  evaluation (optional)
 Every stage's concrete classes inherit from a common `Step` base class:
 see [`pipeline/steps`](steps/README.md).
 
-`pipeline.pipeline.Pipeline` is a thin orchestrator that chains a chosen set
-of steps together into one runnable experiment - it owns no logic of its own
-beyond calling each step's `run()` in order and threading its output into the
-next step's input:
+`pipeline.pipeline.Pipeline` is a thin orchestrator that chains a configured
+set of steps into one runnable experiment. See [Two ways to run the
+pipeline](#two-ways-to-run-the-pipeline) below; `main.py` at the repo root is
+a runnable example.
+
+You can still call every step on its own (`step.run()`), as in the
+step-by-step example below. This is handy while a stage's output still needs
+inspecting/tuning before moving on to the next one.
+
+## Two ways to run the pipeline
+
+The same configured steps can run in two modes:
+
+| | `mode="disk"` | `mode="memory"` |
+|---|---|---|
+| How images move | every step's `run()` writes its output folder, which becomes the next step's `input_path` | images are loaded `preprocess_batch_size` at a time and passed through every step's `process_batch()` |
+| Intermediate folders | yes (one per step) | none (only debug images and `features.csv`) |
+| Kept in RAM | nothing between steps | only the final, normalized images, as one `(N, 256, 256)` uint8 array (`InMemoryImages`, ~64 KB/image) |
+| `Augmentor` | writes `keep_original` + `num_augmentations` copies per image | not run as a step: its `transform` is applied on the fly to *training* images, a fresh random view every epoch |
 
 ```python
 from pipeline.pipeline import Pipeline
+from pipeline.preprocessing import BackgroundEraser, Normalizer, Repair, Augmentor
+from pipeline.feature_learning import VAE
+from pipeline.clustering import HierarchicalClustering
+from pipeline.evaluation import EvaluationWithGroundTruth
 
-pipeline = Pipeline(
-    preprocessing_steps=[...],   # list of PreprocessingStep instances
-    feature_learning_step=...,   # one FeatureLearningStep instance
-    clustering_step=...,         # one ClusteringStep instance
-    evaluation_step=...,         # optional EvaluationStep instance
+vae = VAE(k=128, run_id=run_id).to(device)
+pipe = Pipeline(
+    preprocessing_steps=[            # no input_path needed: run() wires them up
+        BackgroundEraser(mode="segmentation", model=model_path, mask_margin=0.05),
+        Normalizer(background_color=(255, 255, 255)),
+        Repair(contrast_factor=5, skeletonize=False, output_thickness=2),
+        Augmentor(num_augmentations=2),
+    ],
+    feature_learning_step=vae,
+    # optional; a factory because clustering reads features.csv in __init__
+    clustering_factory=lambda csv: HierarchicalClustering(input_path=csv, cluster_num=55),
+    # optional, only used together with clustering_factory; built from the predicted labels
+    evaluation_factory=lambda y_pred: EvaluationWithGroundTruth(y_true, y_pred),
 )
-result = pipeline.run(data)
-# result = {"features": ..., "labels": ..., "metrics": ...}
+
+# In memory, without intermediate folders:
+result = pipe.run(source_folder, mode="memory", preprocess_batch_size=64,
+                  feature_mode="train_model", epochs=500, lr=1e-4, batch_size=128)
+# result = {"images": InMemoryImages, "features": DataFrame, "labels": ..., "metrics": ...}
+
+# The same through folders on disk:
+result = pipe.run(source_folder, mode="disk", feature_mode="train_model", epochs=500)
+# result = {"output_path": <last preprocessing folder>, "features": ..., "labels": ...}
 ```
 
-In practice, most experiments in this project call the concrete steps
-directly (see below) rather than going through `Pipeline`, since each stage
-usually needs its output inspected/tuned before moving on to the next one.
-**Note:** `main.py` at the repo root is an outdated stub — it references
-classes (`PretrainedFeatureLearning`, `ImageEnhancement`, `ObjectDetection`)
-that no longer exist in this codebase. Use the example below, or
-`notebooks/sandbox.ipynb`, as the up-to-date usage reference instead.
+- `feature_mode` is passed as the feature step's `mode`
+  (`"train_model"` / `"extract_features"`). Every other keyword argument
+  (`epochs`, `lr`, `batch_size`, ...) goes to the feature step's `run()`.
+  A step whose `run()` has no `mode` (`VAEClassifier`) ignores it.
+- To reuse already preprocessed images with another model (e.g. extract
+  features with a trained VAE, then train a `VAEClassifier`), skip the
+  pipeline and hand the images over directly:
+  `classifier.set_images(result["images"])`. To write them out for a look,
+  use `result["images"].save(folder)`. To inspect a few batches, use
+  `next(pipe.iter_batches(source_folder))`.
+- Memory mode never JPEG-recompresses between steps, so its images can differ
+  very slightly from disk mode's when the intermediate files are `.jpg`.
+- In memory mode, images are named the way `BackgroundEraser` names them on
+  disk (`<subfolder>__<file>`), so `features["filename"]` and the
+  `VAEClassifier`'s label lookup (by stem) work the same in both modes.
+- Augmentation differs between the modes. In memory mode an epoch is the
+  original dataset size; in disk mode it is `1 + num_augmentations` times as
+  large. Epoch counts and early-stopping patience therefore aren't directly
+  comparable between the two.
+- `SimCLR`/`BYOL` already augment their own two views, so in memory mode
+  they ignore the `Augmentor` (and print a warning).
 
 ## Typical run (end to end)
 
@@ -93,10 +141,12 @@ Every `Step` (see [`pipeline/steps`](steps/README.md)) auto-derives an output
 directory if you don't pass `output_path` explicitly:
 
 ```
-../data/pipeline/<run_id>/<StageBaseClass>/<ConcreteClassName>/
+<repo>/data/pipeline/<run_id>/<StageBaseClass>/<ConcreteClassName>/
 ```
 
-e.g. `../data/pipeline/run_2026-09-04/PreprocessingStep/Normalizer/`. Passing
+e.g. `data/pipeline/run_2026-09-04/PreprocessingStep/Normalizer/` or
+`data/pipeline/run_2026-09-04/FeatureLearningStep/VAE/features.csv`. This
+doesn't depend on where you run from. Passing
 the same `run_id` across a chain of steps keeps one experiment's outputs
 grouped together and separate from other runs.
 
@@ -104,7 +154,7 @@ grouped together and separate from other runs.
 
 ```
 pipeline/
-├── pipeline.py              # Pipeline orchestrator class
+├── pipeline.py              # Pipeline orchestrator: disk or in-memory mode
 ├── steps/                   # Step: shared abstract base for every stage
 ├── preprocessing/           # BackgroundEraser, Repair, Normalizer, Augmentor + shared image-loading helpers
 ├── feature_learning/        # VAE, SimCLR, BYOL, VAEClassifier
