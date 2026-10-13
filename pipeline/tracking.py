@@ -139,6 +139,13 @@ def log_params(params: dict[str, Any], prefix: str = "") -> None:
             warnings.warn(f"MLflow: could not log param {prefix}{key}: {exc}")
 
 
+def set_tags(tags: dict[str, Any]) -> None:
+    """Set run tags (e.g. where the model file was saved); None values are
+    skipped. Unlike params, tags may be overwritten later in the run."""
+    if is_active():
+        mlflow.set_tags({key: str(value) for key, value in tags.items() if value is not None})
+
+
 def log_metrics(metrics: dict[str, Any], step: int | None = None, prefix: str = "") -> None:
     """Log numeric metrics, skipping None and non-finite values."""
     if not is_active():

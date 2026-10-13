@@ -1,0 +1,6 @@
+# Whole pipeline from the raw scans: preprocessing (steps in configs/default.yaml),
+# the preprocessed images are saved to data/preprocessed/<run id> for reuse.
+data:
+  source: raw
+model:
+  params: {k: 16, beta_max: 32}

@@ -1,0 +1,3 @@
+# VAE with a small latent space and strong KL weight, on the ready legion images.
+model:
+  params: {k: 16, beta_max: 32}

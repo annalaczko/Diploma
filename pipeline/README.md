@@ -104,6 +104,58 @@ result = pipe.run(source_folder, mode="disk", feature_mode="train_model", epochs
 - `SimCLR`/`BYOL` already augment their own two views, so in memory mode
   they ignore the `Augmentor` (and print a warning).
 
+## Config-driven runs (`run_experiment.py`)
+
+A whole run can be described by a short YAML file and started from the
+command line. `configs/default.yaml` holds every setting with comments; an
+experiment config lists only what it changes (nested sections are merged,
+lists replaced):
+
+```yaml
+# configs/vae_k16_beta32.yaml
+model:
+  params: {k: 16, beta_max: 32}
+```
+
+```bash
+python run_experiment.py configs/vae_k16_beta32.yaml
+python run_experiment.py configs/vae_k16_beta32.yaml --set clustering.cluster_num=30 --set training.epochs=200
+python run_experiment.py configs/vae_k16_beta32.yaml --dry-run    # resolved config + run id only
+```
+
+- `data.source: preprocessed` (default) trains on ready images in
+  `data.preprocessed_path` (default `data/preprocessed/legion/train`);
+  `raw` runs `preprocessing.steps` on `data.raw_path` first and saves the
+  result to `data/preprocessed/<run id>`, reusable as `preprocessed_path`.
+- `stop_after` ends a run early: `preprocessing` (with `data.source: raw`)
+  only produces the preprocessed images (run name `prep-<steps>__raw`,
+  e.g. `configs/preprocess_raw.yaml`); `features` trains/saves the model and
+  extracts features, without clustering and evaluation. `null` = whole run.
+- `model.type`: `vae`, `simclr` or `byol`; `model.params` go to its
+  constructor. `model.checkpoint` loads a saved state_dict: with
+  `training.train: true` it is fine-tuned (saved as a new file), with
+  `false` only features are extracted.
+- `clustering.method: auto` picks the linkage by cophenetic correlation;
+  `standardize` z-scores the features first, as in the notebook.
+- Evaluation: silhouette on every image, ACC/ARI/NMI on the images with a
+  label in `data.labels` (`ID` = file name without extension, `TypeRev`).
+
+Each run gets an id generated from its config:
+`<model>-<params>_<training>__<clustering>__<data>__<date-time>`, e.g.
+`vae-k16-beta32_e100__ward-euclidean-c55__legion-train__20261012-153000`
+(`name:` in the config replaces the generated part). The same id is used for:
+
+| Where | What |
+|---|---|
+| MLflow run name (experiment `experiment:`) | all settings as `cfg/...` params, metrics, `config.yaml`; tags `model_path`, `started_from`, `data`, `output_dir`, `config_file`, `git_commit`, `git_dirty` |
+| `data/pipeline/<run id>/` | `config.yaml`, features, `clusters.csv`, `metrics.json` |
+| `models/feature_learning/<run id>.pt` | trained state_dict; `<run id>.yaml` next to it has the config and the MLflow run id |
+
+Model files are never overwritten and are not stored in MLflow; the run
+records their path. Relative paths in configs are relative to the repo
+root, and float values like `1e-4` are read as numbers. The logic lives in
+`pipeline/experiment.py` (`load_config`, `run_name`, `run_experiment`).
+
 ## Experiment tracking (MLflow)
 
 `pipeline/tracking.py` logs every stage to MLflow. Pass `experiment_name`
@@ -205,6 +257,7 @@ grouped together and separate from other runs.
 pipeline/
 ├── pipeline.py              # Pipeline orchestrator: disk or in-memory mode
 ├── tracking.py              # optional MLflow logging used by every stage
+├── experiment.py            # config-driven runs (run_experiment.py, configs/)
 ├── steps/                   # Step: shared abstract base for every stage
 ├── preprocessing/           # BackgroundEraser, Repair, Normalizer, Augmentor + shared image-loading helpers
 ├── feature_learning/        # VAE, SimCLR, BYOL, VAEClassifier

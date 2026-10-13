@@ -1,0 +1,51 @@
+# Defaults for every experiment run with run_experiment.py.
+# An experiment config (configs/<name>.yaml) only lists what it changes:
+# nested sections are merged into these, lists are replaced as a whole.
+#
+#   python run_experiment.py configs/<name>.yaml
+#   python run_experiment.py configs/<name>.yaml --set model.params.k=32 --set clustering.cluster_num=30
+#   python run_experiment.py configs/<name>.yaml --dry-run      # print the resolved config and run name only
+#
+# Relative paths are relative to the repository root.
+
+experiment: pottery          # MLflow experiment the run is logged under
+name: null                   # run name; null = generated from the config (model, params, clustering, data)
+stop_after: null             # null = whole run | preprocessing (needs data.source: raw) | features (no clustering/evaluation)
+
+data:
+  source: preprocessed       # preprocessed: use ready images from preprocessed_path | raw: preprocess raw_path from scratch
+  preprocessed_path: data/preprocessed/legion/train
+  raw_path: data/raw
+  labels: data/ocr_data.csv  # ground truth for evaluation (columns ID, TypeRev); null = silhouette only
+
+preprocessing:               # only used when data.source is raw
+  mode: memory               # memory | disk
+  batch_size: 64             # images preprocessed at once in memory mode
+  steps:                     # run in this order; the last step's images are saved to <paths.preprocessed>/<run name>
+    - BackgroundEraser2: {mode: segmentation, model: models/yolov8n_seg_finetuned.pt, mask_margin: 0.01, axis_margin: 0.01}
+    - Normalizer: {background_color: [255, 255, 255]}
+    - Repair: {contrast_factor: 5, dilate_kernel_size: 1, dilate_iterations: 1, skeletonize: false, output_thickness: 2}
+
+model:
+  type: vae                  # vae | simclr | byol
+  params: {f: 4, n: 3, s: 1, k: 128}   # constructor arguments, e.g. beta_max / recon_loss for vae, tau for byol
+  checkpoint: null           # .pt to start from: fine-tuned if training.train, otherwise only used to extract features
+
+training:
+  train: true                # false = only extract features (needs model.checkpoint)
+  epochs: 100
+  lr: 1.0e-4
+  batch_size: 128
+  # any other argument of the model's run()/train_model() can be added here,
+  # e.g. early_stopping_patience: 20
+
+clustering:
+  method: ward               # single | complete | average | weighted | centroid | ward | auto (best cophenetic correlation)
+  metric: euclidean          # euclidean | cityblock | chebyshev | cosine (ignored with method: auto)
+  cluster_num: 55
+  standardize: true          # z-score every feature dimension before clustering
+  min_variance: 1.0e-3       # with standardize: drop dimensions whose variance is below this
+
+paths:
+  models: models/feature_learning   # trained models are saved here as <run name>.pt, with <run name>.yaml next to it
+  preprocessed: data/preprocessed   # raw runs save their preprocessed images to <this>/<run name>

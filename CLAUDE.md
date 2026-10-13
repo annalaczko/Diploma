@@ -16,6 +16,8 @@ The Python 3.10 virtualenv lives in `venv/` (gitignored). Dependencies are in `r
 source venv/bin/activate
 pip install -r requirements.txt
 
+python run_experiment.py configs/<name>.yaml [--set key.sub=value] [--dry-run]   # config-driven run (configs/default.yaml)
+
 pytest                                   # all tests (pytest.ini: testpaths=tests, pythonpath=., -v)
 pytest tests/test_simclr.py              # one file
 pytest tests/test_byol.py::TestName::test_name   # one test

@@ -148,8 +148,9 @@ class Pipeline:
         if mode == "memory":
             images = self.preprocess_in_memory(input_path, preprocess_batch_size, save=save_preprocessed)
             result = {"images": images}
-            if save_preprocessed is not None:
-                result["output_path"] = Path(self._batch_steps()[-1].output_path)
+            steps = self._batch_steps()
+            if save_preprocessed is not None and steps:  # nothing to save without steps
+                result["output_path"] = Path(steps[-1].output_path)
                 print(f"Preprocessed images saved under {result['output_path']}")
             if self.feature_learning_step is not None:
                 self.feature_learning_step.set_images(images, train_transform=self._train_transform())
