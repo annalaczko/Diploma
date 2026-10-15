@@ -10,6 +10,9 @@ models:
                             supervised (VAEClassifier) training.
 """
 
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,7 +33,10 @@ def collect_image_paths(input_value, image_extensions=DEFAULT_IMAGE_EXTENSIONS) 
     Args:
         input_value: a single path (str or Path), or a list/tuple of
             paths. Each entry may point at a file or a directory;
-            directories are searched recursively (`Path.rglob("*")`).
+            directories are searched recursively (`Path.rglob("*")`),
+            skipping subfolders whose name starts with "_": a step's side
+            outputs (`_debug`, `_svg`, see
+            `PreprocessingStep.side_output_dir`), which are not inputs.
             `None` entries and paths that don't exist on disk are
             silently skipped, so callers can pass optional or
             partially-missing input without pre-filtering it themselves.
@@ -65,6 +71,8 @@ def collect_image_paths(input_value, image_extensions=DEFAULT_IMAGE_EXTENSIONS) 
         # Directory: recurse and keep only files with a matching extension.
         for nested in sorted(path.rglob("*")):
             if not nested.is_file():
+                continue
+            if any(part.startswith("_") for part in nested.relative_to(path).parts[:-1]):
                 continue
             if nested.suffix.lower() not in image_extensions:
                 continue
@@ -106,29 +114,70 @@ class ImageRecord:
     image: Image.Image
 
 
-def iter_image_batches(input_path, batch_size=64, image_extensions=DEFAULT_IMAGE_EXTENSIONS):
+def iter_image_batches(input_path, batch_size=64, image_extensions=DEFAULT_IMAGE_EXTENSIONS,
+                       num_workers=8):
     """Yield the images under `input_path` as lists of `ImageRecord`s,
     `batch_size` at a time, so only one batch of full-resolution images
     is ever held in memory. Names are flattened relative to `input_path`
     (see `flatten_name`), matching what `BackgroundEraser` writes in disk
     mode, and EXIF orientation is applied, as `cv2.imread` does there.
+    The images of a batch are decoded on `num_workers` threads.
     """
     paths = collect_image_paths(input_path, image_extensions)
     if not paths:
         raise FileNotFoundError(
             f"No existing images with extensions {image_extensions} found under {input_path}"
         )
-    for start in range(0, len(paths), batch_size):
-        batch = []
-        for path in paths[start:start + batch_size]:
-            with Image.open(path) as image:
-                # Apply EXIF orientation, like cv2.imread does in
-                # BackgroundEraser's disk mode - many scans are stored
-                # rotated with an orientation tag.
-                image = ImageOps.exif_transpose(image)
-                image.load()
-                batch.append(ImageRecord(flatten_name(path, input_path), image.copy()))
-        yield batch
+
+    def load(path):
+        with Image.open(path) as image:
+            # Apply EXIF orientation, like cv2.imread does in
+            # BackgroundEraser's disk mode - many scans are stored
+            # rotated with an orientation tag.
+            image = ImageOps.exif_transpose(image)
+            image.load()
+            return ImageRecord(flatten_name(path, input_path), image.copy())
+
+    with ThreadPoolExecutor(max_workers=max(1, num_workers)) as pool:
+        for start in range(0, len(paths), batch_size):
+            yield list(pool.map(load, paths[start:start + batch_size]))
+
+
+def prefetch(iterable, depth=1):
+    """Iterate over `iterable` while a background thread already produces
+    the next `depth` items - e.g. loads the next batch of images while the
+    current one is being processed. Errors are raised in the caller."""
+    items = queue.Queue(maxsize=depth)
+    stop = threading.Event()
+    done = object()
+
+    def produce():
+        try:
+            for item in iterable:
+                while not stop.is_set():
+                    try:
+                        items.put((item, None), timeout=0.1)
+                        break
+                    except queue.Full:
+                        pass
+                if stop.is_set():
+                    return
+            items.put((done, None))
+        except BaseException as error:  # handed over to the consumer
+            items.put((done, error))
+
+    thread = threading.Thread(target=produce, daemon=True)
+    thread.start()
+    try:
+        while True:
+            item, error = items.get()
+            if error is not None:
+                raise error
+            if item is done:
+                return
+            yield item
+    finally:
+        stop.set()
 
 
 class InMemoryImages:

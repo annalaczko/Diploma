@@ -75,8 +75,8 @@ class Step(ABC):
         """Name of the stage base class this step belongs to: the class in
         its MRO (other than the concrete class itself) that subclasses
         `Step` directly (e.g. `FeatureLearningStep` for `VAE`, even though
-        `VAE` lists `nn.Module` first, and `PreprocessingStep` for
-        `BackgroundEraser2`, not its parent `BackgroundEraser`). Falls back
+        `VAE` lists `nn.Module` first, and `PreprocessingStep` for a
+        subclass of a concrete step, not that step). Falls back
         to the concrete class name for a step that subclasses `Step`
         directly."""
         for cls in self.__class__.__mro__[1:]:

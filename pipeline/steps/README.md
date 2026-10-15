@@ -51,8 +51,7 @@ Tests redirect it to a temp folder (`tests/conftest.py`).
 `<stage_class>` is the step's stage base class: the class in its MRO that
 subclasses `Step` directly (e.g. `PreprocessingStep` for `Normalizer`,
 `FeatureLearningStep` for `VAE` even though `VAE` lists `nn.Module` first,
-and `PreprocessingStep` for `BackgroundEraser2`, not its parent
-`BackgroundEraser`).
+and `PreprocessingStep` for a subclass of a concrete step, not that step).
 Outputs from different kinds of steps therefore land in separate, predictable
 subtrees. If a class subclasses `Step` directly, the concrete class name is
 used for both segments.

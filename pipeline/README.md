@@ -82,6 +82,14 @@ result = pipe.run(source_folder, mode="disk", feature_mode="train_model", epochs
   feature learning gets; `result["output_path"]` points at them), `"all"`
   every step's output. An `Augmentor` is not a step in memory mode, so its
   random views are never saved. Disk mode always writes every step.
+- Per-image metadata: `BackgroundEraser` records each image's scan size,
+  DPI and crop, and with `record_axes=True` the coordinate system (instead of
+  drawing it). `Pipeline` links steps that draw the axes
+  (`Vectorizer(axes="draw")`, `AxisRenderer`) to it, and after preprocessing
+  writes `extracted_metadata.csv` (in the final images' pixel coordinates,
+  with the scale/offset back to the scan and px/cm) next to the saved
+  images, returns it as `result["metadata"]` and logs it to MLflow. See
+  [`preprocessing/README.md`](preprocessing/README.md).
 - `feature_mode` is passed as the feature step's `mode`
   (`"train_model"` / `"extract_features"`). Every other keyword argument
   (`epochs`, `lr`, `batch_size`, ...) goes to the feature step's `run()`.
@@ -124,14 +132,17 @@ python run_experiment.py configs/vae_k16_beta32.yaml --dry-run    # resolved con
 ```
 
 - `data.source: preprocessed` (default) trains on ready images in
-  `data.preprocessed_path` (default `data/preprocessed/legion/train`);
-  `raw` runs `preprocessing.steps` on `data.raw_path` first and saves the
-  result to `data/preprocessed/<run id>`, reusable as `preprocessed_path`.
+  `data.preprocessed_path` (default `data/processed/legion/no_axes/train`);
+  `raw` runs `preprocessing.steps` on `data.raw_path` first; the result is
+  in the last step's folder (see below), and can be copied by hand to
+  e.g. `data/processed/<name>` to be reused as `preprocessed_path`.
 - `stop_after` ends a run early: `preprocessing` (with `data.source: raw`)
   only produces the preprocessed images (run name `prep-<steps>__raw`,
-  e.g. `configs/preprocess_raw.yaml`); `features` trains/saves the model and
+  e.g. `configs/prep_vector_axes.yaml`); `features` trains/saves the model and
   extracts features, without clustering and evaluation. `null` = whole run.
-- `model.type`: `vae`, `simclr` or `byol`; `model.params` go to its
+- `model.type`: `vae`, `simclr`, `byol` or `handcrafted` (measured from
+  the Vectorizer's SVGs, nothing trained; see
+  [`feature_learning/README.md`](feature_learning/README.md)); `model.params` go to its
   constructor. `model.checkpoint` loads a saved state_dict: with
   `training.train: true` it is fine-tuned (saved as a new file), with
   `false` only features are extracted.
@@ -142,17 +153,27 @@ python run_experiment.py configs/vae_k16_beta32.yaml --dry-run    # resolved con
 
 Each run gets an id generated from its config:
 `<model>-<params>_<training>__<clustering>__<data>__<date-time>`, e.g.
-`vae-k16-beta32_e100__ward-euclidean-c55__legion-train__20261012-153000`
+`vae-k16-beta32_e100__ward-euclidean-c55__legion-no_axes-train__20261012-153000`
 (`name:` in the config replaces the generated part). The same id is used for:
 
 | Where | What |
 |---|---|
 | MLflow run name (experiment `experiment:`) | all settings as `cfg/...` params, metrics, `config.yaml`; tags `model_path`, `started_from`, `data`, `output_dir`, `config_file`, `git_commit`, `git_dirty` |
-| `data/pipeline/<run id>/` | `config.yaml`, features, `clusters.csv`, `metrics.json` |
-| `models/feature_learning/<run id>.pt` | trained state_dict; `<run id>.yaml` next to it has the config and the MLflow run id |
+| `data/pipeline/<run id>/` | everything the run writes, each step in its own folder (below) |
 
-Model files are never overwritten and are not stored in MLflow; the run
-records their path. Relative paths in configs are relative to the repo
+```
+data/pipeline/<run id>/
+  config.yaml                                  resolved config
+  PreprocessingStep/<Step>/                    images (memory mode: only the last step's),
+                                               extracted_metadata.csv, _debug/, _svg/
+  FeatureLearningStep/<Model>/                 model.pt (state_dict), model.yaml (config +
+                                               MLflow run id), features.csv
+  ClusteringStep/HierarchicalClustering/       clusters.csv
+  EvaluationStep/                              metrics.json
+```
+
+Model files are never overwritten (the run id has the date and time) and
+are not stored in MLflow; the run records their path. Relative paths in configs are relative to the repo
 root, and float values like `1e-4` are read as numbers. The logic lives in
 `pipeline/experiment.py` (`load_config`, `run_name`, `run_experiment`).
 
@@ -171,7 +192,7 @@ What ends up in the run:
 | Stage | Params | Metrics | Artifacts |
 |---|---|---|---|
 | Pipeline | `input_path`, `mode`, `feature_mode`, step chain, `feature/train/*` | `preprocessing/n_images` (memory mode) | |
-| `BackgroundEraser(2)` | `preprocessing/<step>/*` (its settings) | `n_images`, `no_shard_count`, `no_axes_count` | `preprocessing/<step>/no_shard.txt`, `no_axes.txt`: names of the images without a shard / coordinate system, one per line |
+| `BackgroundEraser` | `preprocessing/<step>/*` (its settings) | `n_images`, `no_shard_count`, `no_axes_count` (with `record_axes`) | `preprocessing/<step>/no_shard.txt`, `no_axes.txt`: names of the images without a shard / coordinate system, one per line |
 | Feature learning | `feature/<step>/*` (architecture, e.g. `k`, `recon_loss`), `feature/train/*` (all training arguments) | per epoch: `feature/loss`, `smoothed_loss`, `lr` (+ VAE: `elbo`, `recon`, `kld`, `beta`; `VAEClassifier`: accuracies); `best_epoch`, `stopped_epoch` | `feature/features.csv` (`VAEClassifier`: `training_history.csv`) |
 | Clustering | `clustering/cluster_num`, `method`, `metric` | `n_clusters`, cluster size min/max/mean, `singleton_clusters` (`compare_all`: `best_cophenetic`) | `clustering/clusters.csv` (filename -> cluster), `compare_all.csv` |
 | Evaluation | | `eval/acc`, `ari`, `nmi` or `eval/silhouette` | `eval/per_class_accuracy.csv` |

@@ -66,7 +66,7 @@ class Repair(PreprocessingStep):
         debug_images: how many of the first images also get a debug
             strip (every intermediate stage side by side, see
             `_save_debug_image`), written to a sibling
-            `<output folder>_debug` directory. 0 disables it.
+            `<output folder>/_debug` directory. 0 disables it.
     """
 
     def __init__(
@@ -129,10 +129,7 @@ class Repair(PreprocessingStep):
                 f"No existing images with extensions {self.image_extensions} found under {source_description}"
             )
 
-        # Sibling folder, not a subfolder: later steps collect their input
-        # images recursively, so debug strips inside the output folder
-        # would be picked up as training data.
-        debug_dir = output_dir.parent / f"{output_dir.name}_debug"
+        debug_dir = self.side_output_dir("debug")
 
         self._debug_saved = 0
         for image_path in tqdm(input_paths, desc="Repairing images", unit="image"):
@@ -146,10 +143,9 @@ class Repair(PreprocessingStep):
 
     def process_batch(self, records: list[ImageRecord]) -> list[ImageRecord]:
         """In-memory mode: repair each image, keeping its name. Debug strips
-        (if `debug_images > 0`) still go to the `<output folder>_debug`
-        directory, for the first `debug_images` images across all batches."""
-        output_dir = Path(self.output_path)
-        debug_dir = output_dir.parent / f"{output_dir.name}_debug"
+        (if `debug_images > 0`) still go to `<output folder>/_debug`, for
+        the first `debug_images` images across all batches."""
+        debug_dir = self.side_output_dir("debug")
         return [
             ImageRecord(r.name, Image.fromarray(self._repair_one(r.image, r.name, debug_dir)))
             for r in records

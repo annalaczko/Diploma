@@ -1,0 +1,151 @@
+# TEMPLATE: every setting that can be changed, with its default and options.
+# Copy it, delete what you don't change (missing keys fall back to default.yaml),
+# and run:  python run_experiment.py configs/<copy>.yaml   (--dry-run to check)
+#
+# As it stands it is a valid run: raw scans -> BackgroundEraser -> Normalizer
+# -> Repair -> Vectorizer -> VAE -> clustering -> evaluation. Commented-out
+# blocks are alternatives (other steps / models); uncomment what you need.
+# Relative paths are relative to the repository root. Numbers like 1e-4 work.
+
+# ===================================================================== run
+experiment: pottery          # MLflow experiment name
+name: null                   # run name; null = generated (model, params, clustering, data) + date-time
+stop_after: null             # null = whole run | preprocessing (needs data.source: raw) | features (no clustering/evaluation)
+
+# ===================================================================== data
+data:
+  source: raw                # raw: preprocess raw_path from scratch | preprocessed: use ready images
+  raw_path: data/legion_raw  # raw scans (searched recursively)
+  preprocessed_path: data/processed/legion/no_axes/train   # ready images (used with source: preprocessed)
+  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
+
+# ===================================================================== preprocessing
+# Only used with data.source: raw. The steps run in this order; each writes to
+# data/pipeline/<run name>/PreprocessingStep/<Step>/ (memory mode: only the last
+# one), with extracted_metadata.csv (per image: scan size, DPI, scale, offset,
+# px/cm and the coordinate system), and _debug/ / _svg/ side outputs. YAML lists become tuples where needed.
+preprocessing:
+  mode: memory               # memory: only the last step's images are saved | disk: every step's are
+  batch_size: 64             # images preprocessed at once in memory mode
+  steps:
+    - BackgroundEraser:
+        mode: segmentation   # segmentation: white out outside the YOLO mask | detection: outside the (padded) box
+        model: models/yolov8n_seg_finetuned.pt   # YOLO weights
+        batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
+        box_margin: 0.15     # detection mode: pad the box by this fraction of its size per side
+        mask_margin: 0.01    # segmentation mode: grow the mask by this fraction of its longer side (class default 0.10)
+        record_axes: true    # also find the coordinate system (into extracted_metadata.csv); false for images without one
+        num_workers: null    # threads clearing a batch in parallel; null = min(16, CPUs), 1 = one at a time
+        half: false          # true: FP16 YOLO (faster on GPU; masks may differ by a pixel from FP32)
+        debug_images: 0      # overlays for the first N images in <output>_debug (class default 10)
+        image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+        # device: cuda       # cuda | cpu (default: cuda if available)
+
+    - Normalizer:
+        target_size: 256     # output side length (px); VAE/SimCLR/BYOL expect 256
+        background_color: [255, 255, 255]   # padding colour (class default [0, 0, 0])
+        image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+
+    - Repair:
+        contrast_factor: 5   # contrast boost before thresholding (class default 10)
+        dilate_kernel_size: 1   # square dilation kernel before skeletonizing (class default 3)
+        dilate_iterations: 1    # (class default 3)
+        skeletonize: false   # true: thin to 1 px and join gaps between endpoints (class default true)
+        max_distance: 15     # skeletonize: join endpoints closer than this (px)
+        line_thickness: 1    # skeletonize: width of the joining lines (px)
+        re_skeletonize: true # skeletonize: thin again after joining
+        min_component_size: 0   # drop connected components smaller than this (px); 0 = off
+        output_thickness: 2  # final line width (px) (class default 1)
+        debug_images: 0      # stage-by-stage strips for the first N images in <output>_debug (class default 10)
+        image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+
+    - Vectorizer:
+        line_thickness: 2    # width of the redrawn lines (px)
+        antialias: false     # true: gray-edged lines instead of pure black/white
+        max_paths: 12        # keep at most this many traced lines (longest first)
+        max_gap_frac: 0.05   # bridge gaps up to this fraction of the image size
+        min_keep_frac: 0.06  # drop lines shorter than this fraction of the longest
+        remove_axes: false   # heuristic axis-remnant removal (can cut straight walls)
+        on_failure: keep     # nothing traceable: keep (image unchanged) | drop
+        axes: none           # none | draw: extend the frame and draw the recorded coordinate system
+        axis_thickness: null # axes: draw: axis width (px); null = line_thickness
+        axes_margin: 0.03    # axes: draw: white space beyond the axis ends (fraction of the image)
+        metadata_csv: null   # extracted_metadata.csv to read when the axes don't come from this run's BackgroundEraser
+        save_svg: false      # also write <name>.svg to <output>/_svg; true is needed by model.type: handcrafted
+        debug_images: 0      # traced-lines overlays for the first N images in <output>_debug (class default 10)
+        image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+
+    # Draws the coordinate system onto raster images (use instead of Vectorizer axes: draw):
+    # - AxisRenderer:
+    #     axis_thickness: 2  # width of the drawn axes (px)
+    #     margin: 0.03       # white space beyond the axis ends (fraction of the image)
+    #     binarize: true     # after shrinking: darker than threshold -> black, rest white
+    #     threshold: 235
+    #     antialias: false
+    #     metadata_csv: null # extracted_metadata.csv to read when the axes don't come from this run's BackgroundEraser
+    #     image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+
+    # Augmentation: in memory mode a random view per training epoch (nothing saved);
+    # in disk mode num_augmentations extra copies per image. SimCLR/BYOL ignore it.
+    # - Augmentor:
+    #     num_augmentations: 1
+    #     keep_original: true
+    #     output_size: 256
+    #     crop_scale: [0.8, 1.0]     # random resized crop: area fraction range
+    #     crop_ratio: [0.9, 1.1]     # random resized crop: aspect ratio range
+    #     brightness: 0.2
+    #     contrast: 0.2
+    #     blur_kernel_size: 5
+    #     blur_sigma: [0.1, 2.0]
+    #     blur_probability: 0.5
+    #     horizontal_flip: true
+    #     seed: null
+    #     image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+
+# ===================================================================== feature learning
+model:
+  type: vae                  # vae | simclr | byol | handcrafted (measured, nothing trained: see below)
+  params:                    # constructor arguments of the chosen model
+    f: 4                     # channel-width exponent: block i has 2**(f+i) channels
+    n: 3                     # convolution kernel size
+    s: 1                     # base stride (f/n/s other than 4/3/1 need the VAE flatten size recomputed)
+    k: 16                    # latent / feature vector size (class default 128)
+    # vae only:
+    recon_loss: bce          # bce | dice | iou | bce_dice
+    beta_max: 32             # KL weight on the flat stage of each beta cycle; 1 = plain VAE (class default 1)
+    # simclr only:
+    # projection_dim: 64     # projection head output size (used by the loss only)
+    # byol only:
+    # hidden_dim: 256        # projector / predictor hidden size
+    # projection_dim: 64
+    # tau: 0.99              # target network EMA rate
+    # handcrafted only - measures the profile drawings (cm, in the vessel's coordinate system) instead of
+    # learning; needs the Vectorizer with save_svg: true in this run, or ready images (data.preprocessed_path)
+    # whose folder or parent has _svg/ and extracted_metadata.csv. Ignores training; no checkpoint.
+    # features: [position, size, axis_distance, thickness, fourier]   # feature groups to compute
+    # efd_harmonics: 10      # elliptic Fourier harmonics of the section outline (4 numbers each)
+  checkpoint: null           # .pt (state_dict) to start from: fine-tuned if training.train, else only used to extract features
+
+training:                    # arguments of the model's run() / train_model() (ignored by handcrafted)
+  train: true                # false = only extract features (needs model.checkpoint)
+  epochs: 100                # maximum epochs (early stopping may end sooner)
+  lr: 1.0e-4                 # learning rate
+  batch_size: 128            # training and extraction batch size
+  early_stopping_patience: 15       # stop after this many epochs without improvement of the smoothed loss
+  early_stopping_min_delta: 0.0     # minimum improvement that counts
+  early_stopping_smoothing_window: 10   # epochs in the moving average early stopping watches
+  # vae only:
+  lr_scheduler_factor: 0.5   # multiply the lr by this when the loss plateaus
+  lr_scheduler_patience: 5   # plateau length (epochs) before reducing the lr
+  min_lr: 1.0e-8             # lower bound for the lr
+  # beta_max: 32             # overrides model.params.beta_max for this run
+  # simclr only:
+  # temperature: 0.5         # NT-Xent temperature
+
+# ===================================================================== clustering
+clustering:
+  method: ward               # single | complete | average | weighted | centroid | ward | auto (best cophenetic correlation)
+  metric: euclidean          # euclidean | cityblock | chebyshev | cosine (centroid/ward need euclidean; ignored with auto)
+  cluster_num: 55            # number of flat clusters
+  standardize: true          # z-score every feature dimension before clustering
+  min_variance: 1.0e-3       # with standardize: drop dimensions whose variance is below this

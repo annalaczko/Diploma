@@ -19,6 +19,8 @@ from pipeline.preprocessing import (
     InMemoryImages,
     Normalizer,
     Repair,
+    Vectorizer,
+    collect_image_paths,
     iter_image_batches,
 )
 
@@ -82,8 +84,9 @@ def test_image_dataset_applies_transform_to_in_memory_images():
     [
         lambda out: Normalizer(output_path=out, target_size=64, background_color=(255, 255, 255)),
         lambda out: Repair(output_path=out, skeletonize=False, output_thickness=2, debug_images=0),
+        lambda out: Vectorizer(output_path=out, debug_images=0),
     ],
-    ids=["Normalizer", "Repair"],
+    ids=["Normalizer", "Repair", "Vectorizer"],
 )
 def test_process_batch_matches_disk_run(tmp_path, make_step):
     source = _line_drawings(tmp_path / "raw")
@@ -193,3 +196,26 @@ def test_memory_mode_saves_nothing_by_default(tmp_path):
 
     assert "output_path" not in result
     assert not list((tmp_path / "repaired").glob("*.png"))
+
+
+def test_prefetch_keeps_order_and_raises_errors():
+    from pipeline.preprocessing import prefetch
+
+    assert list(prefetch(iter(range(50)), depth=3)) == list(range(50))
+
+    def failing():
+        yield 1
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        list(prefetch(failing()))
+
+
+def test_collect_image_paths_skips_side_output_folders(tmp_path):
+    for rel in ["a.png", "sub/b.png", "_debug/c.png", "sub/_svg/d.png"]:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        Image.new("L", (4, 4)).save(tmp_path / rel)
+
+    names = [p.relative_to(tmp_path).as_posix() for p in collect_image_paths(tmp_path)]
+
+    assert names == ["a.png", "sub/b.png"]

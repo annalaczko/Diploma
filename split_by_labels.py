@@ -3,9 +3,9 @@ file: an image goes to test/ if its file name without the extension
 (e.g. "a__007" for "a__007.jpg") is in the labels file's ID column, every
 other image to train/. The IDs are used as they are.
 
-    python split_by_labels.py data/preprocessed/<run id>
-    python split_by_labels.py data/preprocessed/<run id> --labels data/other_labels.csv --id-column ID
-    python split_by_labels.py data/preprocessed/<run id> --copy --out data/preprocessed/legion
+    python split_by_labels.py data/processed/<run id>
+    python split_by_labels.py data/processed/<run id> --labels data/other_labels.csv --id-column ID
+    python split_by_labels.py data/processed/<run id> --copy --out data/processed/legion/no_axes
 
 By default the images are moved into <folder>/train and <folder>/test, so the
 folder ends up as the layout run_experiment.py expects

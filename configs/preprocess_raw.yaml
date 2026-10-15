@@ -1,5 +1,0 @@
-# Only preprocess the raw scans (steps in configs/default.yaml); the images are
-# saved to data/preprocessed/<run id>. No model, clustering or evaluation.
-stop_after: preprocessing
-data:
-  source: raw

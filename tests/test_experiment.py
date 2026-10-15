@@ -40,13 +40,13 @@ def test_typos_and_inconsistent_settings_are_rejected(tmp_path):
 
 
 @pytest.mark.parametrize("overrides, expected", [
-    ([], "vae-k128_e100__ward-euclidean-c55__legion-train"),
+    ([], "vae-k128_e100__ward-euclidean-c55__legion-no_axes-train"),
     (["model.params.beta_max=32", "model.params.k=16", "clustering.method=auto"],
-     "vae-k16-beta32_e100__auto-c55__legion-train"),
+     "vae-k16-beta32_e100__auto-c55__legion-no_axes-train"),
     (["model.type=byol", "model.params.tau=0.99", "data.source=raw", "model.params.f=5"],
      "byol-f5n3s1-k128-tau0.99_e100__ward-euclidean-c55__raw"),
     (["training.train=false", "model.checkpoint=models/x/vae-k16_e100__ward__legion__20261012-1200.pt"],
-     "vae-k128_extract-vae-k16_e100__ward-euclidean-c55__legion-train"),
+     "vae-k128_extract-vae-k16_e100__ward-euclidean-c55__legion-no_axes-train"),
     (["name=my run"], "my-run"),
 ])
 def test_run_name_describes_the_config(overrides, expected):
@@ -76,8 +76,6 @@ def _config(tmp_path, ready_images, *extra):
         "experiment=test",
         f"data.preprocessed_path={folder}",
         f"data.labels={labels}",
-        f"paths.preprocessed={tmp_path / 'preprocessed'}",
-        f"paths.models={tmp_path / 'models'}",
         "training.epochs=2", "training.batch_size=2",
         "clustering.cluster_num=2", "clustering.min_variance=0",
         *extra,
@@ -89,13 +87,17 @@ def test_run_trains_saves_model_and_logs_everything(tmp_path, ready_images):
     run_id = result["run_id"]
 
     assert run_id.startswith("vae-k128_e2__ward-euclidean-c2__set-train__")
-    # Model file, traceable to the run by name and by its .yaml.
-    assert result["model_path"] == tmp_path / "models" / f"{run_id}.pt"
-    info = yaml.safe_load((tmp_path / "models" / f"{run_id}.yaml").read_text())
+    # Everything in the run folder, each step in its own folder.
+    run_dir = result["run_dir"]
+    assert run_dir == tmp_path / "default_output" / run_id
+    model_dir = run_dir / "FeatureLearningStep" / "VAE"
+    assert result["model_path"] == model_dir / "model.pt"
+    assert {p.name for p in model_dir.iterdir()} >= {"model.pt", "model.yaml", "features.csv"}
+    info = yaml.safe_load((model_dir / "model.yaml").read_text())
     assert info["run_id"] == run_id and info["config"]["model"]["type"] == "vae"
-    # Run folder.
-    assert {p.name for p in result["run_dir"].iterdir()} >= {"config.yaml", "clusters.csv", "metrics.json"}
-    assert pd.read_csv(result["run_dir"] / "clusters.csv")["filename"].tolist() == [f"img{i}.png" for i in range(4)]
+    assert (run_dir / "config.yaml").exists() and (run_dir / "EvaluationStep" / "metrics.json").exists()
+    clusters = pd.read_csv(run_dir / "ClusteringStep" / "HierarchicalClustering" / "clusters.csv")
+    assert clusters["filename"].tolist() == [f"img{i}.png" for i in range(4)]
     # MLflow run.
     [run] = mlflow.search_runs(experiment_names=["test"], output_format="list")
     assert run.info.run_name == run_id
@@ -114,6 +116,8 @@ def test_saved_model_can_be_reused_for_extraction(tmp_path, ready_images):
         tmp_path, ready_images, "training.train=false", f"model.checkpoint={trained['model_path']}"))
 
     assert extracted["model_path"] is None  # nothing new trained
+    # Named after the run that saved the checkpoint.
+    assert extracted["run_id"].startswith("vae-k128_extract-vae-k128_e2__")
     np.testing.assert_allclose(np.stack(extracted["features"]["features"]),
                                np.stack(trained["features"]["features"]), rtol=1e-5, atol=1e-5)
 
@@ -124,8 +128,8 @@ def test_stop_after_needs_raw_data_for_preprocessing():
 
 
 @pytest.mark.parametrize("overrides, expected", [
-    (["stop_after=preprocessing", "data.source=raw"], "prep-be2-norm-repair__raw"),
-    (["stop_after=features"], "vae-k128_e100__legion-train"),
+    (["stop_after=preprocessing", "data.source=raw"], "prep-be-ax-norm-repair__raw"),
+    (["stop_after=features"], "vae-k128_e100__legion-no_axes-train"),
 ])
 def test_run_name_of_partial_runs(overrides, expected):
     assert run_name(load_config(None, overrides)) == expected
@@ -144,12 +148,13 @@ def test_stop_after_preprocessing_only_saves_images(tmp_path, ready_images):
     result = run_experiment(config=config)
 
     assert result["run_id"].startswith("prep-norm-repair__raw__")
-    assert result["preprocessed_path"] == tmp_path / "preprocessed" / result["run_id"]
+    steps_dir = result["run_dir"] / "PreprocessingStep"
+    assert result["preprocessed_path"] == steps_dir / "Repair"
     saved = sorted(p.name for p in result["preprocessed_path"].iterdir())
     assert saved == [f"img{i}.png" for i in range(4)]
     assert Image.open(result["preprocessed_path"] / "img0.png").size == (128, 128)
     assert result["model_path"] is None and result["features"] is None and result["metrics"] is None
-    assert not (tmp_path / "models").exists()
+    assert not (result["run_dir"] / "FeatureLearningStep").exists()
     [run] = mlflow.search_runs(experiment_names=["test"], output_format="list")
     assert run.data.tags["preprocessed_output"] == str(result["preprocessed_path"])
     assert run.data.tags["stop_after"] == "preprocessing"
@@ -162,6 +167,6 @@ def test_stop_after_features_skips_clustering(tmp_path, ready_images):
     assert result["model_path"].exists()
     assert len(result["features"]) == 4
     assert result["labels"] is None and result["metrics"] is None
-    assert not (result["run_dir"] / "clusters.csv").exists()
+    assert not (result["run_dir"] / "ClusteringStep").exists()
     [run] = mlflow.search_runs(experiment_names=["test"], output_format="list")
     assert not any(key.startswith(("eval/", "clustering/")) for key in run.data.metrics)

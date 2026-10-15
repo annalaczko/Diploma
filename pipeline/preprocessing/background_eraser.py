@@ -4,6 +4,7 @@ from pathlib import Path
 
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -12,16 +13,32 @@ import torch
 from ultralytics import YOLO
 from tqdm import tqdm
 
-from pipeline import tracking
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 from PIL import Image
 
+from pipeline.preprocessing.axes import METADATA_CSV, axis_row, has_axes, write_metadata_csv
+from pipeline.preprocessing.axis_detection import detect_axes
 from pipeline.preprocessing.dataset import ImageRecord, collect_image_paths, flatten_name
 
 class BackgroundEraser(PreprocessingStep):
     """Runs a YOLO segmentation model on each image, whites out everything
     outside the detected shard mask, and (optionally) crops to a square
     canvas centered on the detection box.
+
+    It records one metadata row per image in `axes_table` (see
+    `pipeline/preprocessing/axes.py`): the scan's size and resolution (DPI)
+    and where the crop lies on it, so sizes in the final image can be
+    converted back to scan pixels and centimetres. With `record_axes=True`
+    the row also holds the drawing's construction coordinate system -
+    vertical rotation axis + horizontal rim/base line, see
+    `axis_detection.detect_axes` - found on the original scan, in the crop's
+    pixel coordinates (the axes may lie outside the crop). The images stay
+    the same: the axes are not drawn into them. A later step can extend the
+    image and draw them (`Vectorizer(axes="draw")`, `AxisRenderer`), and
+    `Pipeline` writes the final extracted_metadata.csv next to the
+    preprocessed images. Parts of an axis that fall inside the shard mask
+    (e.g. where the rim lies on the rim line) stay in the image as short
+    stubs.
     """
     def __init__(self,
                  input_path=None,
@@ -33,6 +50,9 @@ class BackgroundEraser(PreprocessingStep):
                  box_margin=0.15,
                  mask_margin=0.10,
                  debug_images=10,
+                 record_axes=False,
+                 num_workers=None,
+                 half=False,
                  image_extensions: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"),
                  **kwargs):
         """
@@ -63,14 +83,25 @@ class BackgroundEraser(PreprocessingStep):
                 whiting-out and cropping (`mode='segmentation'` only), as a
                 fraction of the mask's longer side: 0.10 (the default)
                 makes the mask ~10% larger overall, i.e. a uniform border
-                of 5% of its size all around (see `_dilate_mask`). Like
+                of 5% of its size all around (see `_dilate_radius`). Like
                 `box_margin`, this keeps a slightly-too-tight mask from
                 clipping the shard's outline.
             debug_images: how many of the first processed images also get
                 a debug overlay (original image with the YOLO mask/box, the
-                grown mask and the crop square drawn on it), written to a
-                sibling `<output folder>_debug` directory (see
+                grown mask and the crop square drawn on it), written to
+                `<output folder>/_debug` (see
                 `_save_debug_image`). 0 disables it.
+            record_axes: also find and record each scan's coordinate system
+                (see the class docstring). Off by default, e.g. for photos
+                without one, where the search would only cost time and
+                mark every image as `no_axes`. Use with
+                `mode='segmentation'`: in detection mode the "mask" is the
+                whole box, so axis lines crossing it stay visible.
+            num_workers: threads that clear (and search for axes on) the
+                images of a batch in parallel; None = min(16, CPU count),
+                0 or 1 = one at a time. The results don't depend on it.
+            half: run YOLO in half precision (FP16, GPU only): faster, but
+                masks can differ by a pixel here and there from FP32.
             image_extensions: file suffixes treated as input images.
             **kwargs: extra options, e.g. device='cuda'/'cpu' for inference.
         """
@@ -91,6 +122,21 @@ class BackgroundEraser(PreprocessingStep):
         # seen in total; reset by `begin_run`, reported by `log_summary`.
         self.no_shard: list[str] = []
         self._n_seen = 0
+        self.record_axes = record_axes
+        self.num_workers = min(16, os.cpu_count() or 1) if num_workers is None else num_workers
+        self.half = half
+        # Flat image name -> metadata row (see axes.axis_row), and with
+        # record_axes the names of images without a coordinate system.
+        self.axes_table: dict[str, dict] = {}
+        self.no_axes: list[str] = []
+
+    # Pipeline links later steps that draw the axes to `axes_table`.
+    @property
+    def provides_axes(self) -> bool:
+        return self.record_axes
+
+    # Pipeline writes the last metadata provider's rows to extracted_metadata.csv.
+    provides_metadata = True
 
     def _get_model(self):
         """Load the YOLO model once and reuse it (in-memory mode calls
@@ -103,40 +149,81 @@ class BackgroundEraser(PreprocessingStep):
         return self.kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
 
     def _debug_dir(self) -> Path:
-        # Sibling folder, not a subfolder: later steps collect their input
-        # images recursively, so debug overlays inside the output folder
-        # would be picked up as training data.
-        output = Path(self.output_path)
-        return output.parent / f"{output.name}_debug"
+        return self.side_output_dir("debug")
 
     def process_batch(self, records: list[ImageRecord]) -> list[ImageRecord]:
         """In-memory mode: run YOLO on one batch of images and return the
-        background-erased, cropped versions (RGB), keeping their names.
+        background-erased, cropped versions (grayscale scans stay
+        grayscale, everything else becomes RGB), keeping their names.
         Images with no detection are dropped and logged, as in `run()`."""
-        images_bgr = [cv2.cvtColor(np.asarray(r.image.convert("RGB")), cv2.COLOR_RGB2BGR) for r in records]
-        model_results = self._get_model().predict(
-            images_bgr,
+        images = [self._as_array(r.image) for r in records]
+        model_results = self._predict([self._bgr(img) for img in images])
+
+        work = []
+        self._n_seen += len(records)
+        for record, img, model_result in zip(records, images, model_results):
+            item = self._format_result(model_result, record.name)
+            if item is None:
+                # Not printed per image: the count is printed at the end
+                # (log_summary) and the names go to MLflow as no_shard.txt.
+                self.no_shard.append(record.name)
+                continue
+            item["dpi"] = _dpi(record.image.info)
+            work.append((record.name, img, item))
+
+        def clear(index, name, img, item):
+            out, debug_info, row = self._clear_one(img, item, crop=True, box_margin=self.box_margin,
+                                                    mask_margin=self.mask_margin)
+            if self._debug_saved + index < self.debug_images:
+                self._save_debug_image(img, *debug_info, self._debug_dir() / name)
+            return out, row
+
+        cleared = self._map(clear, [(i, *args) for i, args in enumerate(work)])
+        self._debug_saved = min(self.debug_images, self._debug_saved + len(work))
+
+        output = []
+        for (name, _, item), (out, row) in zip(work, cleared):
+            self._store_row(item, row)
+            if out.ndim == 3:
+                out = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+            output.append(ImageRecord(name, Image.fromarray(out)))
+        return output
+
+    @staticmethod
+    def _as_array(image: Image.Image) -> np.ndarray:
+        """A PIL image as the array `_clear_one` works on: grayscale
+        (H, W) for grayscale scans - a third of the work of three equal
+        channels, with the same pixels - BGR (H, W, 3) for everything else."""
+        if image.mode == "L":
+            return np.asarray(image)
+        return cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+    @staticmethod
+    def _bgr(img: np.ndarray) -> np.ndarray:
+        """The 3-channel version YOLO needs."""
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img
+
+    def _predict(self, source, **kwargs):
+        if self.half:
+            # ultralytics >= 8.4 replaced the deprecated `half=True` with
+            # `quantize=16`; FP32 is the default, so nothing is passed then.
+            kwargs["quantize"] = 16
+        return self._get_model().predict(
+            source,
             verbose=False,
             batch=self.batch_size,
             iou=0.3,
             device=self._device(),
+            **kwargs,
         )
 
-        output = []
-        self._n_seen += len(records)
-        for record, img, model_result in zip(records, images_bgr, model_results):
-            item = self._format_result(model_result, record.name)
-            if item is None:
-                print(f"No shard detected, skipping: {record.name}")
-                self.no_shard.append(record.name)
-                continue
-            out, debug_info = self._clear_one(img, item, crop=True, box_margin=self.box_margin,
-                                              mask_margin=self.mask_margin)
-            if self._debug_saved < self.debug_images:
-                self._save_debug_image(img, *debug_info, self._debug_dir() / record.name)
-                self._debug_saved += 1
-            output.append(ImageRecord(record.name, Image.fromarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))))
-        return output
+    def _map(self, function, args_list):
+        """`[function(*args) for args in args_list]`, on `num_workers`
+        threads (OpenCV and numpy release the GIL), in order."""
+        if self.num_workers <= 1 or len(args_list) <= 1:
+            return [function(*args) for args in args_list]
+        with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+            return list(pool.map(lambda args: function(*args), args_list))
 
     def run(self, keep_results=True):
         """Run YOLO segmentation on every input image and write cleaned
@@ -166,33 +253,25 @@ class BackgroundEraser(PreprocessingStep):
                                debug_dir=self._debug_dir(), debug_images=self.debug_images)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+        # The metadata (and axes) of every written image, in its crop's coordinates.
+        write_metadata_csv(self.axes_table, Path(self.output_path) / METADATA_CSV)
         self.log_summary()
         return self.output_path if keep_results else None
 
     def begin_run(self):
-        """Forget the images skipped in a previous run."""
+        """Forget the images skipped (and axes recorded) in a previous run."""
         self._debug_saved = 0
         self.no_shard = []
         self._n_seen = 0
+        self.axes_table = {}
+        self.no_axes = []
 
     def failure_lists(self) -> dict[str, list[str]]:
         """Image names skipped or only partly processed, by reason. Each
         entry becomes `<reason>.txt` and `<reason>_count` in MLflow."""
+        if self.record_axes:
+            return {"no_shard": self.no_shard, "no_axes": self.no_axes}
         return {"no_shard": self.no_shard}
-
-    def log_summary(self):
-        """Log how many images were seen and, per failure reason, how many
-        failed plus their names (a text file, one name per line) to the
-        active MLflow run, under `preprocessing/<step name>/`."""
-        prefix = f"preprocessing/{self.name}"
-        tracking.log_params(tracking.params_of(self), prefix=f"{prefix}/")
-        metrics = {"n_images": self._n_seen}
-        for reason, names in self.failure_lists().items():
-            metrics[f"{reason}_count"] = len(names)
-            tracking.log_lines(names, f"{prefix}/{reason}.txt")
-            if names:
-                print(f"{self.name}: {len(names)} image(s) with {reason}")
-        tracking.log_metrics(metrics, prefix=f"{prefix}/")
 
     def _make_flat_symlink_dir(self, paths):
         """Symlink every image into a single flat temp directory with
@@ -243,17 +322,8 @@ class BackgroundEraser(PreprocessingStep):
             detected mask, or that raised during processing, are skipped
             and logged instead of raising.
         """
-        device = self._device()
-
         try:
-            model_results = model.predict(
-                tmp_dir,
-                verbose=False,
-                batch=batch_size,
-                iou=0.3,
-                stream=True,
-                device=device,
-            )
+            model_results = self._predict(tmp_dir, stream=True)
         except Exception as e:
             print(f"Error when calling model.predict: {e}")
             raise
@@ -278,9 +348,6 @@ class BackgroundEraser(PreprocessingStep):
         self.no_shard.extend(self._flatten_output_name(p) for p in failed_paths)
 
         print(f"Detected {len(results_formatted)} shard(s), failed on {len(failed_paths)}")
-        if failed_paths:
-            for p in failed_paths:
-                print(f"  - {p}")
 
         return results_formatted
     
@@ -324,7 +391,7 @@ class BackgroundEraser(PreprocessingStep):
                 for cropping, so a tightly-drawn box doesn't clip a
                 detail right at its edge.
             mask_margin: see `__init__`'s docstring - how much the
-                segmentation mask is grown (via `_dilate_mask`) before
+                segmentation mask is grown (via `_dilate_radius`) before
                 whiting-out; the crop is then centered on the grown
                 mask's bounding rectangle instead of the detection box.
             debug_dir: where to write debug overlays (see
@@ -334,48 +401,59 @@ class BackgroundEraser(PreprocessingStep):
         Returns:
             list of dicts with 'path' and the processed 'image' array.
         """
-        results = []
-        debug_saved = 0
-        for item in tqdm(image_dict, desc="Clearing images"):
-            path = item['path']
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
-            img = cv2.imread(path)
+        def clear(index, item):
+            path = item['path']
+            # ANYCOLOR: grayscale scans stay one channel (see `_as_array`).
+            img = cv2.imread(path, cv2.IMREAD_ANYCOLOR)
             if img is None:
                 print(f"Failed to read image: {path}")
-                continue
-
-            out, debug_info = self._clear_one(img, item, crop=crop, box_margin=box_margin,
-                                              mask_margin=mask_margin)
-
-            if debug_dir is not None and debug_saved < debug_images:
-                self._save_debug_image(
-                    img, *debug_info, Path(debug_dir) / self._flatten_output_name(path),
-                )
-                debug_saved += 1
-
-            results.append({'path': path, 'image': out})
-
+                return None
+            with Image.open(path) as header:  # lazy: reads only the header
+                item['dpi'] = _dpi(header.info)
+            out, debug_info, row = self._clear_one(img, item, crop=crop, box_margin=box_margin,
+                                                    mask_margin=mask_margin)
+            if debug_dir is not None and index < debug_images:
+                self._save_debug_image(img, *debug_info, Path(debug_dir) / self._flatten_output_name(path))
             if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                out_path = os.path.join(output_dir, self._flatten_output_name(path))
-                cv2.imwrite(out_path, out)
+                cv2.imwrite(os.path.join(output_dir, self._flatten_output_name(path)), out)
+            return out, row
 
+        results = []
+        cleared = self._map(clear, list(enumerate(tqdm(image_dict, desc="Clearing images"))))
+        for item, done in zip(image_dict, cleared):
+            if done is None:
+                continue
+            out, row = done
+            self._store_row(item, row)
+            results.append({'path': item['path'], 'image': out})
         return results
 
     def _clear_one(self, img, item, crop=True, box_margin=0.15, mask_margin=0.10):
-        """Whiten everything outside the detected shard in one BGR image
-        and (if `crop`) cut a white-padded square around it. Shared by the
-        disk (`_clear_images`) and in-memory (`process_batch`) modes.
+        """Whiten everything outside the detected shard in one BGR (or
+        grayscale) image and (if `crop`) cut a white-padded square around
+        it. Shared by the disk (`_clear_images`) and in-memory
+        (`process_batch`) modes; safe to run on several threads at once
+        (it changes nothing on `self`).
+
+        Only the part of the scan the square covers is touched: the mask is
+        rasterized, grown and applied there (plus a border of the growth
+        radius), never on the whole A4 sheet, which is most of the work
+        otherwise. The result is the same as doing it on the whole sheet.
 
         Args:
-            img: the original BGR image.
+            img: the original BGR (H, W, 3) or grayscale (H, W) image.
             item: one `_format_result` dict ('boxes', and 'masks' in
-                segmentation mode).
+                segmentation mode; 'dpi', the scan's resolution, if known).
             crop, box_margin, mask_margin: see `_clear_images`.
 
         Returns:
-            (out, debug_info): the processed BGR image, and the
-            `(box, polygon, mask, square)` tuple `_save_debug_image` draws.
+            (out, debug_info, row): the processed image (same channels as
+            `img`), the `(box, polygon, mask, mask_offset, square)` tuple
+            `_save_debug_image` draws, and the metadata row (see
+            `axes.axis_row`; with the axes if `record_axes`).
         """
         h, w = img.shape[:2]
 
@@ -386,7 +464,10 @@ class BackgroundEraser(PreprocessingStep):
         box = np.asarray(item['boxes'][0].cpu(), dtype=np.float32).reshape(-1)  # (x1, y1, x2, y2)
         x1, y1, x2, y2 = self._expand_box(box, w, h, box_margin)
 
-        if 'masks' not in item or not item['masks']:
+        segmented = 'masks' in item and len(item['masks']) > 0
+        if segmented:
+            polygon = np.asarray(item['masks'][0], dtype=np.float32)  # (N, 2) point list
+        else:
             # Detection mode has no segmentation mask, only a
             # bounding box - turn its (padded) corners into an
             # explicit 4-corner rectangle, a valid (N, 2) polygon for
@@ -395,29 +476,23 @@ class BackgroundEraser(PreprocessingStep):
             polygon = np.array(
                 [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
             )
-        else:
-            polygon = np.asarray(item['masks'][0], dtype=np.float32)  # (N, 2) point list
+        points = polygon.astype(np.int32)
 
-        # Rasterize a binary mask from the polygon
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
-
-        if 'masks' in item and item['masks']:
-            mask = self._dilate_mask(mask, mask_margin)
-            # Crop around the grown mask itself rather than the YOLO
-            # box, so the canvas fits exactly what was kept. Falls
-            # back to the padded box if the polygon was degenerate.
-            ys, xs = np.nonzero(mask)
-            if len(xs):
-                x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
-
-        mask, (x1, y1, x2, y2) = self._extend_mask(img, item, mask, (x1, y1, x2, y2))
-
-        debug_mask = mask
-        mask = mask.astype(bool)
-
-        white_bg = np.full_like(img, 255)
-        out = np.where(mask[..., None], img, white_bg)
+        radius = 0
+        if segmented and len(points):
+            # Bounding rectangle of the rasterized polygon (clipped to the
+            # image, as fillPoly clips it), grown by the dilation radius:
+            # the grown mask's extent, without rasterizing the whole sheet.
+            px, py, pw, ph = cv2.boundingRect(points)
+            px1, py1 = max(px, 0), max(py, 0)
+            px2, py2 = min(px + pw, w), min(py + ph, h)
+            if px2 > px1 and py2 > py1:
+                radius = self._dilate_radius(px2 - px1, py2 - py1, mask_margin)
+                # Crop around the grown mask itself rather than the YOLO
+                # box, so the canvas fits exactly what was kept. Falls
+                # back to the padded box if the polygon lies off-image.
+                x1, y1 = max(px1 - radius, 0), max(py1 - radius, 0)
+                x2, y2 = min(px2 + radius, w), min(py2 + radius, h)
 
         square_coords = None
         if crop:
@@ -452,40 +527,64 @@ class BackgroundEraser(PreprocessingStep):
             src_y1 = max(sq_y1_i, 0)
             src_x2 = min(sq_x2_i, w)
             src_y2 = min(sq_y2_i, h)
+            square_coords = (sq_x1_i, sq_y1_i, sq_x2_i, sq_y2_i)
+        else:
+            src_x1, src_y1, src_x2, src_y2 = 0, 0, w, h
 
+        # Rasterize and grow the mask only around the region that is kept,
+        # with a border of `radius` so the dilation sees every mask pixel
+        # that reaches into the region.
+        wx1, wy1 = max(src_x1 - radius - 1, 0), max(src_y1 - radius - 1, 0)
+        wx2, wy2 = min(max(src_x2, wx1) + radius + 1, w), min(max(src_y2, wy1) + radius + 1, h)
+        mask = np.zeros((wy2 - wy1, wx2 - wx1), dtype=np.uint8)
+        cv2.fillPoly(mask, [points], 255, offset=(-wx1, -wy1))
+        if radius >= 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+            mask = cv2.dilate(mask, kernel)
+
+        region = np.full((max(src_y2 - src_y1, 0), max(src_x2 - src_x1, 0)) + img.shape[2:], 255, img.dtype)
+        if src_x2 > src_x1 and src_y2 > src_y1:
+            keep = mask[src_y1 - wy1:src_y2 - wy1, src_x1 - wx1:src_x2 - wx1].astype(bool)
+            if img.ndim == 3:
+                keep = keep[..., None]
+            region = np.where(keep, img[src_y1:src_y2, src_x1:src_x2], region)
+
+        if crop:
             # Where that region lands inside the (white) square canvas
             dst_x1 = src_x1 - sq_x1_i
             dst_y1 = src_y1 - sq_y1_i
-            dst_x2 = dst_x1 + (src_x2 - src_x1)
-            dst_y2 = dst_y1 + (src_y2 - src_y1)
+            out = np.full((side_i, side_i) + img.shape[2:], 255, dtype=img.dtype)
+            if region.size:
+                out[dst_y1:dst_y1 + region.shape[0], dst_x1:dst_x1 + region.shape[1]] = region
+        else:
+            out = region
 
-            square = np.full((side_i, side_i, img.shape[2]), 255, dtype=out.dtype)
-            if src_x2 > src_x1 and src_y2 > src_y1:
-                square[dst_y1:dst_y2, dst_x1:dst_x2] = out[src_y1:src_y2, src_x1:src_x2]
+        row = self._metadata_row(img, item, square_coords, out)
+        return out, (box, polygon, mask, (wx1, wy1), square_coords), row
 
-            out = square
-            square_coords = (sq_x1_i, sq_y1_i, sq_x2_i, sq_y2_i)
+    def _metadata_row(self, img, item, crop_box, out) -> dict:
+        """The image's metadata row (see `axes.axis_row`) in the crop's
+        (`crop_box`) coordinates; with `record_axes`, the coordinate system
+        is searched on the original scan."""
+        name = self._flatten_output_name(item.get("path", ""))
+        detection = None
+        if self.record_axes:
+            gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            detection = detect_axes(gray)
+        return axis_row(name, detection, crop_box, (out.shape[1], out.shape[0]),
+                        scan_size=(img.shape[1], img.shape[0]), dpi=item.get("dpi"))
 
-        return out, (box, polygon, debug_mask, square_coords)
-
-    def _extend_mask(self, img, item, mask, region):
-        """Hook for subclasses to add pixels to the kept area before
-        whiting-out and cropping (see `BackgroundEraser2`). The default
-        keeps the mask as it is.
-
-        Args:
-            img: the original BGR image.
-            item: the `_format_result` dict for this image.
-            mask: (H, W) uint8 mask of the (grown) shard.
-            region: `(x1, y1, x2, y2)` the crop is centered on.
-
-        Returns:
-            `(mask, region)`, possibly extended.
-        """
-        return mask, region
+    def _store_row(self, item, row) -> None:
+        """Record one image's metadata row in `axes_table` (and, with
+        `record_axes`, `no_axes`). Called in input order, after the
+        parallel `_clear_one`s."""
+        name = self._flatten_output_name(item.get("path", ""))
+        self.axes_table[name] = row
+        if self.record_axes and not has_axes(row):
+            self.no_axes.append(name)  # counted at the end (log_summary), names in MLflow
 
     @staticmethod
-    def _save_debug_image(img, box, polygon, mask, square, out_path):
+    def _save_debug_image(img, box, polygon, mask, mask_offset, square, out_path):
         """Write the original image with what the eraser did drawn on it:
             red   - the raw YOLO detection box,
             yellow - the raw YOLO mask polygon (in detection mode this is
@@ -499,16 +598,17 @@ class BackgroundEraser(PreprocessingStep):
             img: the original BGR image (not modified).
             box: raw YOLO box `(x1, y1, x2, y2)`.
             polygon: (N, 2) polygon the mask was rasterized from.
-            mask: (H, W) uint8 final mask.
+            mask: uint8 final mask of the region around the crop.
+            mask_offset: `(x, y)` of the mask's top-left corner in `img`.
             square: crop square `(x1, y1, x2, y2)`, or None if not cropping.
             out_path: file to write.
         """
-        vis = img.copy()
+        vis = img.copy() if img.ndim == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         t = max(2, round(max(img.shape[:2]) / 300))  # line width scaled to image size
         bx1, by1, bx2, by2 = (int(round(v)) for v in box)
         cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 0, 255), t)
         cv2.polylines(vis, [polygon.astype(np.int32)], True, (0, 255, 255), t)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE, offset=mask_offset)
         cv2.drawContours(vis, contours, -1, (0, 255, 0), t)
         if square is not None:
             cv2.rectangle(vis, square[:2], square[2:], (255, 0, 0), t)
@@ -516,34 +616,19 @@ class BackgroundEraser(PreprocessingStep):
         cv2.imwrite(str(out_path), vis)
 
     @staticmethod
-    def _dilate_mask(mask, margin):
-        """Grow a binary uint8 mask by a uniform border, so the result is
-        about `margin` larger than the original along its longer side
-        (`margin / 2` of that side added all around).
+    def _dilate_radius(width, height, margin) -> int:
+        """Radius of the disk-shaped dilation that grows a mask with this
+        bounding rectangle so it is about `margin` larger along its longer
+        side (`margin / 2` of that side added all around); 0 = no growth.
 
-        Uses morphological dilation with a disk-shaped kernel rather than
-        scaling the polygon about its center: dilation adds the same
-        border everywhere, so a concave or elongated shard's thin edges
-        get the same safety margin as its bulk.
-
-        Args:
-            mask: (H, W) uint8 mask, nonzero inside the shard.
-            margin: growth as a fraction of the mask's longer side; <= 0
-                returns the mask unchanged.
-
-        Returns:
-            The dilated (H, W) uint8 mask (clipped to the image by
-            construction).
+        Dilation rather than scaling the polygon about its center: it adds
+        the same border everywhere, so a concave or elongated shard's thin
+        edges get the same safety margin as its bulk.
         """
-        ys, xs = np.nonzero(mask)
-        if margin <= 0 or not len(xs):
-            return mask
-        size = max(xs.max() - xs.min(), ys.max() - ys.min()) + 1
-        radius = int(round(size * margin / 2))
-        if radius < 1:
-            return mask
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
-        return cv2.dilate(mask, kernel)
+        if margin <= 0:
+            return 0
+        radius = int(round(max(width, height) * margin / 2))
+        return radius if radius >= 1 else 0
 
     @staticmethod
     def _expand_box(box, image_width, image_height, margin):
@@ -601,3 +686,17 @@ class BackgroundEraser(PreprocessingStep):
             rather than one common root directory).
         """
         return flatten_name(path, self.input_path)
+
+
+def _dpi(info: dict) -> float | None:
+    """Horizontal resolution (dots per inch) from a PIL image's `info`, or
+    None if the file doesn't store one."""
+    dpi = info.get("dpi")
+    if not dpi:
+        return None
+    try:
+        # PNG stores pixels per metre, so 150 dpi reads back as 150.0124.
+        value = round(float(dpi[0]), 1)
+    except (TypeError, ValueError, IndexError):
+        return None
+    return value if value > 0 else None

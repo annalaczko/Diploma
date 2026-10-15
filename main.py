@@ -7,7 +7,7 @@ import torch
 from pipeline.clustering import HierarchicalClustering
 from pipeline.feature_learning import VAE
 from pipeline.pipeline import Pipeline
-from pipeline.preprocessing import Augmentor, BackgroundEraser2, Normalizer, Repair
+from pipeline.preprocessing import Augmentor, BackgroundEraser, Normalizer, Repair
 
 run_id = "example_run"
 source_folder = "data/pipeline/example_run/PreprocessingStep/Repair"
@@ -17,8 +17,8 @@ vae = VAE(f=4, n=3, s=1, k=16, beta_max=32, run_id=run_id).to(device)
 
 pipeline = Pipeline(
     preprocessing_steps=[
-        # BackgroundEraser2(mode="segmentation", model="models/yolov8n_seg_finetuned.pt",
-        #                   mask_margin=0.01, axis_margin=0.01, run_id=run_id),
+        # BackgroundEraser(mode="segmentation", model="models/yolov8n_seg_finetuned.pt",
+        #                  mask_margin=0.01, record_axes=True, run_id=run_id),
         # Normalizer(background_color=(255, 255, 255), run_id=run_id),
         # Repair(contrast_factor=5, dilate_kernel_size=1, dilate_iterations=1,
         #        skeletonize=False, output_thickness=2, run_id=run_id),

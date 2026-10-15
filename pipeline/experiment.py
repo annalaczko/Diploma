@@ -4,15 +4,23 @@
 
 Start runs with run_experiment.py at the repo root; configs/default.yaml
 documents every setting. Each run gets an id generated from its config,
-e.g. `vae-k16-beta32_e100__ward-euclidean-c55__legion-train__20261012-153000`,
+e.g. `vae-k16-beta32_e100__ward-euclidean-c55__legion-no_axes-train__20261012-153000`,
 which is used everywhere:
   - MLflow run name (experiment `config["experiment"]`): params, metrics,
     tags (git commit, model file path, ...) and the resolved config.yaml.
-  - data/pipeline/<run id>/: config.yaml, features, clusters.csv, metrics.json.
-  - <paths.models>/<run id>.pt: the trained model's state_dict, with
-    <run id>.yaml next to it (config + MLflow run id), so a model file can
-    always be traced back to its run, and fed into a later run as
-    `model.checkpoint` (to fine-tune it or extract features with it).
+  - data/pipeline/<run id>/: everything the run writes, each step into its
+    own folder <Stage>/<Step>/ (see `Step`):
+      config.yaml                                   the resolved config
+      PreprocessingStep/<Step>/                     each step's images (raw runs:
+                                                    the last one, in memory mode),
+                                                    extracted_metadata.csv, _debug/, _svg/
+      FeatureLearningStep/<Model>/model.pt          the trained state_dict, with
+                                  model.yaml        config + MLflow run id, and
+                                  features.csv      the features
+      ClusteringStep/HierarchicalClustering/clusters.csv
+      EvaluationStep/metrics.json
+    A model file can thus always be traced back to its run, and fed into a
+    later run as `model.checkpoint` (to fine-tune it or extract features).
 """
 
 from __future__ import annotations
@@ -34,16 +42,25 @@ import pipeline.steps.step as step_module
 from pipeline import tracking
 from pipeline.clustering import HierarchicalClustering
 from pipeline.evaluation import EvaluationWithGroundTruth, EvaluationWithNoGroundTruth
-from pipeline.feature_learning import BYOL, SimCLR, VAE
+from pipeline.feature_learning import BYOL, HandcraftedFeatures, SimCLR, VAE
+from pipeline.feature_learning.handcrafted_features import FEATURE_GROUPS
 from pipeline.pipeline import Pipeline
-from pipeline.preprocessing import Augmentor, BackgroundEraser, BackgroundEraser2, Normalizer, Repair
+from pipeline.preprocessing import (
+    Augmentor, AxisRenderer, BackgroundEraser, Normalizer, Repair, Vectorizer,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "default.yaml"
+# Ready images are usually copied here by hand; their path below it names
+# the data in run names (data/processed/legion/no_axes/train -> legion-no_axes-train).
+PROCESSED_ROOT = REPO_ROOT / "data" / "processed"
 
-MODELS = {"vae": VAE, "simclr": SimCLR, "byol": BYOL}
+MODELS = {"vae": VAE, "simclr": SimCLR, "byol": BYOL, "handcrafted": HandcraftedFeatures}
+# Feature steps that measure instead of learn: nothing to train or load.
+MEASURED = {"handcrafted"}
 PREPROCESSING_STEPS = {
-    cls.__name__: cls for cls in (BackgroundEraser, BackgroundEraser2, Normalizer, Repair, Augmentor)
+    cls.__name__: cls
+    for cls in (BackgroundEraser, Normalizer, Repair, Vectorizer, AxisRenderer, Augmentor)
 }
 
 # Model parameters that go into the generated run name, as (key, label):
@@ -52,17 +69,18 @@ NAME_KEYS = {
     "vae": [("k", "k"), ("beta_max", "beta"), ("recon_loss", "")],
     "simclr": [("k", "k"), ("projection_dim", "proj")],
     "byol": [("k", "k"), ("tau", "tau")],
+    "handcrafted": [("efd_harmonics", "efd")],
 }
 DEFAULT_FNS = (4, 3, 1)  # f, n, s; only named when changed
 # Short step names for preprocessing-only run names.
-STEP_LABELS = {"BackgroundEraser": "be", "BackgroundEraser2": "be2", "Normalizer": "norm",
-               "Repair": "repair", "Augmentor": "aug"}
+STEP_LABELS = {"BackgroundEraser": "be", "Normalizer": "norm",
+               "Repair": "repair", "Vectorizer": "vec", "AxisRenderer": "axes", "Augmentor": "aug"}
 STOP_AFTER = (None, "preprocessing", "features")
 
 # Sections whose keys are checked against configs/default.yaml, to catch
 # typos. model.params, training and step parameters are passed through to
 # the classes as they are, so the classes check those.
-CHECKED_SECTIONS = ("data", "preprocessing", "model", "clustering", "paths")
+CHECKED_SECTIONS = ("data", "preprocessing", "model", "clustering")
 
 
 # --------------------------------------------------------------------- #
@@ -113,14 +131,35 @@ def load_config(path=None, overrides: Iterable[str] = (), default=DEFAULT_CONFIG
     (if any), then with `overrides` ('key.sub=value', the value parsed as
     YAML, so 32 is an int, 1e-4 a float, null None and [a, b] a list)."""
     defaults = _read_yaml(default)
-    config = deep_merge(defaults, _read_yaml(path) if path is not None else {})
+    own = _read_yaml(path) if path is not None else {}
+    own_type = (own.get("model") or {}).get("type")
+    if own_type is not None and _other_kind(defaults["model"]["type"], own_type):
+        # The default model.params (f/n/s/k of the shared encoder) don't
+        # apply to a measuring feature step, nor the other way round.
+        defaults["model"]["params"] = {}
+    config = deep_merge(defaults, own)
+    parsed = []
     for item in overrides:
         key, sep, value = item.partition("=")
         if not sep:
             raise ValueError(f"Overrides look like key.sub=value, got {item!r}")
-        set_dotted(config, key.strip(), _parse_yaml(value))
+        parsed.append((key.strip(), _parse_yaml(value)))
+    # A new model.type first: switching between a learned and a measuring
+    # feature step, the params set so far don't apply.
+    for key, value in parsed:
+        if key == "model.type" and _other_kind(config["model"]["type"], value):
+            config["model"]["params"] = {}
+            config["model"]["type"] = value
+    for key, value in parsed:
+        set_dotted(config, key, value)
     validate(config, defaults)
     return config
+
+
+def _other_kind(old_type, new_type) -> bool:
+    """Whether a model type switch crosses between learned models (sharing
+    the encoder params f/n/s/k) and measuring ones (MEASURED)."""
+    return (old_type in MEASURED) != (new_type in MEASURED)
 
 
 def validate(config: dict, defaults: dict) -> None:
@@ -137,7 +176,10 @@ def validate(config: dict, defaults: dict) -> None:
         raise ValueError(f"stop_after must be one of {STOP_AFTER}")
     if config["stop_after"] == "preprocessing" and config["data"]["source"] != "raw":
         raise ValueError("stop_after: preprocessing needs data.source: raw (ready images need no preprocessing)")
-    if (config["stop_after"] != "preprocessing"
+    measured = config["model"]["type"] in MEASURED
+    if measured and config["model"]["checkpoint"]:
+        raise ValueError(f"model.type: {config['model']['type']} has no weights: remove model.checkpoint")
+    if (config["stop_after"] != "preprocessing" and not measured
             and not config["training"]["train"] and not config["model"]["checkpoint"]):
         raise ValueError("training.train: false only extracts features, so it needs model.checkpoint")
     for entry in config["preprocessing"]["steps"] or []:
@@ -169,14 +211,23 @@ def resolve_path(path) -> Path | None:
 def run_name(config: dict) -> str:
     """Readable name from the settings that tell runs apart:
     <model>-<params>_<training>__<clustering>__<data>, e.g.
-    'vae-k16-beta32_e100__ward-euclidean-c55__legion-train'. Without the
+    'vae-k16-beta32_e100__ward-euclidean-c55__legion-no_axes-train'. Without the
     clustering part for stop_after: features, and 'prep-<steps>__raw' (e.g.
-    'prep-be2-norm-repair__raw') for stop_after: preprocessing.
+    'prep-be-ax-norm-repair__raw') for stop_after: preprocessing.
     `config["name"]`, if set, is used instead."""
     if config.get("name"):
         return _safe(config["name"])
     if config["stop_after"] == "preprocessing":
-        steps = [STEP_LABELS[next(iter(entry))] for entry in config["preprocessing"]["steps"] or []]
+        steps = []
+        for entry in config["preprocessing"]["steps"] or []:
+            (class_name, params), = entry.items()
+            params = params or {}
+            label = STEP_LABELS[class_name]
+            if params.get("record_axes"):  # BackgroundEraser recording the axes
+                label += "-ax"
+            if params.get("axes") == "draw":  # Vectorizer drawing them
+                label += "-axes"
+            steps.append(label)
         return _safe(f"prep-{'-'.join(steps)}__{_data_label(config)}")
 
     model = config["model"]
@@ -187,19 +238,31 @@ def run_name(config: dict) -> str:
         parts.append("f{}n{}s{}".format(*fns))
     parts += [f"{label}{_fmt(params[key])}" for key, label in NAME_KEYS[model["type"]] if key in params]
 
-    training = config["training"]
-    if training["train"]:
-        trained = f"e{training['epochs']}" + ("-ft" if model.get("checkpoint") else "")
+    if model["type"] in MEASURED:
+        features = params.get("features")
+        if features is not None and tuple(features) != tuple(FEATURE_GROUPS):
+            parts.append("-".join(features))
+        trained = ""
+    elif config["training"]["train"]:
+        trained = f"e{config['training']['epochs']}" + ("-ft" if model.get("checkpoint") else "")
     else:
-        # A checkpoint saved by an earlier run is named <run name>__<time>;
-        # its first part is enough to say which model it was.
-        trained = "extract-" + Path(model["checkpoint"]).stem.split("__")[0]
+        trained = "extract-" + _checkpoint_label(model["checkpoint"])
 
+    model_part = "-".join(parts) + (f"_{trained}" if trained else "")
     if config["stop_after"] == "features":
-        return _safe(f"{'-'.join(parts)}_{trained}__{_data_label(config)}")
+        return _safe(f"{model_part}__{_data_label(config)}")
     clustering = config["clustering"]
     method = "auto" if clustering["method"] == "auto" else f"{clustering['method']}-{clustering['metric']}"
-    return _safe(f"{'-'.join(parts)}_{trained}__{method}-c{clustering['cluster_num']}__{_data_label(config)}")
+    return _safe(f"{model_part}__{method}-c{clustering['cluster_num']}__{_data_label(config)}")
+
+
+def _checkpoint_label(checkpoint) -> str:
+    """Which model a checkpoint is, for run names: the name of the run that
+    saved it - data/pipeline/<run name>__<time>/FeatureLearningStep/<Model>/model.pt,
+    or <run name>__<time>.pt for older ones - without its time."""
+    path = Path(checkpoint)
+    run = path.parents[2].name if path.name == "model.pt" and len(path.parents) > 2 else path.stem
+    return run.split("__")[0]
 
 
 def _data_label(config: dict) -> str:
@@ -208,7 +271,7 @@ def _data_label(config: dict) -> str:
         return "raw"
     path = resolve_path(data["preprocessed_path"])
     try:
-        parts = path.relative_to(resolve_path(config["paths"]["preprocessed"])).parts
+        parts = path.relative_to(PROCESSED_ROOT).parts
     except ValueError:
         parts = path.parts[-2:]
     return "-".join(parts)
@@ -227,8 +290,8 @@ def _safe(name: str) -> str:
 # --------------------------------------------------------------------- #
 
 def build_preprocessing_steps(config: dict, run_id: str) -> list:
-    """The configured preprocessing steps, in order. The last image-producing
-    step (not an Augmentor) writes to <paths.preprocessed>/<run id>."""
+    """The configured preprocessing steps, in order, each writing to its own
+    folder data/pipeline/<run id>/PreprocessingStep/<Step>/."""
     steps = []
     for entry in config["preprocessing"]["steps"] or []:
         (class_name, params), = entry.items()
@@ -237,17 +300,18 @@ def build_preprocessing_steps(config: dict, run_id: str) -> list:
         if "model" in params:  # BackgroundEraser's YOLO weights
             params["model"] = str(resolve_path(params["model"]))
         steps.append(PREPROCESSING_STEPS[class_name](run_id=run_id, **params))
-    image_steps = [step for step in steps if not isinstance(step, Augmentor)]
-    if image_steps:
-        image_steps[-1].output_path = str(resolve_path(config["paths"]["preprocessed"]) / run_id)
     return steps
 
 
-def build_model(config: dict, run_id: str, device) -> torch.nn.Module:
-    """The feature-learning model, with `model.checkpoint` loaded if given
-    (a plain state_dict, as saved by `save_model` or torch.save)."""
+def build_model(config: dict, run_id: str, device):
+    """The feature step: a learned model (on `device`, with `model.checkpoint`
+    loaded if given - a plain state_dict, as saved by `save_model` or
+    torch.save), or a measuring one such as HandcraftedFeatures."""
     model_config = config["model"]
-    model = MODELS[model_config["type"]](run_id=run_id, **(model_config.get("params") or {})).to(device)
+    model = MODELS[model_config["type"]](run_id=run_id, **(model_config.get("params") or {}))
+    if not isinstance(model, torch.nn.Module):
+        return model
+    model = model.to(device)
     if model_config.get("checkpoint"):
         state = torch.load(resolve_path(model_config["checkpoint"]), map_location=device, weights_only=True)
         model.load_state_dict(state)
@@ -327,11 +391,12 @@ def evaluate(clustering: HierarchicalClustering, predicted: np.ndarray, labels_p
 # --------------------------------------------------------------------- #
 
 def save_model(model, config: dict, run_id: str, mlflow_run_id: str | None) -> Path:
-    """Save the state_dict to <paths.models>/<run id>.pt, and the resolved
-    config plus the MLflow run id to <run id>.yaml next to it."""
-    folder = resolve_path(config["paths"]["models"])
+    """Save the state_dict to model.pt in the model step's folder
+    (data/pipeline/<run id>/FeatureLearningStep/<Model>/), and the resolved
+    config plus the MLflow run id to model.yaml next to it."""
+    folder = Path(model.output_path)
     folder.mkdir(parents=True, exist_ok=True)
-    model_path = folder / f"{run_id}.pt"
+    model_path = folder / "model.pt"
     torch.save(model.state_dict(), model_path)
     info = {
         "run_id": run_id,
@@ -343,7 +408,7 @@ def save_model(model, config: dict, run_id: str, mlflow_run_id: str | None) -> P
         "started_from": config["model"].get("checkpoint"),
         "config": config,
     }
-    _write_yaml(info, folder / f"{run_id}.yaml")
+    _write_yaml(info, folder / "model.yaml")
     return model_path
 
 
@@ -393,7 +458,7 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
                         clustering_factory=clustering_factory(config, run_id, built) if stop_after is None else None)
 
         training = dict(config["training"])
-        train = training.pop("train") and model is not None
+        train = training.pop("train") and isinstance(model, torch.nn.Module)
         feature_kwargs = training if train else {"batch_size": training.get("batch_size", 32)}
         result = pipe.run(
             str(resolve_path(data["raw_path"] if raw else data["preprocessed_path"])),
@@ -416,8 +481,13 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
             clustering = built["step"]
             metrics = evaluate(clustering, predicted, resolve_path(data["labels"]))
             names = clustering.filenames if clustering.filenames is not None else range(len(predicted))
-            pd.DataFrame({"filename": names, "cluster": predicted}).to_csv(run_dir / "clusters.csv", index=False)
-            (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=float))
+            clusters_csv = Path(clustering.output_path) / "clusters.csv"
+            clusters_csv.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"filename": names, "cluster": predicted}).to_csv(clusters_csv, index=False)
+            # The evaluation steps write nothing themselves; their stage folder holds the metrics.
+            evaluation_dir = run_dir / "EvaluationStep"
+            evaluation_dir.mkdir(exist_ok=True)
+            (evaluation_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=float))
 
     print(f"Done: {run_id}" + (f" (stopped after {stop_after})" if stop_after else ""))
     if preprocessed_path:

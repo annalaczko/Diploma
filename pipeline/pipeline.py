@@ -9,18 +9,21 @@ from typing import Callable, Iterator, Literal
 
 import numpy as np
 import torch
+from PIL import Image
 from tqdm import tqdm
 
 from pipeline import tracking
 from pipeline.clustering.clustering_step import ClusteringStep
 from pipeline.evaluation.evaluation_step import EvaluationStep
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
+from pipeline.preprocessing import axes as axes_lib
 from pipeline.preprocessing.augmentation import Augmentor
 from pipeline.preprocessing.dataset import (
     ImageRecord,
     InMemoryImages,
     collect_image_paths,
     iter_image_batches,
+    prefetch,
 )
 from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 
@@ -152,11 +155,23 @@ class Pipeline:
             if save_preprocessed is not None and steps:  # nothing to save without steps
                 result["output_path"] = Path(steps[-1].output_path)
                 print(f"Preprocessed images saved under {result['output_path']}")
-            if self.feature_learning_step is not None:
-                self.feature_learning_step.set_images(images, train_transform=self._train_transform())
+            height, width = images.images.shape[1:3]
+            self._export_metadata(result, {name: (width, height) for name in images.names},
+                              result.get("output_path"))
+            step = self.feature_learning_step
+            if step is not None:
+                step.set_images(images, train_transform=self._train_transform())
+                if getattr(step, "reads_saved_images", False):
+                    # E.g. HandcraftedFeatures: works on the saved files
+                    # (SVGs, extracted_metadata.csv), not on the images.
+                    if "output_path" not in result:
+                        raise ValueError(f"{step.name} reads the preprocessed files: run with save_preprocessed")
+                    step.input_path = str(result["output_path"])
         elif mode == "disk":
             output_path = self.preprocess_on_disk(input_path)
             result = {"output_path": output_path}
+            if self.preprocessing_steps:
+                self._export_metadata(result, _image_sizes(output_path), output_path)
             if self.feature_learning_step is not None:
                 self.feature_learning_step.set_images(None)
                 self.feature_learning_step.input_path = str(output_path)
@@ -204,10 +219,12 @@ class Pipeline:
                 `run`'s `save_preprocessed`).
         """
         steps = self._batch_steps()
+        self._link_axes()
         saving = {"last": steps[-1:], "all": steps}.get(save, [])
         n_images = len(collect_image_paths(input_path))
         with tqdm(total=n_images, desc="Preprocessing", unit="image") as progress:
-            for batch in iter_image_batches(input_path, batch_size):
+            # The next batch is loaded while this one goes through the steps.
+            for batch in prefetch(iter_image_batches(input_path, batch_size)):
                 n_loaded = len(batch)
                 for step in steps:
                     batch = step.process_batch(batch)
@@ -246,12 +263,38 @@ class Pipeline:
     def preprocess_on_disk(self, input_path) -> Path:
         """Run each step's `run()` in order, pointing each step at the
         previous one's output folder. Returns the last output folder."""
+        self._link_axes()
         current = input_path
         for step in self.preprocessing_steps:
             step.input_path = current
             output = step.run()
             current = output if output is not None else step.output_path
         return Path(current)
+
+    def _link_axes(self) -> None:
+        """Point every step that draws the axes (`uses_axes`, e.g.
+        `Vectorizer(axes="draw")`, `AxisRenderer`) at the nearest earlier
+        step that provides them (`provides_axes`, e.g. BackgroundEraser with record_axes)."""
+        provider = None
+        for step in self.preprocessing_steps:
+            if getattr(step, "uses_axes", False) and getattr(step, "metadata_csv", None) is None:
+                step.axes_source = provider
+            if getattr(step, "provides_axes", False):
+                provider = step
+
+    def _export_metadata(self, result: dict, sizes: dict, folder) -> None:
+        """If a step recorded per-image metadata (BackgroundEraser: scan size,
+        DPI, crop, scale and the axes), put its rows - converted to the final
+        images' pixel coordinates - in result['metadata'], write them to
+        <folder>/extracted_metadata.csv and log them to MLflow."""
+        providers = [s for s in self.preprocessing_steps if getattr(s, "provides_metadata", False)]
+        if not providers:
+            return
+        table = axes_lib.metadata_dataframe(providers[-1].axes_table, sizes)
+        result["metadata"] = table
+        if folder is not None:
+            table.to_csv(Path(folder) / axes_lib.METADATA_CSV, index=False)
+        tracking.log_table(table, f"preprocessing/{axes_lib.METADATA_CSV}")
 
     def _batch_steps(self) -> list[PreprocessingStep]:
         return [step for step in self.preprocessing_steps if not isinstance(step, Augmentor)]
@@ -276,3 +319,13 @@ class Pipeline:
         if feature_mode is not None and "mode" in inspect.signature(step.run).parameters:
             return step.run(feature_mode, **feature_kwargs)
         return step.run(**feature_kwargs)
+
+
+def _image_sizes(folder) -> dict[str, tuple[int, int]]:
+    """Name -> (width, height) of every image directly in `folder` (reads
+    only the file headers)."""
+    sizes = {}
+    for path in collect_image_paths(folder):
+        with Image.open(path) as image:
+            sizes[path.name] = image.size
+    return sizes

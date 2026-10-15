@@ -19,7 +19,7 @@ from pipeline.clustering import HierarchicalClustering
 from pipeline.evaluation import EvaluationWithGroundTruth
 from pipeline.feature_learning.vae import VAE
 from pipeline.pipeline import Pipeline
-from pipeline.preprocessing import BackgroundEraser2, Normalizer
+from pipeline.preprocessing import BackgroundEraser, Normalizer
 
 H, W = 1400, 1000
 SHARD_BOX = [400.0, 520.0, 520.0, 640.0]
@@ -79,19 +79,19 @@ def test_disk_run_logs_flat_names_of_failed_images(tmp_path):
     Image.fromarray(_sheet(with_axes=False)).save(source / "survey" / "no_axes.png")
     Image.fromarray(_sheet(with_axes=False, with_shard=False)).save(source / "survey" / "blank.png")
 
-    eraser = _mock_yolo(BackgroundEraser2(input_path=str(source), output_path=str(tmp_path / "out"),
+    eraser = _mock_yolo(BackgroundEraser(record_axes=True, input_path=str(source), output_path=str(tmp_path / "out"),
                                           mode="detection", box_margin=0.0, debug_images=0))
     with tracking.start_run("eraser"):
         eraser.run()
 
     run = _only_run("eraser")
-    prefix = "preprocessing/BackgroundEraser2"
+    prefix = "preprocessing/BackgroundEraser"
     assert run.data.metrics[f"{prefix}/n_images"] == 3
     assert run.data.metrics[f"{prefix}/no_shard_count"] == 1
     assert run.data.metrics[f"{prefix}/no_axes_count"] == 1
     assert _artifact_text(run, f"{prefix}/no_shard.txt") == "survey__blank.png\n"
     assert _artifact_text(run, f"{prefix}/no_axes.txt") == "survey__no_axes.png\n"
-    assert run.data.params[f"{prefix}/axis_margin"] == "0.005"
+    assert run.data.params[f"{prefix}/mode"] == "detection"
 
 
 @pytest.mark.parametrize("mode", ["memory", "disk"])
@@ -103,7 +103,7 @@ def test_pipeline_run_tracks_every_stage(tmp_path, recwarn, mode):
     Image.fromarray(_sheet(with_axes=False)).save(source / "c.png")
     Image.fromarray(_sheet(with_axes=False, with_shard=False)).save(source / "d.png")
 
-    eraser = _mock_yolo(BackgroundEraser2(mode="detection", box_margin=0.0, debug_images=0,
+    eraser = _mock_yolo(BackgroundEraser(record_axes=True, mode="detection", box_margin=0.0, debug_images=0,
                                           output_path=str(tmp_path / "erased")))
     torch.manual_seed(0)
     vae = VAE(output_path=str(tmp_path / "features"))
@@ -123,13 +123,13 @@ def test_pipeline_run_tracks_every_stage(tmp_path, recwarn, mode):
     metrics, params = run.data.metrics, run.data.params
     assert run.info.run_name == "smoke"
     # Preprocessing: counts and names of the skipped images.
-    assert metrics["preprocessing/BackgroundEraser2/no_shard_count"] == 1
-    assert metrics["preprocessing/BackgroundEraser2/no_axes_count"] == 1
+    assert metrics["preprocessing/BackgroundEraser/no_shard_count"] == 1
+    assert metrics["preprocessing/BackgroundEraser/no_axes_count"] == 1
     if mode == "memory":
         assert metrics["preprocessing/n_images"] == 3
-    assert _artifact_text(run, "preprocessing/BackgroundEraser2/no_shard.txt") == "d.png\n"
-    assert _artifact_text(run, "preprocessing/BackgroundEraser2/no_axes.txt") == "c.png\n"
-    assert params["preprocessing/BackgroundEraser2/axis_margin"] == "0.005"
+    assert _artifact_text(run, "preprocessing/BackgroundEraser/no_shard.txt") == "d.png\n"
+    assert _artifact_text(run, "preprocessing/BackgroundEraser/no_axes.txt") == "c.png\n"
+    assert params["preprocessing/BackgroundEraser/mode"] == "detection"
     # Feature learning: one value per epoch, config and features.csv.
     history = mlflow.tracking.MlflowClient().get_metric_history(run.info.run_id, "feature/loss")
     assert [m.step for m in history] == [1, 2]

@@ -1,7 +1,7 @@
 """Finds the construction coordinate system on a raw A4 pottery scan: the
 long vertical rotation axis, the horizontal rim/base line and their
 intersection. Ported from giappetto/pottery_axes_batch.py (which also
-reports quadrants and writes a CSV); used by `BackgroundEraser2`.
+reports quadrants and writes a CSV); used by `BackgroundEraser(record_axes=True)`.
 
 The lines are found with long morphological openings rather than Hough
 segments: an opening with a long, thin kernel keeps only straight ruler

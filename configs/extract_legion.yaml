@@ -1,5 +1,0 @@
-# No training: extract features with an existing model and cluster them.
-model:
-  checkpoint: models/feature_learning/legion.pt   # k=128 VAE (the default params)
-training:
-  train: false

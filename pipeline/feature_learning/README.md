@@ -17,7 +17,8 @@ pipeline/feature_learning/
 ├── reconstruction_losses.py   # interchangeable VAE reconstruction losses (BCE, Dice, soft-IoU, BCE+Dice)
 ├── vae_classifier.py          # VAEClassifier
 ├── simclr.py                  # SimCLR, SimCLREncoder, SimCLRDataset
-└── byol.py                    # BYOL
+├── byol.py                    # BYOL
+└── handcrafted_features.py    # HandcraftedFeatures: profile measures from the Vectorizer's SVGs (model.type: handcrafted)
 ```
 
 Image loading (path discovery + tensor conversion) is delegated to
@@ -564,3 +565,60 @@ ratio), then pads it to exactly that size, centered. Same goal as
 `Normalizer.pad_to_square` (an aspect-ratio-preserving square canvas), but a
 different implementation (resize-then-pad here, vs. pad-then-resize in
 `Normalizer`) for use outside a full pipeline `Step`.
+
+## Hand-crafted features (`handcrafted_features.py`)
+
+Measures the vectorized profile drawings directly instead of learning
+features. Input: a Vectorizer output folder (`_svg/*.svg` and
+`extracted_metadata.csv`). Each drawing is moved into its vessel's
+coordinate system in cm (x = distance from the rotation axis, y = distance
+from the rim/base line, positive downwards), using the recorded axes and
+`px_per_cm`; vertical-axis remnants are cut out of the lines first (the
+horizontal line is kept: rim tops and bases lie on it).
+
+Each `add_*(df, profiles)` function adds one kind of columns to the feature
+DataFrame (one row per image); `extract_features(folder, groups, names,
+efd_harmonics)` runs the chosen groups of `FEATURE_GROUPS` (position, size,
+axis_distance, thickness, fourier):
+
+| Function | Columns |
+|---|---|
+| `add_position_features` | `position` (below / above / both the horizontal line; ink within 1 mm of the line not counted), `below_frac`, `above_frac` |
+| `add_size_features` | `rim_height_cm`, `rim_width_cm` |
+| `add_axis_distance_features` | `rim_axis_dist_mean_cm`, `_min_cm`, `_max_cm` (from the rotation axis) |
+| `add_thickness_features` | `rim_thickness_mean_cm`: normal rays from every line point to the nearest other line, so the lines need not be joined |
+| `add_fourier_features` | `efd_<n>_<a,b,c,d>`, n = 1..10: elliptic Fourier descriptors of the cross-section's outline, size- and start-point-normalized, not rotation-normalized. The drawings leave the break edges out, so free line ends are joined pairwise (closest first, up to 3 cm) and the enclosed area is filled; if nothing is enclosed, the ink is closed morphologically wider than the wall instead |
+
+Images without a coordinate system get NaN.
+
+```bash
+python -m pipeline.feature_learning.handcrafted_features <Vectorizer folder> [--out features.csv]
+```
+
+### `HandcraftedFeatures` (the pipeline step)
+
+```python
+HandcraftedFeatures(
+    input_path=None,            # Vectorizer output folder, or a train/test subfolder of it
+    features=("position", "size", "axis_distance", "thickness", "fourier"),
+    efd_harmonics=10,
+    output_path=None, name=None, run_id="default_run",
+)
+```
+
+In configs: `model.type: handcrafted`, `model.params: {features: [...],
+efd_harmonics: 10}`. Nothing is trained and there is no checkpoint;
+`training` is ignored. `run()` accepts and ignores the training arguments,
+so it stands in for a learned model, and writes to its folder:
+`handcrafted_features.csv` (the readable table), `features.csv` (filename +
+vector, read by clustering) and `feature_columns.txt`. The vector is every
+numeric column except `above_frac` (= 1 - `below_frac`); missing values are
+filled with the column median. Different units (cm, fractions, Fourier
+coefficients) are why clustering should keep `standardize: true`.
+
+It reads files, not images: the SVGs (`_svg/`) and `extracted_metadata.csv`
+of a Vectorizer with `save_svg: true`, in `input_path` or its parent
+(`split_by_labels.py` leaves them there). With `data.source: raw` in memory
+mode, `Pipeline` points it at the saved last preprocessing folder
+(`reads_saved_images`). Only the images in `input_path` are used, so a
+train/ subfolder gives the train split.

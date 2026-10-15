@@ -10,5 +10,6 @@ from pipeline.feature_learning.vae import VAE
 from pipeline.feature_learning.vae_classifier import VAEClassifier
 from pipeline.feature_learning.simclr import SimCLR
 from pipeline.feature_learning.byol import BYOL
+from pipeline.feature_learning.handcrafted_features import HandcraftedFeatures
 
-__all__ = ["FeatureLearningStep", "EarlyStopping", "VAE", "VAEClassifier", "SimCLR", "BYOL"]
+__all__ = ["FeatureLearningStep", "EarlyStopping", "VAE", "VAEClassifier", "SimCLR", "BYOL", "HandcraftedFeatures"]
