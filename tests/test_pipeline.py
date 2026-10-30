@@ -219,3 +219,21 @@ def test_collect_image_paths_skips_side_output_folders(tmp_path):
     names = [p.relative_to(tmp_path).as_posix() for p in collect_image_paths(tmp_path)]
 
     assert names == ["a.png", "sub/b.png"]
+
+
+def test_background_eraser_crop_size_is_fraction_of_page_width(monkeypatch):
+    eraser = BackgroundEraser(mode="detection", box_margin=0.0, crop_size=0.5, debug_images=0, run_id="test")
+    small = SimpleNamespace(boxes=SimpleNamespace(xyxy=torch.tensor([[10.0, 20.0, 50.0, 40.0]])))
+    large = SimpleNamespace(boxes=SimpleNamespace(xyxy=torch.tensor([[0.0, 0.0, 90.0, 70.0]])))
+    model = SimpleNamespace(predict=lambda images, **kwargs: [small, large][:len(images)])
+    monkeypatch.setattr(eraser, "_get_model", lambda: model)
+
+    records = [
+        ImageRecord("small.png", Image.new("RGB", (100, 80), (0, 0, 0))),
+        ImageRecord("large.png", Image.new("RGB", (100, 80), (0, 0, 0))),
+    ]
+    out = eraser.process_batch(records)
+
+    assert [r.image.size for r in out] == [(50, 50), (50, 50)]  # half of the 100 px page width
+    assert eraser.clipped == ["large.png"]  # the 90x70 box doesn't fit
+    assert eraser.failure_lists()["clipped"] == ["large.png"]

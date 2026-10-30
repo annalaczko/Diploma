@@ -17,6 +17,12 @@ class HierarchicalClustering(ClusteringStep):
     by cophenetic correlation (see `compare_all`).
     """
 
+    METHODS = ('single', 'complete', 'average', 'weighted', 'centroid', 'ward')
+    METRICS = ('euclidean', 'cityblock', 'chebyshev', 'cosine')
+    # Linkages defined on Euclidean distances only: scipy runs them on any
+    # distance matrix without complaint, but the result is meaningless.
+    EUCLIDEAN_ONLY = ('centroid', 'ward')
+
     def __init__(self, input_path, cluster_num=30, method=None, metric=None, output_path=None, run_id="default_run"):
         """
         Args:
@@ -45,8 +51,8 @@ class HierarchicalClustering(ClusteringStep):
         features = pd.read_csv(input_path)
         self.vectors = self.parse_feature_string(features['features'].values)
         self.filenames = features['filename'].tolist() if 'filename' in features else None
-        self.methods=['single', 'complete', 'average', 'weighted', 'centroid', 'ward']
-        self.metrics=['euclidean', 'cityblock', 'chebyshev', 'cosine'] 
+        self.methods=list(self.METHODS)
+        self.metrics=list(self.METRICS)
 
         self.best_method = method if method in self.methods else 'average'
         self.best_metric = metric if metric in self.metrics else 'euclidean'

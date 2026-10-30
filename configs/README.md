@@ -12,8 +12,29 @@ new config, and delete what you don't change.
 |---|---|
 | `default.yaml` | the defaults every config is merged into |
 | `template.yaml` | every option; as it stands raw scans -> BackgroundEraser -> Normalizer -> Repair -> Vectorizer -> VAE -> clustering -> evaluation |
-| `prep_vector_axes.yaml` | preprocessing only: vectorized shards |
-| `prep_vector_axes_svg.yaml` | preprocessing only: vectorized shards, also as SVG |
+| `vae.yaml` / `vae_axes.yaml` | VAE trained on `legion/raster[_axes]/train`, features of `test` clustered and evaluated (clustering sweep) |
+| `handcrafted.yaml` / `handcrafted_axes.yaml` | hand-crafted profile measures of vectorized images with their `_svg/` (nothing trained; clustering sweep) |
+| `dinov3.yaml` / `dinov3_axes.yaml` | frozen pretrained DINOv3 (the sandbox.ipynb method) on `legion/raster[_axes]/test` (nothing trained; clustering sweep) |
+| `only_prep/*.yaml` | preprocessing only (`stop_after: preprocessing`): raster / vector images, with or without the axes |
+
+The three feature methods are chosen with `model.type: vae | handcrafted | dinov3`
+(`simclr` and `byol` also work). Switching `model.type` (also with
+`--set model.type=...`) drops the `model.params` that belong to the other
+kind of model. `handcrafted` and `dinov3` train nothing, so they take no
+`model.checkpoint`; dinov3 only uses `training.batch_size`. DINOv3 needs
+`transformers` and a one-off `huggingface-cli login` (the weights are gated).
+
+## Sweeps
+
+`sweep:` tries every combination of the listed values, training each model
+only once (combinations that differ only in `clustering.*` re-cluster its
+features). Details: [`pipeline/README.md`](../pipeline/README.md#sweeps).
+
+```yaml
+sweep:
+  model.params.k: [16, 32]
+  clustering.cluster_num: [20, 30, 55]
+```
 
 ## Where the outputs go
 

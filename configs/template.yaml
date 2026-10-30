@@ -11,6 +11,15 @@
 experiment: pottery          # MLflow experiment name
 name: null                   # run name; null = generated (model, params, clustering, data) + date-time
 stop_after: null             # null = whole run | preprocessing (needs data.source: raw) | features (no clustering/evaluation)
+sweep: {}                    # settings to try, one run per combination (see pipeline/README.md#sweeps), e.g.
+                             #   sweep:
+                             #     model.params.k: [16, 32]                         # model/training settings: one training each
+                             #     model.params.beta_max: [8, 32]
+                             #     clustering.method: [ward, average, complete, auto]   # clustering settings: re-cluster
+                             #     clustering.metric: [euclidean, cosine]           #   the same features, no new training
+                             #     clustering.cluster_num: [30, 55]
+                             # Combinations that cannot run (ward/centroid with a non-euclidean metric, auto with
+                             # a second metric) are left out and listed. A list-valued setting: [[0, 0], [5, 5]].
 
 # ===================================================================== data
 data:
@@ -18,6 +27,11 @@ data:
   raw_path: data/legion_raw  # raw scans (searched recursively)
   preprocessed_path: data/processed/legion/no_axes/train   # ready images (used with source: preprocessed)
   labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
+  extract_path: null         # ready images to extract features from, then cluster and evaluate, e.g.
+                             # data/processed/legion/no_axes/test; the model trains on preprocessed_path (or the
+                             # raw images), its features of those go to features_train.csv; null = the same images
+  features: null             # features.csv of an earlier run (data/pipeline/<run id>/FeatureLearningStep/<Model>/features.csv):
+                             # only cluster and evaluate these; preprocessing, model and training are not used
 
 # ===================================================================== preprocessing
 # Only used with data.source: raw. The steps run in this order; each writes to
@@ -34,6 +48,9 @@ preprocessing:
         batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
         box_margin: 0.15     # detection mode: pad the box by this fraction of its size per side
         mask_margin: 0.01    # segmentation mode: grow the mask by this fraction of its longer side (class default 0.10)
+        crop_size: null      # null: square crop fitted to the shard | number: square side = this fraction of the
+                             # scan width (0.5 = half), centered on the shard; keeps the shards' relative sizes
+                             # (larger shards are cut off, listed in MLflow as clipped.txt)
         record_axes: true    # also find the coordinate system (into extracted_metadata.csv); false for images without one
         num_workers: null    # threads clearing a batch in parallel; null = min(16, CPUs), 1 = one at a time
         half: false          # true: FP16 YOLO (faster on GPU; masks may differ by a pixel from FP32)
@@ -104,7 +121,7 @@ preprocessing:
 
 # ===================================================================== feature learning
 model:
-  type: vae                  # vae | simclr | byol | handcrafted (measured, nothing trained: see below)
+  type: vae                  # vae | simclr | byol | handcrafted | dinov3 (handcrafted, dinov3: nothing trained, see below)
   params:                    # constructor arguments of the chosen model
     f: 4                     # channel-width exponent: block i has 2**(f+i) channels
     n: 3                     # convolution kernel size
@@ -124,9 +141,13 @@ model:
     # whose folder or parent has _svg/ and extracted_metadata.csv. Ignores training; no checkpoint.
     # features: [position, size, axis_distance, thickness, fourier]   # feature groups to compute
     # efd_harmonics: 10      # elliptic Fourier harmonics of the section outline (4 numbers each)
+    # dinov3 only - frozen pretrained DINOv3 (the sandbox.ipynb method: RGB image -> the model's image
+    # processor -> CLS token of the last hidden state, 768 numbers for vitb16). Ignores training except
+    # batch_size; no checkpoint. Gated on Hugging Face: accept the license and `huggingface-cli login` once.
+    # model_name: facebook/dinov3-vitb16-pretrain-lvd1689m   # or facebook/dinov3-vits16-... (smaller), -vitl16-... (larger)
   checkpoint: null           # .pt (state_dict) to start from: fine-tuned if training.train, else only used to extract features
 
-training:                    # arguments of the model's run() / train_model() (ignored by handcrafted)
+training:                    # arguments of the model's run() / train_model() (ignored by handcrafted; dinov3 uses only batch_size)
   train: true                # false = only extract features (needs model.checkpoint)
   epochs: 100                # maximum epochs (early stopping may end sooner)
   lr: 1.0e-4                 # learning rate
@@ -149,3 +170,5 @@ clustering:
   cluster_num: 55            # number of flat clusters
   standardize: true          # z-score every feature dimension before clustering
   min_variance: 1.0e-3       # with standardize: drop dimensions whose variance is below this
+  feature_importance: 10     # print the N dimensions that separate the clusters best at the end of the run
+                             # (eta2; the whole list: <run>/ClusteringStep/HierarchicalClustering/feature_importance.csv); 0 = off

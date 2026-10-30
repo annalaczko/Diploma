@@ -112,7 +112,7 @@ def test_run_experiment_with_handcrafted_features(tmp_path):
 def test_handcrafted_rejects_a_checkpoint_and_unknown_groups():
     from pipeline.experiment import load_config
 
-    with pytest.raises(ValueError, match="no weights"):
+    with pytest.raises(ValueError, match="not trained here"):
         load_config(None, ["model.type=handcrafted", "model.checkpoint=x.pt"])
     with pytest.raises(ValueError, match="Unknown feature groups"):
         hf.HandcraftedFeatures(features=["size", "colour"])

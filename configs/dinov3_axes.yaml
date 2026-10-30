@@ -1,0 +1,34 @@
+# DINOv3 (frozen, pretrained; the sandbox.ipynb method) -> clustering -> evaluation.
+# Nothing is trained: every image is embedded once, its CLS token is the feature vector.
+# Gated on Hugging Face: accept the license on the model page and `huggingface-cli login` once.
+# Every option: configs/template.yaml. Run:  python run_experiment.py configs/dinov3_axes.yaml
+
+# ===================================================================== run
+experiment: pottery          # MLflow experiment name
+name: dinov3_axes            # run name; null = generated (model, params, clustering, data) + date-time
+stop_after: null             # null = whole run | features (no clustering/evaluation)
+sweep:                       # one run per combination (see pipeline/README.md#sweeps); every model_name is
+                             # embedded once, the clustering settings re-cluster the same features.
+                             # Combinations that cannot run (ward/centroid with a non-euclidean metric, auto with
+                             # a second metric) are left out and listed.
+  clustering.method: [ward, average, complete, auto]
+  clustering.metric: [euclidean, cosine]
+  clustering.cluster_num: [5, 10, 15, 20, 25, 30]
+
+
+# ===================================================================== data
+data:
+  source: preprocessed       # ready images
+  preprocessed_path: data/processed/legion/raster_axes/test   # the images embedded, clustered and evaluated
+                             # (the same ones the VAE configs cluster)
+  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
+  features: null             # features.csv of an earlier run: only cluster and evaluate these
+
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m   # or facebook/dinov3-vits16-pretrain-lvd1689m (smaller),
+                                                           # facebook/dinov3-vitl16-pretrain-lvd1689m (larger)
+
+training:                    # nothing is trained; only batch_size is used
+  batch_size: 128            # images embedded at once; lower it on CUDA out-of-memory

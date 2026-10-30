@@ -1,15 +1,20 @@
 """Tests for config-driven experiment runs (pipeline/experiment.py)."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlflow
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 import yaml
 from PIL import Image
+from transformers import BatchEncoding
 
-from pipeline.experiment import load_config, run_experiment, run_name
+from pipeline.feature_learning import DINOv3
+from pipeline.experiment import (feature_importance, feature_names, load_config, run_experiment, run_name,
+                                 run_sweep, sweep_configs)
 
 
 def _write(path: Path, data) -> Path:
@@ -48,6 +53,9 @@ def test_typos_and_inconsistent_settings_are_rejected(tmp_path):
     (["training.train=false", "model.checkpoint=models/x/vae-k16_e100__ward__legion__20261012-1200.pt"],
      "vae-k128_extract-vae-k16_e100__ward-euclidean-c55__legion-no_axes-train"),
     (["name=my run"], "my-run"),
+    (["model.type=dinov3"], "dinov3__ward-euclidean-c55__legion-no_axes-train"),
+    (["model.type=dinov3", "model.params.model_name=facebook/dinov3-vitl16-pretrain-lvd1689m"],
+     "dinov3-vitl16__ward-euclidean-c55__legion-no_axes-train"),
 ])
 def test_run_name_describes_the_config(overrides, expected):
     assert run_name(load_config(None, overrides)) == expected
@@ -80,6 +88,42 @@ def _config(tmp_path, ready_images, *extra):
         "clustering.cluster_num=2", "clustering.min_variance=0",
         *extra,
     ])
+
+
+def test_switching_model_family_drops_the_params_that_do_not_apply(tmp_path):
+    handcrafted = _write(tmp_path / "hc.yaml", {"model": {"type": "handcrafted", "params": {"efd_harmonics": 5}}})
+
+    assert load_config(None, ["model.type=dinov3"])["model"]["params"] == {}
+    assert load_config(handcrafted, ["model.type=dinov3"])["model"]["params"] == {}
+    with pytest.raises(ValueError, match="not trained here"):
+        load_config(None, ["model.type=dinov3", "model.checkpoint=x.pt"])
+
+
+class _FakeDINOv3:
+    """Stands in for the Hugging Face processor and backbone: the 'CLS
+    token' is the top half's mean per channel, so no weights are downloaded."""
+
+    def __call__(self, images=None, return_tensors=None, **batch):
+        if images is not None:  # the processor
+            pixels = torch.stack([torch.from_numpy(np.asarray(image, np.float32)).permute(2, 0, 1)
+                                  for image in images])
+            return BatchEncoding({"pixel_values": pixels})
+        pooled = batch["pixel_values"][:, :, :128].mean(dim=(2, 3))
+        return SimpleNamespace(last_hidden_state=torch.stack([pooled, pooled * 0], dim=1))
+
+
+def test_dinov3_run_embeds_clusters_and_evaluates(tmp_path, ready_images, monkeypatch):
+    fake = _FakeDINOv3()
+    monkeypatch.setattr(DINOv3, "_load", lambda self: (fake, fake))
+    result = run_experiment(config=_config(tmp_path, ready_images, "model.type=dinov3"))
+
+    assert result["run_id"].startswith("dinov3__ward-euclidean-c2__set-train__")
+    assert result["model_path"] is None  # nothing trained, nothing saved
+    model_dir = result["run_dir"] / "FeatureLearningStep" / "DINOv3"
+    features = pd.read_csv(model_dir / "features.csv")
+    assert features["filename"].tolist() == [f"img{i}.png" for i in range(4)]
+    assert len(features["features"][0].split()) == 3
+    assert (result["run_dir"] / "EvaluationStep" / "metrics.json").exists()
 
 
 def test_run_trains_saves_model_and_logs_everything(tmp_path, ready_images):
@@ -170,3 +214,158 @@ def test_stop_after_features_skips_clustering(tmp_path, ready_images):
     assert not (result["run_dir"] / "ClusteringStep").exists()
     [run] = mlflow.search_runs(experiment_names=["test"], output_format="list")
     assert not any(key.startswith(("eval/", "clustering/")) for key in run.data.metrics)
+
+
+def test_extract_path_trains_on_one_folder_and_clusters_another(tmp_path, ready_images):
+    folder, _ = ready_images
+    test_folder = folder.parent / "test"
+    test_folder.mkdir()
+    for name in ("img0.png", "img1.png", "img2.png"):
+        Image.open(folder / name).transpose(Image.Transpose.FLIP_LEFT_RIGHT).save(test_folder / f"t_{name}")
+
+    result = run_experiment(config=_config(tmp_path, ready_images, f"data.extract_path={test_folder}"))
+
+    assert result["run_id"].startswith("vae-k128_e2__ward-euclidean-c2__set-train-to-test__")
+    model_dir = result["run_dir"] / "FeatureLearningStep" / "VAE"
+    assert pd.read_csv(model_dir / "features_train.csv")["filename"].tolist() == [f"img{i}.png" for i in range(4)]
+    assert result["features_path"] == model_dir / "features.csv"
+    assert result["features"]["filename"].tolist() == ["t_img0.png", "t_img1.png", "t_img2.png"]
+    clusters = pd.read_csv(result["run_dir"] / "ClusteringStep" / "HierarchicalClustering" / "clusters.csv")
+    assert clusters["filename"].tolist() == ["t_img0.png", "t_img1.png", "t_img2.png"]
+    assert result["model_path"].exists()
+
+
+def test_extract_path_without_training_only_reads_that_folder(tmp_path, ready_images):
+    folder, _ = ready_images
+    trained = run_experiment(config=_config(tmp_path, ready_images, "stop_after=features"))
+    test_folder = folder.parent / "test"
+    test_folder.mkdir()
+    Image.open(folder / "img0.png").save(test_folder / "a.png")
+    Image.open(folder / "img1.png").save(test_folder / "b.png")
+    Image.open(folder / "img2.png").save(test_folder / "c.png")
+
+    result = run_experiment(config=_config(
+        tmp_path, ready_images, "training.train=false", f"model.checkpoint={trained['model_path']}",
+        f"data.extract_path={test_folder}"))
+
+    assert "__set-test__" in result["run_id"]
+    assert result["features"]["filename"].tolist() == ["a.png", "b.png", "c.png"]
+
+
+# --------------------------------------------------------------------- #
+# Sweeps
+# --------------------------------------------------------------------- #
+
+def test_sweep_has_one_config_per_combination_model_settings_first(tmp_path):
+    config = load_config(_write(tmp_path / "exp.yaml", {"sweep": {
+        "clustering": {"cluster_num": [20, 30]},  # nested keys work too
+        "model.params.k": [16, 32],
+    }}))
+
+    combinations, skipped = sweep_configs(config)
+
+    assert skipped == []
+    assert [swept for swept, _ in combinations] == [
+        {"model.params.k": 16, "clustering.cluster_num": 20},
+        {"model.params.k": 16, "clustering.cluster_num": 30},
+        {"model.params.k": 32, "clustering.cluster_num": 20},
+        {"model.params.k": 32, "clustering.cluster_num": 30},
+    ]
+    _, last = combinations[-1]
+    assert last["model"]["params"]["k"] == 32 and last["clustering"]["cluster_num"] == 30
+    assert last["sweep"] == {} and config["model"]["params"]["k"] == 128  # the config itself untouched
+
+
+def test_sweep_leaves_out_combinations_that_cannot_run():
+    config = load_config(None, [
+        "sweep={clustering.method: [ward, average, auto], clustering.metric: [euclidean, cosine]}"])
+
+    combinations, skipped = sweep_configs(config)
+
+    assert [(swept["clustering.method"], swept["clustering.metric"]) for swept, _ in combinations] == [
+        ("ward", "euclidean"), ("average", "euclidean"), ("average", "cosine"), ("auto", "euclidean")]
+    assert [why.split(" ")[0] for _, why in skipped] == ["method", "same"]  # ward+cosine, auto+cosine
+
+
+def test_impossible_clustering_settings_are_rejected():
+    with pytest.raises(ValueError, match="needs metric euclidean"):
+        load_config(None, ["clustering.metric=cosine"])  # default method: ward
+    with pytest.raises(ValueError, match="clustering.method"):
+        load_config(None, ["clustering.method=wardd"])
+    with pytest.raises(ValueError, match="No combination"):
+        load_config(None, ["sweep={clustering.metric: [cosine, cityblock]}"])
+    # The sweep may fix the base config's clustering.
+    load_config(None, ["clustering.metric=cosine", "sweep={clustering.method: [average, single]}"])
+
+
+def test_bad_sweeps_are_rejected(tmp_path):
+    with pytest.raises(ValueError, match="clusterng"):
+        load_config(None, ["sweep={clusterng.cluster_num: [20, 30]}"])
+    with pytest.raises(ValueError, match="non-empty list"):
+        load_config(None, ["sweep={clustering.cluster_num: 20}"])
+    with pytest.raises(ValueError, match="same setting"):
+        load_config(None, ["sweep={model.params.k: [16, 32]}", "model.params.k=8"])
+    with pytest.raises(ValueError, match="would not change anything"):
+        load_config(None, ["sweep={clustering.cluster_num: [20, 30]}", "stop_after=features"])
+
+
+def test_sweep_trains_once_per_model_and_reclusters_its_features(tmp_path, ready_images):
+    config = _config(tmp_path, ready_images,
+                     "sweep={training.lr: [1.0e-3, 1.0e-4], clustering.method: [ward, average]}")
+
+    rows = run_sweep(config=config)
+
+    assert [row["status"] for row in rows] == ["ok"] * 4
+    runs = [tmp_path / "default_output" / row["run_id"] for row in rows]
+    trained = [run for run in runs if (run / "FeatureLearningStep").exists()]
+    assert trained == [runs[0], runs[2]]  # one model per learning rate
+    # lr is not in the generated name, so the sweep adds it.
+    assert rows[1]["run_id"].startswith("vae-k128_e2__average-euclidean-c2__set-train__lr0.001__")
+    reused = yaml.safe_load((runs[1] / "config.yaml").read_text())
+    assert reused["data"]["features"] == str(runs[0] / "FeatureLearningStep" / "VAE" / "features.csv")
+    for run in runs:
+        assert (run / "EvaluationStep" / "metrics.json").exists()
+
+    [sweep_dir] = (tmp_path / "default_output").glob("sweep-*")
+    summary = pd.read_csv(sweep_dir / "summary.csv")
+    assert summary["clustering.method"].tolist() == ["ward", "average"] * 2
+    assert "silhouette" in summary.columns
+    mlflow_runs = mlflow.search_runs(experiment_names=["test"], output_format="list")
+    assert len(mlflow_runs) == 4
+    assert {run.data.tags["sweep"] for run in mlflow_runs} == {sweep_dir.name}
+
+
+def test_failed_features_run_skips_its_reclusterings(tmp_path, ready_images, monkeypatch):
+    import pipeline.experiment as experiment
+    real_build_model = experiment.build_model
+
+    def build_model(config, run_id, device):
+        if config["model"]["params"]["k"] == 16:
+            raise RuntimeError("out of memory")
+        return real_build_model(config, run_id, device)
+
+    monkeypatch.setattr(experiment, "build_model", build_model)
+    config = _config(tmp_path, ready_images,
+                     "sweep={model.params.k: [16, 8], clustering.method: [ward, average]}")
+
+    rows = run_sweep(config=config)
+
+    assert [row["status"].split(":")[0] for row in rows] == ["failed", "skipped", "ok", "ok"]
+
+
+def test_feature_importance_ranks_the_separating_dimension_first():
+    rng = np.random.default_rng(0)
+    labels = np.repeat([1, 2], 50)
+    separating = labels * 5.0 + rng.normal(0, 0.1, 100)
+    noise = rng.normal(0, 1, 100)
+    table = feature_importance(np.column_stack([noise, separating]), labels, ["noise", "size"])
+
+    assert table["feature"].tolist() == ["size", "noise"]
+    assert table["eta2"][0] > 0.99 and table["eta2"][1] < 0.1
+
+
+def test_feature_names_from_feature_columns_txt(tmp_path):
+    csv = tmp_path / "features.csv"
+    (tmp_path / "feature_columns.txt").write_text("height\nwidth\n")
+    assert feature_names(csv, 2) == ["height", "width"]
+    assert feature_names(csv, 3) == ["dim_0", "dim_1", "dim_2"]  # length mismatch -> generic names

@@ -86,6 +86,7 @@ BackgroundEraser(
     batch_size=256,              # model.predict's inference batch size
     box_margin=0.15,             # 'detection' only: see _expand_box below
     mask_margin=0.10,            # 'segmentation' only: see _dilate_radius below
+    crop_size=None,              # None = crop fitted to the shard; a number = that fraction of the scan width
     debug_images=10,             # debug overlays for the first N images; 0 disables
     record_axes=False,           # also record the coordinate system (see "Recording the axes" below)
     num_workers=None,            # threads clearing a batch in parallel; None = min(16, CPUs), 0/1 = serial
@@ -94,6 +95,16 @@ BackgroundEraser(
     **kwargs,                   # e.g. device='cuda'/'cpu'
 )
 ```
+
+`crop_size`: by default the square crop is fitted to each shard, so every
+shard fills its image and, after `Normalizer` resizes it, its real size is
+lost. With a number, the square's side is that fraction of the scan's width
+instead (`0.5` = half the page width), still centered on the shard: every
+crop covers the same part of the page, so the shards keep their sizes
+relative to each other (as long as the scans have the same width/DPI). A
+shard larger than the square is cut off at the square's edges; those images
+are collected in `eraser.clipped` and logged like `no_shard` (`clipped_count`,
+`clipped.txt`).
 
 `batch_size` controls GPU memory use during detection - lower it if
 `model.predict` raises CUDA out-of-memory errors; it doesn't affect how many

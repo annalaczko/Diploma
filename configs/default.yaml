@@ -12,12 +12,17 @@
 experiment: pottery          # MLflow experiment the run is logged under
 name: null                   # run name; null = generated from the config (model, params, clustering, data)
 stop_after: null             # null = whole run | preprocessing (needs data.source: raw) | features (no clustering/evaluation)
+sweep: {}                    # settings to try, e.g. {model.params.k: [16, 32], clustering.cluster_num: [20, 30]}:
+                             # one run per combination; the model is trained once per model/training combination
 
 data:
   source: preprocessed       # preprocessed: use ready images from preprocessed_path | raw: preprocess raw_path from scratch
   preprocessed_path: data/processed/legion/no_axes/train
   raw_path: data/legion_raw
   labels: data/ocr_data.csv  # ground truth for evaluation (columns ID, TypeRev); null = silhouette only
+  extract_path: null         # ready images to extract features from (and cluster/evaluate), e.g. .../test;
+                             # the model still trains on preprocessed_path (or the raw images); null = the same images
+  features: null             # features.csv of an earlier run: only cluster and evaluate these (no preprocessing or model)
 
 preprocessing:               # only used when data.source is raw
   mode: memory               # memory | disk
@@ -28,7 +33,7 @@ preprocessing:               # only used when data.source is raw
     - Repair: {contrast_factor: 5, dilate_kernel_size: 1, dilate_iterations: 1, skeletonize: false, output_thickness: 2, debug_images: 0}
 
 model:
-  type: vae                  # vae | simclr | byol | handcrafted (measured from the Vectorizer's SVGs, nothing trained)
+  type: vae                  # vae | simclr | byol | handcrafted (measured from the Vectorizer's SVGs) | dinov3 (frozen pretrained backbone); the last two train nothing
   params: {f: 4, n: 3, s: 1, k: 128}   # constructor arguments, e.g. beta_max / recon_loss for vae, tau for byol
                                        # (only used with type vae; another type starts from its own defaults)
   checkpoint: null           # .pt to start from: fine-tuned if training.train, otherwise only used to extract features
@@ -47,3 +52,5 @@ clustering:
   cluster_num: 55
   standardize: true          # z-score every feature dimension before clustering
   min_variance: 1.0e-3       # with standardize: drop dimensions whose variance is below this
+  feature_importance: 10     # print the N dimensions that separate the clusters best at the end of the run
+                             # (eta2; the whole list: <run>/ClusteringStep/HierarchicalClustering/feature_importance.csv); 0 = off

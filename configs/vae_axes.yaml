@@ -1,0 +1,73 @@
+# TEMPLATE: every setting that can be changed, with its default and options.
+# Copy it, delete what you don't change (missing keys fall back to default.yaml),
+# and run:  python run_experiment.py configs/<copy>.yaml   (--dry-run to check)
+#
+# As it stands it is a valid run: raw scans -> BackgroundEraser -> Normalizer
+# -> Repair -> Vectorizer -> VAE -> clustering -> evaluation. Commented-out
+# blocks are alternatives (other steps / models); uncomment what you need.
+# Relative paths are relative to the repository root. Numbers like 1e-4 work.
+
+# ===================================================================== run
+experiment: pottery          # MLflow experiment name
+name: vae_axes              # run name; null = generated (model, params, clustering, data) + date-time
+stop_after: null             # null = whole run | preprocessing (needs data.source: raw) | features (no clustering/evaluation)
+sweep:                       # one run per combination (see pipeline/README.md#sweeps); model/training
+                             # settings: one training each, clustering settings: re-cluster the same features.
+                             # Combinations that cannot run (ward/centroid with a non-euclidean metric, auto with
+                             # a second metric) are left out and listed. A list-valued setting: [[0, 0], [5, 5]].
+  model.params.k: [32]
+  model.params.beta_max: [32]
+  clustering.method: [ward, average, complete, auto]
+  clustering.metric: [euclidean, cosine]
+  clustering.cluster_num: [5, 10, 15, 20, 25, 30]
+
+
+# ===================================================================== data
+data:
+  source: preprocessed                # raw: preprocess raw_path from scratch | preprocessed: use ready images
+  preprocessed_path: data/processed/legion/raster_axes/train   # ready images (used with source: preprocessed)
+  extract_path: data/processed/legion/raster_axes/test   # Features, clustering and evaluation come
+                             # from these images; the VAE trains on preprocessed_path (its features: features_train.csv)
+  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
+  features: null             # features.csv of an earlier run (data/pipeline/<run id>/FeatureLearningStep/<Model>/features.csv):
+                             # only cluster and evaluate these; preprocessing, model and training are not used
+
+model:
+  type: vae                  # vae | simclr | byol | handcrafted | dinov3 (handcrafted, dinov3: nothing trained, see below)
+  params:                    # constructor arguments of the chosen model
+    f: 4                     # channel-width exponent: block i has 2**(f+i) channels
+    n: 3                     # convolution kernel size
+    s: 1                     # base stride (f/n/s other than 4/3/1 need the VAE flatten size recomputed)
+    k: 32                    # latent / feature vector size (class default 128)
+    # vae only:
+    recon_loss: bce_dice          # bce | dice | iou | bce_dice
+    beta_max: 32             # KL weight on the flat stage of each beta cycle; 1 = plain VAE (class default 1)
+    # simclr only:
+    # projection_dim: 64     # projection head output size (used by the loss only)
+    # byol only:
+    # hidden_dim: 256        # projector / predictor hidden size
+    # projection_dim: 64
+    # tau: 0.99              # target network EMA rate
+    # handcrafted only - measures the profile drawings (cm, in the vessel's coordinate system) instead of
+    # learning; needs the Vectorizer with save_svg: true in this run, or ready images (data.preprocessed_path)
+    # whose folder or parent has _svg/ and extracted_metadata.csv. Ignores training; no checkpoint.
+    # features: [position, size, axis_distance, thickness, fourier]   # feature groups to compute
+    # efd_harmonics: 10      # elliptic Fourier harmonics of the section outline (4 numbers each)
+  checkpoint: null           # .pt (state_dict) to start from: fine-tuned if training.train, else only used to extract features
+
+training:                    # arguments of the model's run() / train_model() (ignored by handcrafted; dinov3 uses only batch_size)
+  train: true                # false = only extract features (needs model.checkpoint)
+  epochs: 100                # maximum epochs (early stopping may end sooner)
+  lr: 1.0e-4                 # learning rate
+  batch_size: 128            # training and extraction batch size
+  early_stopping_patience: 15       # stop after this many epochs without improvement of the smoothed loss
+  early_stopping_min_delta: 0.0     # minimum improvement that counts
+  early_stopping_smoothing_window: 10   # epochs in the moving average early stopping watches
+  # vae only:
+  lr_scheduler_factor: 0.5   # multiply the lr by this when the loss plateaus
+  lr_scheduler_patience: 5   # plateau length (epochs) before reducing the lr
+  min_lr: 1.0e-8             # lower bound for the lr
+  # beta_max: 32             # overrides model.params.beta_max for this run
+  # simclr only:
+  # temperature: 0.5         # NT-Xent temperature
+

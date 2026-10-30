@@ -1,0 +1,75 @@
+# TEMPLATE: every setting that can be changed, with its default and options.
+# Copy it, delete what you don't change (missing keys fall back to default.yaml),
+# and run:  python run_experiment.py configs/<copy>.yaml   (--dry-run to check)
+#
+# As it stands it is a valid run: raw scans -> BackgroundEraser -> Normalizer
+# -> Repair -> Vectorizer -> VAE -> clustering -> evaluation. Commented-out
+# blocks are alternatives (other steps / models); uncomment what you need.
+# Relative paths are relative to the repository root. Numbers like 1e-4 work.
+
+# ===================================================================== run
+experiment: prep          # MLflow experiment name
+name: raster                   # run name; null = generated (model, params, clustering, data) + date-time
+stop_after: preprocessing             # null = whole run | preprocessing (needs data.source: raw) | features (no clustering/evaluation)
+
+# ===================================================================== data
+data:
+  source: raw                # raw: preprocess raw_path from scratch | preprocessed: use ready images
+  raw_path: data/legion_raw  # raw scans (searched recursively)
+
+# ===================================================================== preprocessing
+# Only used with data.source: raw. The steps run in this order; each writes to
+# data/pipeline/<run name>/PreprocessingStep/<Step>/ (memory mode: only the last
+# one), with extracted_metadata.csv (per image: scan size, DPI, scale, offset,
+# px/cm and the coordinate system), and _debug/ / _svg/ side outputs. YAML lists become tuples where needed.
+preprocessing:
+  mode: memory               # memory: only the last step's images are saved | disk: every step's are
+  batch_size: 256             # images preprocessed at once in memory mode
+  steps:
+    - BackgroundEraser:
+        mode: segmentation   # segmentation: white out outside the YOLO mask | detection: outside the (padded) box
+        model: models/yolov8n_seg_finetuned.pt   # YOLO weights
+        batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
+        box_margin: 0.01     # detection mode: pad the box by this fraction of its size per side
+        mask_margin: 0.01    # segmentation mode: grow the mask by this fraction of its longer side (class default 0.10)
+        record_axes: true    # also find the coordinate system (into extracted_metadata.csv); false for images without one
+        num_workers: null    # threads clearing a batch in parallel; null = min(16, CPUs), 1 = one at a time
+        half: false          # true: FP16 YOLO (faster on GPU; masks may differ by a pixel from FP32)
+        debug_images: 0      # overlays for the first N images in <output>_debug (class default 10)
+        image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+        # device: cuda       # cuda | cpu (default: cuda if available)
+
+    - Normalizer:
+        target_size: 256     # output side length (px); VAE/SimCLR/BYOL expect 256
+        background_color: [255, 255, 255]   # padding colour (class default [0, 0, 0])
+        image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+
+    - Repair:
+        contrast_factor: 5   # contrast boost before thresholding (class default 10)
+        dilate_kernel_size: 1   # square dilation kernel before skeletonizing (class default 3)
+        dilate_iterations: 1    # (class default 3)
+        skeletonize: false   # true: thin to 1 px and join gaps between endpoints (class default true)
+        max_distance: 15     # skeletonize: join endpoints closer than this (px)
+        line_thickness: 1    # skeletonize: width of the joining lines (px)
+        re_skeletonize: true # skeletonize: thin again after joining
+        min_component_size: 0   # drop connected components smaller than this (px); 0 = off
+        output_thickness: 2  # final line width (px) (class default 1)
+        debug_images: 0      # stage-by-stage strips for the first N images in <output>_debug (class default 10)
+        image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]
+
+    # Augmentation: in memory mode a random view per training epoch (nothing saved);
+    # in disk mode num_augmentations extra copies per image. SimCLR/BYOL ignore it.
+    - Augmentor:
+        num_augmentations: 2
+        keep_original: true
+        output_size: 256
+        crop_scale: [0.8, 1.0]     # random resized crop: area fraction range
+        crop_ratio: [0.9, 1.1]     # random resized crop: aspect ratio range
+        brightness: 0.2
+        contrast: 0.2
+        blur_kernel_size: 5
+        blur_sigma: [0.1, 2.0]
+        blur_probability: 0.5
+        horizontal_flip: true
+        seed: null
+        image_extensions: [.png, .jpg, .jpeg, .tif, .tiff, .bmp]

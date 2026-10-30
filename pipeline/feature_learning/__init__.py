@@ -2,7 +2,8 @@
 feature vectors. Includes a VAE (unsupervised, reconstruction-based) and
 two unsupervised self-supervised baselines - SimCLR (contrastive) and
 BYOL (no negative pairs) - plus a classifier head that can be trained on
-top of a VAE's encoder."""
+top of a VAE's encoder, hand-crafted profile measures, and a frozen
+pretrained DINOv3 backbone."""
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
@@ -11,5 +12,6 @@ from pipeline.feature_learning.vae_classifier import VAEClassifier
 from pipeline.feature_learning.simclr import SimCLR
 from pipeline.feature_learning.byol import BYOL
 from pipeline.feature_learning.handcrafted_features import HandcraftedFeatures
+from pipeline.feature_learning.dinov3 import DINOv3
 
-__all__ = ["FeatureLearningStep", "EarlyStopping", "VAE", "VAEClassifier", "SimCLR", "BYOL", "HandcraftedFeatures"]
+__all__ = ["FeatureLearningStep", "EarlyStopping", "VAE", "VAEClassifier", "SimCLR", "BYOL", "HandcraftedFeatures", "DINOv3"]

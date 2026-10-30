@@ -138,14 +138,25 @@ python run_experiment.py configs/vae_k16_beta32.yaml --dry-run    # resolved con
   e.g. `data/processed/<name>` to be reused as `preprocessed_path`.
 - `stop_after` ends a run early: `preprocessing` (with `data.source: raw`)
   only produces the preprocessed images (run name `prep-<steps>__raw`,
-  e.g. `configs/prep_vector_axes.yaml`); `features` trains/saves the model and
+  e.g. `configs/only_prep/vector_axes.yaml`); `features` trains/saves the model and
   extracts features, without clustering and evaluation. `null` = whole run.
-- `model.type`: `vae`, `simclr`, `byol` or `handcrafted` (measured from
-  the Vectorizer's SVGs, nothing trained; see
+- `model.type`: `vae`, `simclr`, `byol`, `handcrafted` (measured from
+  the Vectorizer's SVGs) or `dinov3` (frozen pretrained DINOv3, the
+  sandbox.ipynb method) - the last two train nothing and take no
+  checkpoint; see
   [`feature_learning/README.md`](feature_learning/README.md)); `model.params` go to its
   constructor. `model.checkpoint` loads a saved state_dict: with
   `training.train: true` it is fine-tuned (saved as a new file), with
   `false` only features are extracted.
+- `data.extract_path` (ready images, e.g. `.../test`) is where features
+  come from, and so what is clustered and evaluated; the model still
+  trains on `preprocessed_path` (or the raw images). The training images'
+  features are kept as `features_train.csv`. Without training
+  (`training.train: false`, handcrafted, dinov3) only `extract_path` is read. The
+  run name's data part reads `legion-no_axes-train-to-test`.
+- `data.features` (a `features.csv` of an earlier run) skips preprocessing
+  and the model: the run only clusters and evaluates those features. Its
+  name takes the model and data part from that run's folder.
 - `clustering.method: auto` picks the linkage by cophenetic correlation;
   `standardize` z-scores the features first, as in the notebook.
 - Evaluation: silhouette on every image, ACC/ARI/NMI on the images with a
@@ -167,15 +178,48 @@ data/pipeline/<run id>/
   PreprocessingStep/<Step>/                    images (memory mode: only the last step's),
                                                extracted_metadata.csv, _debug/, _svg/
   FeatureLearningStep/<Model>/                 model.pt (state_dict), model.yaml (config +
-                                               MLflow run id), features.csv
-  ClusteringStep/HierarchicalClustering/       clusters.csv
+                                               MLflow run id), features.csv (+ features_train.csv
+                                               with data.extract_path)
+  ClusteringStep/HierarchicalClustering/       clusters.csv, feature_importance.csv
   EvaluationStep/                              metrics.json
 ```
 
 Model files are never overwritten (the run id has the date and time) and
 are not stored in MLflow; the run records their path. Relative paths in configs are relative to the repo
 root, and float values like `1e-4` are read as numbers. The logic lives in
-`pipeline/experiment.py` (`load_config`, `run_name`, `run_experiment`).
+`pipeline/experiment.py` (`load_config`, `run_name`, `run_experiment`, `run_sweep`).
+
+### Sweeps
+
+A `sweep` maps settings (dotted or nested keys) to lists of values; the run
+becomes one ordinary run per combination:
+
+```yaml
+sweep:
+  model.params.k: [16, 32]
+  training.lr: [1.0e-3, 1.0e-4]
+  clustering.cluster_num: [20, 30, 55]     # 2 x 2 x 3 = 12 runs, 4 models trained
+```
+
+- The model is trained once per combination of the non-clustering
+  settings. The other combinations of that group only cluster its
+  `features.csv` again (`data.features`), so they take seconds. If the
+  training run fails, its group is skipped; other failures are reported
+  and the sweep goes on.
+- Run names get the swept settings the generated name does not show,
+  e.g. `...__legion-no_axes-train__lr0.001`. Every run has its own folder
+  and MLflow run, tagged `sweep: <sweep id>`.
+- `data/pipeline/sweep-<config name>__<date-time>/` holds `sweep.yaml` (the
+  config) and `summary.csv` (swept settings, run id, status, metrics per
+  run; rewritten after every run). `--dry-run` lists the runs.
+- Combinations that cannot run are left out and listed: `centroid`/`ward`
+  with a metric other than `euclidean`, and `method: auto` with a second
+  metric (auto ignores it, so it would repeat a run). The same clustering
+  settings in a single run are an error (an unknown method or metric too,
+  which `HierarchicalClustering` would quietly replace).
+- A list-valued setting is swept with a list of lists (`[[0, 0], [5, 5]]`).
+  `--set` cannot set a swept setting, and settings the run never gets to
+  (e.g. clustering with `stop_after: features`) cannot be swept.
 
 ## Experiment tracking (MLflow)
 
@@ -194,7 +238,7 @@ What ends up in the run:
 | Pipeline | `input_path`, `mode`, `feature_mode`, step chain, `feature/train/*` | `preprocessing/n_images` (memory mode) | |
 | `BackgroundEraser` | `preprocessing/<step>/*` (its settings) | `n_images`, `no_shard_count`, `no_axes_count` (with `record_axes`) | `preprocessing/<step>/no_shard.txt`, `no_axes.txt`: names of the images without a shard / coordinate system, one per line |
 | Feature learning | `feature/<step>/*` (architecture, e.g. `k`, `recon_loss`), `feature/train/*` (all training arguments) | per epoch: `feature/loss`, `smoothed_loss`, `lr` (+ VAE: `elbo`, `recon`, `kld`, `beta`; `VAEClassifier`: accuracies); `best_epoch`, `stopped_epoch` | `feature/features.csv` (`VAEClassifier`: `training_history.csv`) |
-| Clustering | `clustering/cluster_num`, `method`, `metric` | `n_clusters`, cluster size min/max/mean, `singleton_clusters` (`compare_all`: `best_cophenetic`) | `clustering/clusters.csv` (filename -> cluster), `compare_all.csv` |
+| Clustering | `clustering/cluster_num`, `method`, `metric` | `n_clusters`, cluster size min/max/mean, `singleton_clusters` (`compare_all`: `best_cophenetic`) | `clustering/clusters.csv` (filename -> cluster), `compare_all.csv`, `clustering/feature_importance.csv` (per dimension: eta2 = share of its variance explained by the clusters, ANOVA F; the top `clustering.feature_importance` are also printed at the end of the run) |
 | Evaluation | | `eval/acc`, `ari`, `nmi` or `eval/silhouette` | `eval/per_class_accuracy.csv` |
 
 Image names use the flat `<subfolder>__<file>` form in both modes.

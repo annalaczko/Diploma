@@ -18,7 +18,8 @@ pipeline/feature_learning/
 ├── vae_classifier.py          # VAEClassifier
 ├── simclr.py                  # SimCLR, SimCLREncoder, SimCLRDataset
 ├── byol.py                    # BYOL
-└── handcrafted_features.py    # HandcraftedFeatures: profile measures from the Vectorizer's SVGs (model.type: handcrafted)
+├── handcrafted_features.py    # HandcraftedFeatures: profile measures from the Vectorizer's SVGs (model.type: handcrafted)
+└── dinov3.py                  # DINOv3: pretrained backbone (frozen or fine-tuned), CLS token as features (model.type: dinov3)
 ```
 
 Image loading (path discovery + tensor conversion) is delegated to
@@ -622,3 +623,45 @@ of a Vectorizer with `save_svg: true`, in `input_path` or its parent
 mode, `Pipeline` points it at the saved last preprocessing folder
 (`reads_saved_images`). Only the images in `input_path` are used, so a
 train/ subfolder gives the train split.
+
+## DINOv3 (`dinov3.py`)
+
+A pretrained DINOv3 backbone (Hugging Face `transformers`) as a
+feature extractor, as in the "DINOv3" section of `notebooks/sandbox.ipynb`:
+each image is converted to RGB, prepared by the model's own
+`AutoImageProcessor`, and its feature vector is the CLS token of the last
+hidden state (768 numbers for ViT-B/16). By default (`finetune=False`)
+the backbone is frozen and nothing is trained; it is a baseline for whether generic pretrained features already separate
+the pottery types better than the purpose-built encoders.
+
+```python
+DINOv3(
+    input_path=None,            # folder of preprocessed images (or set_images)
+    model_name="facebook/dinov3-vitb16-pretrain-lvd1689m",   # or -vits16- / -vitl16-
+    finetune=False,             # True: run(mode="train_model") fine-tunes first (skeleton)
+    device=None,                # None = cuda if available
+    output_path=None, name=None, run_id="default_run",
+)
+```
+
+`run(mode="extract_features", batch_size=128)` accepts and ignores the
+other training arguments, so it stands in for a learned model, and writes
+`features.csv` (filename + vector) to its folder. It works in both disk
+and memory mode (same features). `transformers` is imported, and the
+weights loaded, only on the first run.
+
+With `finetune=True`, `run(mode="train_model", epochs=20, lr=1e-5, ...)`
+first calls `finetune_model` (AdamW on the unfrozen parameters,
+`EarlyStopping` on the training loss), then extracts features with the
+fine-tuned weights; with `finetune=False` that mode raises `ValueError`.
+Fine-tuning is still a skeleton: `_setup_finetuning` (what to unfreeze,
+head), `_train_loader` and `_finetune_loss` raise `NotImplementedError`,
+saving `model.pt` is a TODO, and `run_experiment` does not train it yet
+(`dinov3` is still in `MEASURED`).
+
+In configs: `model.type: dinov3`, `model.params: {model_name: ...}`;
+`training` is ignored except `batch_size`, and there is no checkpoint. The
+run name shows the backbone (`dinov3-vitl16__...`) when `model_name` is
+set. The checkpoints are gated: accept the license on the model page and
+run `huggingface-cli login` (or set `HF_TOKEN`) once; afterwards the
+weights come from the local cache.

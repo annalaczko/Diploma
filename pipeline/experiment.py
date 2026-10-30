@@ -21,14 +21,21 @@ which is used everywhere:
       EvaluationStep/metrics.json
     A model file can thus always be traced back to its run, and fed into a
     later run as `model.checkpoint` (to fine-tune it or extract features).
+
+A config with a `sweep` (settings -> lists of values) is run by `run_sweep`:
+one such run per combination, training each model only once - combinations
+that differ only in clustering settings cluster its features.csv again
+(`data.features`). data/pipeline/<sweep id>/summary.csv compares them.
 """
 
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import re
 import subprocess
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -42,7 +49,8 @@ import pipeline.steps.step as step_module
 from pipeline import tracking
 from pipeline.clustering import HierarchicalClustering
 from pipeline.evaluation import EvaluationWithGroundTruth, EvaluationWithNoGroundTruth
-from pipeline.feature_learning import BYOL, HandcraftedFeatures, SimCLR, VAE
+from pipeline.feature_learning import BYOL, DINOv3, HandcraftedFeatures, SimCLR, VAE
+from pipeline.feature_learning.dinov3 import short_model_name
 from pipeline.feature_learning.handcrafted_features import FEATURE_GROUPS
 from pipeline.pipeline import Pipeline
 from pipeline.preprocessing import (
@@ -55,9 +63,10 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "default.yaml"
 # the data in run names (data/processed/legion/no_axes/train -> legion-no_axes-train).
 PROCESSED_ROOT = REPO_ROOT / "data" / "processed"
 
-MODELS = {"vae": VAE, "simclr": SimCLR, "byol": BYOL, "handcrafted": HandcraftedFeatures}
-# Feature steps that measure instead of learn: nothing to train or load.
-MEASURED = {"handcrafted"}
+MODELS = {"vae": VAE, "simclr": SimCLR, "byol": BYOL, "handcrafted": HandcraftedFeatures, "dinov3": DINOv3}
+# Feature steps not trained here - measuring (handcrafted) or a frozen
+# pretrained backbone (dinov3): nothing to train or load.
+MEASURED = {"handcrafted", "dinov3"}
 PREPROCESSING_STEPS = {
     cls.__name__: cls
     for cls in (BackgroundEraser, Normalizer, Repair, Vectorizer, AxisRenderer, Augmentor)
@@ -70,7 +79,10 @@ NAME_KEYS = {
     "simclr": [("k", "k"), ("projection_dim", "proj")],
     "byol": [("k", "k"), ("tau", "tau")],
     "handcrafted": [("efd_harmonics", "efd")],
+    "dinov3": [("model_name", "")],
 }
+# How a parameter's value is written in run names, where not as it is.
+NAME_FORMATS = {"model_name": short_model_name}
 DEFAULT_FNS = (4, 3, 1)  # f, n, s; only named when changed
 # Short step names for preprocessing-only run names.
 STEP_LABELS = {"BackgroundEraser": "be", "Normalizer": "norm",
@@ -126,6 +138,82 @@ def set_dotted(config: dict, key: str, value: Any) -> None:
     node[last] = value
 
 
+def _flatten_sweep(sweep: dict, prefix: str = "") -> dict:
+    """The sweep as {'a.b': [values]}, whether written with dotted keys
+    ('model.params.k: [16, 32]') or nested ones ('model: {params: {k: [16, 32]}}')."""
+    if not isinstance(sweep, dict):
+        raise ValueError(f"sweep must map settings to lists of values, got {sweep!r}")
+    flat = {}
+    for key, value in sweep.items():
+        if isinstance(value, dict):
+            flat.update(_flatten_sweep(value, f"{prefix}{key}."))
+        elif isinstance(value, list) and value:
+            flat[f"{prefix}{key}"] = value
+        else:
+            raise ValueError(f"sweep {prefix}{key} needs a non-empty list of values, got {value!r}"
+                             " (a list-valued setting is a list of lists: [[0, 0], [5, 5]])")
+    if any(key.split(".")[0] == "sweep" for key in flat):
+        raise ValueError("A sweep cannot change the sweep")
+    return flat
+
+
+def sweep_configs(config: dict) -> tuple[list[tuple[dict, dict]], list[tuple[dict, str]]]:
+    """Every combination of the sweep's values, as (the swept settings,
+    the config with them set and without the sweep). Combinations sharing
+    everything but clustering settings come one after the other.
+
+    Combinations that cannot run (e.g. method ward with metric cosine) or
+    would repeat an earlier one (method auto ignores the metric) are left
+    out, and returned as (the swept settings, why) second."""
+    sweep = config.get("sweep") or {}
+    keys = sorted(sweep, key=_is_downstream)  # stable: upstream keys first, as written
+    base = copy.deepcopy(config)
+    base["sweep"] = {}
+    combinations, skipped, seen = [], [], {}
+    for values in itertools.product(*(sweep[key] for key in keys)):
+        swept = dict(zip(keys, values))
+        combination = copy.deepcopy(base)
+        for key, value in swept.items():
+            set_dotted(combination, key, copy.deepcopy(value))
+        problem = clustering_problem(combination["clustering"])
+        if problem:
+            skipped.append((swept, problem))
+            continue
+        effective = {key: value for key, value in swept.items()
+                     if not (key == "clustering.metric" and combination["clustering"]["method"] == "auto")}
+        same = json.dumps(effective, sort_keys=True, default=str)
+        if same in seen:
+            skipped.append((swept, f"same run as {_describe(seen[same])} (method auto ignores the metric)"))
+            continue
+        seen[same] = swept
+        combinations.append((swept, combination))
+    return combinations, skipped
+
+
+def clustering_problem(clustering: dict) -> str | None:
+    """Why these clustering settings cannot run, or None if they can."""
+    method, metric = clustering["method"], clustering["metric"]
+    if method != "auto" and method not in HierarchicalClustering.METHODS:
+        return f"clustering.method must be auto or one of {list(HierarchicalClustering.METHODS)}, got {method!r}"
+    if method != "auto" and metric not in HierarchicalClustering.METRICS:
+        return f"clustering.metric must be one of {list(HierarchicalClustering.METRICS)}, got {metric!r}"
+    if method in HierarchicalClustering.EUCLIDEAN_ONLY and metric != "euclidean":
+        return f"method {method} needs metric euclidean, got {metric}"
+    cluster_num = clustering["cluster_num"]
+    if isinstance(cluster_num, bool) or not isinstance(cluster_num, int) or cluster_num < 1:
+        return f"clustering.cluster_num must be a positive whole number, got {cluster_num!r}"
+    return None
+
+
+def _describe(swept: dict) -> str:
+    return ", ".join(f"{key}={_fmt(value)}" for key, value in swept.items())
+
+
+def _is_downstream(key: str) -> bool:
+    """Settings that need no new features: clustering (and evaluation)."""
+    return key.split(".")[0] == "clustering"
+
+
 def load_config(path=None, overrides: Iterable[str] = (), default=DEFAULT_CONFIG) -> dict:
     """configs/default.yaml, merged with the experiment config at `path`
     (if any), then with `overrides` ('key.sub=value', the value parsed as
@@ -135,7 +223,7 @@ def load_config(path=None, overrides: Iterable[str] = (), default=DEFAULT_CONFIG
     own_type = (own.get("model") or {}).get("type")
     if own_type is not None and _other_kind(defaults["model"]["type"], own_type):
         # The default model.params (f/n/s/k of the shared encoder) don't
-        # apply to a measuring feature step, nor the other way round.
+        # apply to a feature step not trained here, nor the other way round.
         defaults["model"]["params"] = {}
     config = deep_merge(defaults, own)
     parsed = []
@@ -144,25 +232,46 @@ def load_config(path=None, overrides: Iterable[str] = (), default=DEFAULT_CONFIG
         if not sep:
             raise ValueError(f"Overrides look like key.sub=value, got {item!r}")
         parsed.append((key.strip(), _parse_yaml(value)))
-    # A new model.type first: switching between a learned and a measuring
-    # feature step, the params set so far don't apply.
+    # A new model.type first: switching to a model with other params
+    # (learned <-> handcrafted <-> dinov3), the params set so far don't apply.
     for key, value in parsed:
         if key == "model.type" and _other_kind(config["model"]["type"], value):
             config["model"]["params"] = {}
             config["model"]["type"] = value
     for key, value in parsed:
         set_dotted(config, key, value)
-    validate(config, defaults)
+    config["sweep"] = _flatten_sweep(config.get("sweep") or {})
+    for key, _ in parsed:
+        if key.split(".")[0] == "sweep":
+            continue
+        # The same setting, or one containing the other (model.params vs model.params.k).
+        clash = [swept for swept in config["sweep"]
+                 if (swept + ".").startswith(key + ".") or key.startswith(swept + ".")]
+        if clash:
+            raise ValueError(f"--set {key} and sweep {clash[0]} set the same setting")
+    if config["sweep"]:
+        # The base config's own clustering may be one the sweep replaces.
+        validate(config, defaults, check_clustering=False)
+        combinations, skipped = sweep_configs(config)
+        if not combinations:
+            raise ValueError("No combination of the sweep can run: "
+                             + "; ".join(f"{_describe(swept)}: {why}" for swept, why in skipped))
+        for _, combination in combinations:
+            validate(combination, defaults)
+    else:
+        validate(config, defaults)
     return config
 
 
 def _other_kind(old_type, new_type) -> bool:
-    """Whether a model type switch crosses between learned models (sharing
-    the encoder params f/n/s/k) and measuring ones (MEASURED)."""
-    return (old_type in MEASURED) != (new_type in MEASURED)
+    """Whether a model type switch changes which params apply: the learned
+    models share the encoder params f/n/s/k, each MEASURED one has its own."""
+    def family(model_type):
+        return model_type if model_type in MEASURED else "learned"
+    return family(old_type) != family(new_type)
 
 
-def validate(config: dict, defaults: dict) -> None:
+def validate(config: dict, defaults: dict, check_clustering: bool = True) -> None:
     unknown = set(config) - set(defaults)
     for section in CHECKED_SECTIONS:
         unknown |= {f"{section}.{key}" for key in set(config.get(section) or {}) - set(defaults[section])}
@@ -176,10 +285,27 @@ def validate(config: dict, defaults: dict) -> None:
         raise ValueError(f"stop_after must be one of {STOP_AFTER}")
     if config["stop_after"] == "preprocessing" and config["data"]["source"] != "raw":
         raise ValueError("stop_after: preprocessing needs data.source: raw (ready images need no preprocessing)")
+    problem = clustering_problem(config["clustering"]) if check_clustering else None
+    if problem:
+        raise ValueError(problem)
+    features = config["data"].get("features")
+    if features and config["stop_after"]:
+        raise ValueError("data.features only clusters existing features: remove stop_after")
+    if features and config["data"].get("extract_path"):
+        raise ValueError("data.features already are features: remove data.extract_path")
+    if config["data"].get("extract_path") and config["stop_after"] == "preprocessing":
+        raise ValueError("data.extract_path is where features come from: stop_after: preprocessing extracts none")
+    # Sections the run never gets to (or, with data.features, skips).
+    unused = {"preprocessing": ("model", "training", "clustering"), "features": ("clustering",)}.get(
+        config["stop_after"], ("model", "training") if features else ())
+    pointless = [key for key in config.get("sweep") or {} if key.split(".")[0] in unused]
+    if pointless:
+        raise ValueError(f"sweep {pointless} would not change anything: this run does not get to "
+                         f"{'/'.join(unused)}")
     measured = config["model"]["type"] in MEASURED
     if measured and config["model"]["checkpoint"]:
-        raise ValueError(f"model.type: {config['model']['type']} has no weights: remove model.checkpoint")
-    if (config["stop_after"] != "preprocessing" and not measured
+        raise ValueError(f"model.type: {config['model']['type']} is not trained here: remove model.checkpoint")
+    if (config["stop_after"] != "preprocessing" and not measured and not features
             and not config["training"]["train"] and not config["model"]["checkpoint"]):
         raise ValueError("training.train: false only extracts features, so it needs model.checkpoint")
     for entry in config["preprocessing"]["steps"] or []:
@@ -230,13 +356,20 @@ def run_name(config: dict) -> str:
             steps.append(label)
         return _safe(f"prep-{'-'.join(steps)}__{_data_label(config)}")
 
+    clustering = config["clustering"]
+    method = "auto" if clustering["method"] == "auto" else f"{clustering['method']}-{clustering['metric']}"
+    if config["data"].get("features"):
+        model_part, data_part = _features_label(config["data"]["features"])
+        return _safe(f"{model_part}__{method}-c{clustering['cluster_num']}__{data_part or _data_label(config)}")
+
     model = config["model"]
     params = model.get("params") or {}
     parts = [model["type"]]
     fns = tuple(params.get(key, default) for key, default in zip("fns", DEFAULT_FNS))
     if fns != DEFAULT_FNS:
         parts.append("f{}n{}s{}".format(*fns))
-    parts += [f"{label}{_fmt(params[key])}" for key, label in NAME_KEYS[model["type"]] if key in params]
+    parts += [f"{label}{NAME_FORMATS.get(key, _fmt)(params[key])}"
+              for key, label in NAME_KEYS[model["type"]] if key in params]
 
     if model["type"] in MEASURED:
         features = params.get("features")
@@ -251,8 +384,6 @@ def run_name(config: dict) -> str:
     model_part = "-".join(parts) + (f"_{trained}" if trained else "")
     if config["stop_after"] == "features":
         return _safe(f"{model_part}__{_data_label(config)}")
-    clustering = config["clustering"]
-    method = "auto" if clustering["method"] == "auto" else f"{clustering['method']}-{clustering['metric']}"
     return _safe(f"{model_part}__{method}-c{clustering['cluster_num']}__{_data_label(config)}")
 
 
@@ -265,16 +396,45 @@ def _checkpoint_label(checkpoint) -> str:
     return run.split("__")[0]
 
 
+def _features_label(features) -> tuple[str, str | None]:
+    """Model and data part of the name of the run that wrote a features.csv
+    (data/pipeline/<model>__[<clustering>__]<data>__<time>/FeatureLearningStep/<Model>/features.csv);
+    the data part is None if the path does not look like that."""
+    path = Path(features)
+    parts = (path.parents[2].name if len(path.parents) > 2 else path.stem).split("__")
+    return parts[0], parts[-2] if len(parts) >= 3 else None
+
+
 def _data_label(config: dict) -> str:
+    """The images the run uses: 'raw', the preprocessed_path below
+    data/processed (legion/no_axes/train -> legion-no_axes-train), and with
+    data.extract_path the folder features come from: trained on one and
+    extracting from the other, '<train>-to-<extract>' without their common
+    start (legion-no_axes-train-to-test)."""
     data = config["data"]
-    if data["source"] == "raw":
-        return "raw"
-    path = resolve_path(data["preprocessed_path"])
+    extract = data.get("extract_path")
+    if extract and config["stop_after"] != "preprocessing" and not _trains(config):
+        return "-".join(_path_parts(extract))
+    trained = ["raw"] if data["source"] == "raw" else _path_parts(data["preprocessed_path"])
+    if not extract or config["stop_after"] == "preprocessing":
+        return "-".join(trained)
+    extracted = _path_parts(extract)
+    common = 0
+    while common < min(len(trained), len(extracted)) - 1 and trained[common] == extracted[common]:
+        common += 1
+    return "-".join(trained) + "-to-" + "-".join(extracted[common:])
+
+
+def _path_parts(path) -> list[str]:
+    path = resolve_path(path)
     try:
-        parts = path.relative_to(PROCESSED_ROOT).parts
+        return list(path.relative_to(PROCESSED_ROOT).parts)
     except ValueError:
-        parts = path.parts[-2:]
-    return "-".join(parts)
+        return list(path.parts[-2:])
+
+
+def _trains(config: dict) -> bool:
+    return bool(config["training"]["train"]) and config["model"]["type"] not in MEASURED
 
 
 def _fmt(value) -> str:
@@ -306,7 +466,7 @@ def build_preprocessing_steps(config: dict, run_id: str) -> list:
 def build_model(config: dict, run_id: str, device):
     """The feature step: a learned model (on `device`, with `model.checkpoint`
     loaded if given - a plain state_dict, as saved by `save_model` or
-    torch.save), or a measuring one such as HandcraftedFeatures."""
+    torch.save), or one not trained here (HandcraftedFeatures, DINOv3)."""
     model_config = config["model"]
     model = MODELS[model_config["type"]](run_id=run_id, **(model_config.get("params") or {}))
     if not isinstance(model, torch.nn.Module):
@@ -318,14 +478,44 @@ def build_model(config: dict, run_id: str, device):
     return model
 
 
-def standardize(vectors: np.ndarray, min_variance: float) -> np.ndarray:
+def standardize(vectors: np.ndarray, min_variance: float) -> tuple[np.ndarray, np.ndarray]:
     """Z-score every dimension, after dropping the near-constant ones
-    (inactive latent dimensions would otherwise be blown up to unit variance)."""
+    (inactive latent dimensions would otherwise be blown up to unit variance).
+    Returns the standardized vectors and the mask of the kept dimensions."""
     keep = vectors.var(axis=0) > min_variance
     if not keep.any():
         raise ValueError(f"No feature dimension has variance above {min_variance}")
     kept = vectors[:, keep]
-    return (kept - kept.mean(axis=0)) / kept.std(axis=0)
+    return (kept - kept.mean(axis=0)) / kept.std(axis=0), keep
+
+
+def feature_names(features_csv, n_dims: int) -> list[str]:
+    """Names of the feature vector's dimensions: feature_columns.txt next to
+    the features.csv (written by the handcrafted features), else dim_<i>."""
+    columns = Path(features_csv).with_name("feature_columns.txt")
+    if columns.exists():
+        names = columns.read_text(encoding="utf-8").split()
+        if len(names) == n_dims:
+            return names
+    return [f"dim_{i}" for i in range(n_dims)]
+
+
+def feature_importance(vectors: np.ndarray, labels: np.ndarray, names: list[str]) -> pd.DataFrame:
+    """How strongly each dimension separates the clusters, most important
+    first: eta2 = between-cluster / total sum of squares (the share of the
+    dimension's variance the clusters explain, 0..1) and the ANOVA F
+    statistic it gives."""
+    clusters = np.unique(labels)
+    centered = vectors - vectors.mean(axis=0)
+    total = (centered ** 2).sum(axis=0)
+    between = sum((labels == c).sum() * centered[labels == c].mean(axis=0) ** 2 for c in clusters)
+    within = total - between
+    k, n = len(clusters), len(vectors)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        eta2 = np.where(total > 0, between / total, 0.0)
+        f = (between / max(k - 1, 1)) / (within / max(n - k, 1))
+    table = pd.DataFrame({"feature": names, "eta2": eta2, "f_statistic": f})
+    return table.sort_values("eta2", ascending=False, ignore_index=True)
 
 
 def clustering_factory(config: dict, run_id: str, built: dict):
@@ -343,8 +533,10 @@ def clustering_factory(config: dict, run_id: str, built: dict):
             run_id=run_id,
         )
         n_features = step.vectors.shape[1]
+        step.feature_names = feature_names(features_csv, n_features)
         if settings["standardize"]:
-            step.vectors = standardize(step.vectors, settings["min_variance"])
+            step.vectors, keep = standardize(step.vectors, settings["min_variance"])
+            step.feature_names = [name for name, kept in zip(step.feature_names, keep) if kept]
         tracking.log_metrics({"n_dims_used": step.vectors.shape[1], "n_dims_total": n_features},
                              prefix="clustering/")
         if auto:
@@ -413,7 +605,7 @@ def save_model(model, config: dict, run_id: str, mlflow_run_id: str | None) -> P
 
 
 def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: bool = False,
-                   config: dict | None = None) -> dict:
+                   config: dict | None = None, tags: dict | None = None) -> dict:
     """Run one experiment end to end (see the module docstring).
 
     Args:
@@ -421,18 +613,26 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
         overrides: 'key.sub=value' strings applied on top.
         dry_run: only print the resolved config and the run id.
         config: an already loaded config, instead of `config_path`.
+        tags: extra MLflow tags for the run.
 
     `config["stop_after"]` ends the run early: after 'preprocessing'
     (only the preprocessed images are produced) or after 'features' (model
     trained/saved and features extracted, no clustering or evaluation).
+    With `config["data"]["features"]` the run starts late instead: it only
+    clusters and evaluates that features.csv. A config with a `sweep` is
+    run with `run_sweep`.
 
     Returns:
         dict with 'run_id', 'config', and unless `dry_run`: 'run_dir',
         'preprocessed_path' (None unless data.source is raw), 'model_path'
-        (None if not trained), 'features', 'labels', 'metrics' (the last
-        ones None when the run stopped before them).
+        (None if not trained), 'features_path' (the features.csv clustered,
+        None after stop_after: preprocessing), 'features' (None with
+        data.features), 'labels', 'metrics' (the last ones None when the
+        run stopped before them).
     """
     config = config if config is not None else load_config(config_path, overrides)
+    if config.get("sweep"):
+        raise ValueError("The config has a sweep: run it with run_sweep")
     run_id = f"{run_name(config)}__{datetime.now():%Y%m%d-%H%M%S}"
     if dry_run:
         print(yaml.safe_dump(config, sort_keys=False, allow_unicode=True))
@@ -450,31 +650,57 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
     stop_after = config["stop_after"]
     with tracking.start_run(config["experiment"], run_name=run_id) as mlflow_run:
         _log_run_info(config, config_path, run_id, run_dir)
-
-        model = build_model(config, run_id, device) if stop_after != "preprocessing" else None
+        tracking.set_tags(tags or {})
         built = {}
-        steps = build_preprocessing_steps(config, run_id) if raw else []
-        pipe = Pipeline(steps, feature_learning_step=model,
-                        clustering_factory=clustering_factory(config, run_id, built) if stop_after is None else None)
 
-        training = dict(config["training"])
-        train = training.pop("train") and isinstance(model, torch.nn.Module)
-        feature_kwargs = training if train else {"batch_size": training.get("batch_size", 32)}
-        result = pipe.run(
-            str(resolve_path(data["raw_path"] if raw else data["preprocessed_path"])),
-            # Ready images: disk mode reads the folder directly, no copy in RAM.
-            mode=config["preprocessing"]["mode"] if raw else "disk",
-            preprocess_batch_size=config["preprocessing"]["batch_size"],
-            feature_mode="train_model" if train else "extract_features",
-            save_preprocessed="last" if raw else None,
-            **(feature_kwargs if model is not None else {}),
-        )
-        image_steps = [step for step in steps if not isinstance(step, Augmentor)]
-        preprocessed_path = Path(image_steps[-1].output_path) if image_steps else None
-        tracking.set_tags({"preprocessed_output": preprocessed_path})
+        if data.get("features"):
+            # Only clustering and evaluation, on the features of an earlier run.
+            features_path = resolve_path(data["features"])
+            result = {"features": None,
+                      "labels": clustering_factory(config, run_id, built)(str(features_path)).run()}
+            preprocessed_path = model_path = None
+        else:
+            model = build_model(config, run_id, device) if stop_after != "preprocessing" else None
+            training = dict(config["training"])
+            train = training.pop("train") and isinstance(model, torch.nn.Module)
+            extract_path = resolve_path(data.get("extract_path")) if model is not None else None
+            # Training on one folder, features from another: cluster only after the second extraction.
+            separate = extract_path is not None and train
+            if extract_path is not None and not train:
+                raw = False  # nothing to train: only the images to extract from are needed
+            steps = build_preprocessing_steps(config, run_id) if raw else []
+            pipe = Pipeline(steps, feature_learning_step=model,
+                            clustering_factory=clustering_factory(config, run_id, built)
+                            if stop_after is None and not separate else None)
 
-        model_path = save_model(model, config, run_id, mlflow_run.info.run_id) if train else None
-        tracking.set_tags({"model_path": model_path})
+            feature_kwargs = training if train else {"batch_size": training.get("batch_size", 32)}
+            source = data["raw_path"] if raw else (extract_path if not separate and extract_path
+                                                   else data["preprocessed_path"])
+            result = pipe.run(
+                str(resolve_path(source)),
+                # Ready images: disk mode reads the folder directly, no copy in RAM.
+                mode=config["preprocessing"]["mode"] if raw else "disk",
+                preprocess_batch_size=config["preprocessing"]["batch_size"],
+                feature_mode="train_model" if train else "extract_features",
+                save_preprocessed="last" if raw else None,
+                **(feature_kwargs if model is not None else {}),
+            )
+            features_path = Path(model.output_path) / "features.csv" if model is not None else None
+            image_steps = [step for step in steps if not isinstance(step, Augmentor)]
+            preprocessed_path = Path(image_steps[-1].output_path) if image_steps else None
+            tracking.set_tags({"preprocessed_output": preprocessed_path})
+
+            model_path = save_model(model, config, run_id, mlflow_run.info.run_id) if train else None
+            tracking.set_tags({"model_path": model_path})
+
+            if separate:
+                # Keep the training images' features next to the ones clustered.
+                features_path.replace(features_path.with_name("features_train.csv"))
+                model.set_images(None)
+                model.input_path = str(extract_path)
+                result["features"] = model.run(mode="extract_features", batch_size=feature_kwargs["batch_size"])
+                if stop_after is None:
+                    result["labels"] = clustering_factory(config, run_id, built)(str(features_path)).run()
 
         predicted, metrics = result.get("labels"), None
         if stop_after is None:
@@ -484,6 +710,9 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
             clusters_csv = Path(clustering.output_path) / "clusters.csv"
             clusters_csv.parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame({"filename": names, "cluster": predicted}).to_csv(clusters_csv, index=False)
+            importance = feature_importance(clustering.vectors, predicted, clustering.feature_names)
+            importance.to_csv(clusters_csv.with_name("feature_importance.csv"), index=False)
+            tracking.log_table(importance, "clustering/feature_importance.csv")
             # The evaluation steps write nothing themselves; their stage folder holds the metrics.
             evaluation_dir = run_dir / "EvaluationStep"
             evaluation_dir.mkdir(exist_ok=True)
@@ -496,9 +725,121 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
         print(f"  model:   {model_path}")
     if metrics:
         print("  metrics: " + ", ".join(f"{key}={value:.4g}" for key, value in metrics.items()))
+    top = config["clustering"]["feature_importance"]
+    if stop_after is None and top:
+        print(f"  feature importance (eta2, top {min(top, len(importance))} of {len(importance)}; "
+              f"all in {clusters_csv.with_name('feature_importance.csv')}):")
+        for row in importance.head(top).itertuples():
+            print(f"    {row.feature:<30} {row.eta2:.3f}")
     return {"run_id": run_id, "config": config, "run_dir": run_dir, "preprocessed_path": preprocessed_path,
-            "model_path": model_path, "features": result.get("features"), "labels": predicted,
-            "metrics": metrics}
+            "model_path": model_path, "features_path": features_path, "features": result.get("features"),
+            "labels": predicted, "metrics": metrics}
+
+
+def run_sweep(config_path=None, overrides: Iterable[str] = (), dry_run: bool = False,
+              config: dict | None = None) -> list[dict]:
+    """One run (`run_experiment`) per combination of the config's sweep.
+
+    The model is trained once for each combination of the other settings;
+    the combinations that differ from it only in clustering settings then
+    cluster its features.csv again (`data.features`). If that first run
+    fails, they are skipped; any other failed run is reported and the sweep
+    goes on. Every run gets its own folder and MLflow run (tagged with the
+    sweep id) as usual, and data/pipeline/<sweep id>/ gets the config
+    (sweep.yaml) and summary.csv: the swept settings, run id, status and
+    metrics of every run, rewritten after each one.
+
+    Returns:
+        The rows of summary.csv, as dicts.
+    """
+    config = config if config is not None else load_config(config_path, overrides)
+    combinations, skipped = sweep_configs(config)
+    _name_sweep_runs(combinations)
+    label = config["name"] or (Path(config_path).stem if config_path else "default")
+    sweep_id = _safe(f"sweep-{label}__{datetime.now():%Y%m%d-%H%M%S}")
+    groups = [_upstream(swept) for swept, _ in combinations]
+    first_of = {}
+    for index, group in enumerate(groups):
+        first_of.setdefault(group, index)
+
+    print(f"Sweep {sweep_id}: {len(combinations)} runs, {len(first_of)} of them computing features")
+    for index, (swept, combination) in enumerate(combinations):
+        source = "" if first_of[groups[index]] == index else (
+            f"  (features of {combinations[first_of[groups[index]]][1]['name']})")
+        print(f"  {index + 1:>3}. {combination['name']}{source}")
+    if skipped:
+        print(f"Left out {len(skipped)} combinations:")
+        for swept, why in skipped:
+            print(f"       {_describe(swept)}: {why}")
+    if dry_run:
+        return [{**swept, "run_id": combination["name"], "status": "dry run"} for swept, combination in combinations]
+
+    sweep_dir = Path(step_module.DEFAULT_OUTPUT_ROOT) / sweep_id
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    _write_yaml(config, sweep_dir / "sweep.yaml")
+    features_of, rows = {}, []
+    for index, (swept, combination) in enumerate(combinations):
+        group = groups[index]
+        first = first_of[group] == index
+        print(f"\n=== Sweep run {index + 1}/{len(combinations)}: {_describe(swept)}")
+        row = {**swept, "run_id": None}
+        if not first:
+            if features_of.get(group) is None:
+                rows.append({**row, "status": "skipped: its features run failed"})
+                _write_summary(rows, sweep_dir)
+                continue
+            combination["data"]["features"] = str(features_of[group])
+            combination["data"]["extract_path"] = None
+        try:
+            result = run_experiment(config_path, config=combination, tags={"sweep": sweep_id})
+        except Exception as error:  # report it, go on with the other runs
+            traceback.print_exc()
+            rows.append({**row, "status": f"failed: {type(error).__name__}: {error}"})
+        else:
+            if first:
+                features_of[group] = result["features_path"]
+            rows.append({**row, "run_id": result["run_id"], "status": "ok", **(result["metrics"] or {})})
+        _write_summary(rows, sweep_dir)
+
+    print(f"\nSweep {sweep_id} done: {sum(row['status'] == 'ok' for row in rows)}/{len(rows)} runs ok")
+    with pd.option_context("display.width", 200, "display.max_columns", None):
+        print(pd.DataFrame(rows).drop(columns="run_id").to_string(index=False))
+    print(f"  summary: {sweep_dir / 'summary.csv'}")
+    return rows
+
+
+def _upstream(swept: dict) -> str:
+    """What the features depend on: the swept settings other than clustering."""
+    return json.dumps({key: value for key, value in swept.items() if not _is_downstream(key)},
+                      sort_keys=True, default=str)
+
+
+def _name_sweep_runs(combinations: list[tuple[dict, dict]]) -> None:
+    """Set each combination's `name`: its generated run name (or the
+    config's own name), followed by the swept settings that name does not
+    show, e.g. 'vae-k16_e100__ward-euclidean-c30__legion-train__lr0.001'."""
+    swept, first = combinations[0]
+    hidden = []
+    for key, value in swept.items():
+        values = {json.dumps(other[key], sort_keys=True, default=str): other[key] for other, _ in combinations}
+        names = set()
+        for other in values.values():
+            changed = copy.deepcopy(first)
+            set_dotted(changed, key, other)
+            names.add(run_name(changed))
+        if len(names) < len(values):
+            hidden.append(key)
+    for swept, combination in combinations:
+        suffix = "-".join(f"{key.split('.')[-1]}{_fmt(swept[key])}" for key in hidden)
+        combination["name"] = _safe(run_name(combination) + (f"__{suffix}" if suffix else ""))
+    names = [combination["name"] for _, combination in combinations]
+    if len(set(names)) < len(names):  # e.g. clustering.metric, which method: auto ignores
+        for index, (_, combination) in enumerate(combinations):
+            combination["name"] += f"__run{index + 1}"
+
+
+def _write_summary(rows: list[dict], sweep_dir: Path) -> None:
+    pd.DataFrame(rows).to_csv(sweep_dir / "summary.csv", index=False)
 
 
 def _log_run_info(config: dict, config_path, run_id: str, run_dir: Path) -> None:
@@ -514,7 +855,9 @@ def _log_run_info(config: dict, config_path, run_id: str, run_dir: Path) -> None
             "model_type": config["model"]["type"],
             "started_from": config["model"].get("checkpoint"),
         }),
-        "data": resolve_path(config["data"]["raw_path" if config["data"]["source"] == "raw" else "preprocessed_path"]),
+        "data": resolve_path(config["data"].get("features") or config["data"][
+            "raw_path" if config["data"]["source"] == "raw" else "preprocessed_path"]),
+        "extract_data": resolve_path(config["data"].get("extract_path")),
         "git_commit": commit,
         "git_dirty": dirty,
     })

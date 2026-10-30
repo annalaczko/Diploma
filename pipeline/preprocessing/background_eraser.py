@@ -49,6 +49,7 @@ class BackgroundEraser(PreprocessingStep):
                  batch_size=256,
                  box_margin=0.15,
                  mask_margin=0.10,
+                 crop_size=None,
                  debug_images=10,
                  record_axes=False,
                  num_workers=None,
@@ -86,6 +87,15 @@ class BackgroundEraser(PreprocessingStep):
                 of 5% of its size all around (see `_dilate_radius`). Like
                 `box_margin`, this keeps a slightly-too-tight mask from
                 clipping the shard's outline.
+            crop_size: side of the square crop. None (the default) fits
+                it to the shard (the grown mask or padded box), so every
+                shard fills its image. A number makes it that fraction of
+                the scan's width instead (0.5 = half the page width),
+                still centered on the shard: every crop then covers the
+                same part of the page, so after resizing the shards keep
+                their sizes relative to each other. A shard larger than
+                the square is cut off at its edges; such images are
+                listed in `clipped`.
             debug_images: how many of the first processed images also get
                 a debug overlay (original image with the YOLO mask/box, the
                 grown mask and the crop square drawn on it), written to
@@ -112,6 +122,7 @@ class BackgroundEraser(PreprocessingStep):
         self.batch_size = batch_size
         self.box_margin = box_margin
         self.mask_margin = mask_margin
+        self.crop_size = crop_size
         self.debug_images = debug_images
         self.kwargs = kwargs
         self.image_extensions = image_extensions
@@ -122,6 +133,8 @@ class BackgroundEraser(PreprocessingStep):
         # seen in total; reset by `begin_run`, reported by `log_summary`.
         self.no_shard: list[str] = []
         self._n_seen = 0
+        # With a fixed `crop_size`: images whose shard didn't fit the square.
+        self.clipped: list[str] = []
         self.record_axes = record_axes
         self.num_workers = min(16, os.cpu_count() or 1) if num_workers is None else num_workers
         self.half = half
@@ -263,15 +276,19 @@ class BackgroundEraser(PreprocessingStep):
         self._debug_saved = 0
         self.no_shard = []
         self._n_seen = 0
+        self.clipped = []
         self.axes_table = {}
         self.no_axes = []
 
     def failure_lists(self) -> dict[str, list[str]]:
         """Image names skipped or only partly processed, by reason. Each
         entry becomes `<reason>.txt` and `<reason>_count` in MLflow."""
+        lists = {"no_shard": self.no_shard}
         if self.record_axes:
-            return {"no_shard": self.no_shard, "no_axes": self.no_axes}
-        return {"no_shard": self.no_shard}
+            lists["no_axes"] = self.no_axes
+        if self.crop_size is not None:
+            lists["clipped"] = self.clipped
+        return lists
 
     def _make_flat_symlink_dir(self, paths):
         """Symlink every image into a single flat temp directory with
@@ -504,6 +521,11 @@ class BackgroundEraser(PreprocessingStep):
             box_w = x2 - x1
             box_h = y2 - y1
             side = max(box_w, box_h)
+            if self.crop_size is not None:
+                # Fixed fraction of the page width: the same scale for every image.
+                fixed = self.crop_size * w
+                item['clipped'] = fixed < side
+                side = fixed
 
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
@@ -580,6 +602,8 @@ class BackgroundEraser(PreprocessingStep):
         parallel `_clear_one`s."""
         name = self._flatten_output_name(item.get("path", ""))
         self.axes_table[name] = row
+        if item.get('clipped'):
+            self.clipped.append(name)
         if self.record_axes and not has_axes(row):
             self.no_axes.append(name)  # counted at the end (log_summary), names in MLflow
 
