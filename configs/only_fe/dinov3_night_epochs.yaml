@@ -1,0 +1,61 @@
+# DINOv3 fine-tuned with DINO self-distillation (teacher-student, no negatives, no labels) on the TRAIN
+# images, then the teacher's features of the TEST images clustered and evaluated. The same data and
+# settings as dinov3_finetune_PN.yaml (NT-Xent), so the two objectives can be compared.
+# The TypeRev labels exist only for the test images, so training on train keeps them out of training.
+# Gated on Hugging Face: accept the license on the model page and `huggingface-cli login` once.
+# Every option: configs/template.yaml.
+#
+# To use it:
+#   python run_experiment.py configs/only_fe/dinov3_finetune_PN_dino.yaml --dry-run   # check the paths
+#   python run_experiment.py configs/only_fe/dinov3_finetune_PN_dino.yaml
+# Relative paths are relative to the repository root.
+
+# ===================================================================== data
+data:
+  source: preprocessed       # ready images, no preprocessing in this run
+  # TRAIN folder, the model is fine-tuned on these (their features: features_train.csv)
+  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/pagecrop/no_axes/train
+  # TEST folder, features, clustering and evaluation come from these
+  extract_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/pagecrop/no_axes/test_top5
+  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  features: null             # must stay null: with extract_path the features are computed in this run
+
+# ===================================================================== run
+experiment: dinov3-experiments          # MLflow experiment name
+name: NIGHT-EPOCHS-P-N-dino      # run name; null = generated (model, params, clustering, data) + date-time
+stop_after: null             # null = whole run | features (no clustering/evaluation)
+sweep:
+  model.params.unfreeze_blocks: [2,3]
+  training.epochs: [100, 200]
+  clustering.method: [average, ward]
+  clustering.metric: [euclidean, cosine]
+  clustering.cluster_num: [5]
+
+
+# ===================================================================== model
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m   # or -vits16- (smaller), -vitl16- (larger)
+    finetune: true           # train the last blocks (training.train: true) before extracting features
+    finetune_method: dino    # teacher-student self-distillation (nt_xent: dinov3_finetune_PN.yaml)
+    unfreeze_blocks: 2       # last N transformer blocks (+ final norm) trained, the rest stays frozen
+    num_prototypes: 1024     # size of the head output (soft pseudo-classes)
+    teacher_momentum: 0.99  # teacher = m * teacher + (1 - m) * student after every step;
+                             # ~22 steps per epoch here, so the teacher lags ~1/(1-m) = 250 steps (~11 epochs)
+    teacher_temp: 0.04       # low = sharp teacher targets
+    student_temp: 0.1        # higher than teacher_temp
+    center_momentum: 0.9     # moving average of the teacher's logits, subtracted against collapse
+  checkpoint: null           # model.pt of an earlier fine-tuning run: continue it, or with train: false only extract
+
+# ===================================================================== training
+training:                    # arguments of DINOv3.run()
+  train: true                # true = fine-tune on preprocessed_path, then extract from extract_path
+                             # false = only extract from extract_path (needs model.checkpoint)
+  epochs: 200                # maximum epochs (early stopping may end sooner)
+  lr: 3.0e-5                 # AdamW; small, so the pretrained blocks are only adjusted
+  batch_size: 256            # images per step (x2 views); also the extraction batch; lower it on CUDA out-of-memory
+                             # (dino keeps a second copy of the backbone for the teacher)
+  early_stopping_patience: 30       # higher than for nt_xent: the DINO loss often rises in the first epochs
+  early_stopping_min_delta: 0.0     # minimum improvement that counts
+  early_stopping_smoothing_window: 3    # epochs in the moving average early stopping watches

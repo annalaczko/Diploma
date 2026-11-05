@@ -173,25 +173,24 @@ def load_profiles(folder, names=None) -> dict[str, Profile | None]:
     metadata = pd.read_csv(metadata_csv)
     metadata["found"] = metadata["found"].astype(bool)
     rows = {row["filename"]: row for row in metadata.to_dict("records")}
-    profiles = {}
-    for name in tqdm(list(rows if names is None else names), desc="Handcrafted: loading SVGs", unit="image"):
-        row = rows.get(name)
-        if row is None:
-            profiles[name] = None
-            continue
-        svg = svg_dir / f"{Path(name).stem}.svg"
-        if not has_axes(row) or not svg.exists() or not row.get("px_per_cm") > 0:
-            profiles[name] = None
-            continue
-        pieces = remove_axis_remnants(read_svg_paths(svg), row)
-        if not pieces:
-            profiles[name] = None
-            continue
-        # Which side of the axis the profile is drawn on: the majority of the ink.
-        side = 1.0 if np.median(to_vessel_frame(np.vstack(pieces), row, 1.0)[:, 0]) >= 0 else -1.0
-        profiles[name] = Profile(name, pieces, [to_vessel_frame(p, row, side) for p in pieces],
-                                 float(row["px_per_cm"]), row, side)
-    return profiles
+    return {name: _load_profile(name, rows.get(name), svg_dir)
+            for name in tqdm(list(rows if names is None else names), desc="Handcrafted: loading SVGs", unit="image")}
+
+
+def _load_profile(name: str, row: dict | None, svg_dir: Path) -> Profile | None:
+    """One image's Profile, or None (see `load_profiles`)."""
+    if row is None:
+        return None
+    svg = svg_dir / f"{Path(name).stem}.svg"
+    if not has_axes(row) or not svg.exists() or not row.get("px_per_cm") > 0:
+        return None
+    pieces = remove_axis_remnants(read_svg_paths(svg), row)
+    if not pieces:
+        return None
+    # Which side of the axis the profile is drawn on: the majority of the ink.
+    side = 1.0 if np.median(to_vessel_frame(np.vstack(pieces), row, 1.0)[:, 0]) >= 0 else -1.0
+    return Profile(name, pieces, [to_vessel_frame(p, row, side) for p in pieces],
+                   float(row["px_per_cm"]), row, side)
 
 
 # --------------------------------------------------------------------- #

@@ -141,9 +141,10 @@ python run_experiment.py configs/vae_k16_beta32.yaml --dry-run    # resolved con
   e.g. `configs/only_prep/vector_axes.yaml`); `features` trains/saves the model and
   extracts features, without clustering and evaluation. `null` = whole run.
 - `model.type`: `vae`, `simclr`, `byol`, `handcrafted` (measured from
-  the Vectorizer's SVGs) or `dinov3` (frozen pretrained DINOv3, the
-  sandbox.ipynb method) - the last two train nothing and take no
-  checkpoint; see
+  the Vectorizer's SVGs) or `dinov3` (pretrained DINOv3, the
+  sandbox.ipynb method) - handcrafted and a frozen dinov3 train nothing and
+  take no checkpoint; dinov3 with `model.params.finetune: true` trains like
+  the learned models; see
   [`feature_learning/README.md`](feature_learning/README.md)); `model.params` go to its
   constructor. `model.checkpoint` loads a saved state_dict: with
   `training.train: true` it is fine-tuned (saved as a new file), with
@@ -152,7 +153,7 @@ python run_experiment.py configs/vae_k16_beta32.yaml --dry-run    # resolved con
   come from, and so what is clustered and evaluated; the model still
   trains on `preprocessed_path` (or the raw images). The training images'
   features are kept as `features_train.csv`. Without training
-  (`training.train: false`, handcrafted, dinov3) only `extract_path` is read. The
+  (`training.train: false`, handcrafted, frozen dinov3) only `extract_path` is read. The
   run name's data part reads `legion-no_axes-train-to-test`.
 - `data.features` (a `features.csv` of an earlier run) skips preprocessing
   and the model: the run only clusters and evaluates those features. Its

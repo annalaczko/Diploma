@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from PIL import Image
 
 from pipeline.preprocessing.repair import Repair

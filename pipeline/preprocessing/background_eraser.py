@@ -1,44 +1,48 @@
-"""Concrete preprocessing steps. Add new steps here or in new files,
-each inheriting from PreprocessingStep."""
-from pathlib import Path
+"""BackgroundEraser: the first preprocessing step. It finds the sherd
+drawing on a raw scan with a YOLO model, whites out everything else and
+cuts out a square around it.
 
+Per image (`_clear_one`):
+    1. YOLO gives a box (detection mode) or an outline polygon
+       (segmentation mode) of the sherd.
+    2. The region is grown a little (`box_margin` / `mask_margin`), so a
+       slightly too tight detection doesn't cut off thin details.
+    3. Everything outside it is painted white.
+    4. A square is cut out around it: fitted to the sherd, or with
+       `crop_size` a fixed fraction of the page width.
+"""
+
+import os
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import cv2
 import numpy as np
-import os
 import torch
-from ultralytics import YOLO
-from tqdm import tqdm
-
-from pipeline.preprocessing.preprocessing_step import PreprocessingStep
 from PIL import Image
+from tqdm import tqdm
+from ultralytics import YOLO
 
 from pipeline.preprocessing.axes import METADATA_CSV, axis_row, has_axes, write_metadata_csv
 from pipeline.preprocessing.axis_detection import detect_axes
 from pipeline.preprocessing.dataset import ImageRecord, collect_image_paths, flatten_name
+from pipeline.preprocessing.preprocessing_step import PreprocessingStep
+
 
 class BackgroundEraser(PreprocessingStep):
-    """Runs a YOLO segmentation model on each image, whites out everything
-    outside the detected shard mask, and (optionally) crops to a square
-    canvas centered on the detection box.
+    """Removes the background around the sherd and crops a square around it
+    (see the module docstring for the steps).
 
-    It records one metadata row per image in `axes_table` (see
-    `pipeline/preprocessing/axes.py`): the scan's size and resolution (DPI)
-    and where the crop lies on it, so sizes in the final image can be
-    converted back to scan pixels and centimetres. With `record_axes=True`
-    the row also holds the drawing's construction coordinate system -
-    vertical rotation axis + horizontal rim/base line, see
-    `axis_detection.detect_axes` - found on the original scan, in the crop's
-    pixel coordinates (the axes may lie outside the crop). The images stay
-    the same: the axes are not drawn into them. A later step can extend the
-    image and draw them (`Vectorizer(axes="draw")`, `AxisRenderer`), and
-    `Pipeline` writes the final extracted_metadata.csv next to the
-    preprocessed images. Parts of an axis that fall inside the shard mask
-    (e.g. where the rim lies on the rim line) stay in the image as short
-    stubs.
+    It also records one metadata row per image in `axes_table` (see
+    `axes.py`): the scan's size and resolution (DPI) and where the crop lies
+    on the scan, so sizes in the final image can be converted back to
+    centimetres. With `record_axes=True` the row also holds the drawing's
+    coordinate system (the vertical rotation axis and the horizontal rim
+    line, found by `axis_detection.detect_axes`), in the crop's pixel
+    coordinates. The axes are not drawn into the image here; later steps can
+    do that (`Vectorizer(axes="draw")`, `AxisRenderer`).
     """
     def __init__(self,
                  input_path=None,
@@ -339,11 +343,7 @@ class BackgroundEraser(PreprocessingStep):
             detected mask, or that raised during processing, are skipped
             and logged instead of raising.
         """
-        try:
-            model_results = self._predict(tmp_dir, stream=True)
-        except Exception as e:
-            print(f"Error when calling model.predict: {e}")
-            raise
+        model_results = self._predict(tmp_dir, stream=True)
 
         results_formatted = []
         failed_paths = []
@@ -656,26 +656,9 @@ class BackgroundEraser(PreprocessingStep):
 
     @staticmethod
     def _expand_box(box, image_width, image_height, margin):
-        """Pad a `(x1, y1, x2, y2)` box outward by `margin` (a fraction of
-        its own width/height) on every side, then clamp to the image
-        bounds so the result never runs off-image.
-
-        E.g. `margin=0.15` grows the box by 15% of its width on the left
-        and again on the right (30% wider overall), and the same on
-        top/bottom - a small safety buffer around a YOLO detection, which
-        is often drawn tight against the shard's visible edge and can
-        otherwise clip a thin protruding detail (a handle, spout, ...).
-
-        Args:
-            box: `(x1, y1, x2, y2)` in pixel coordinates.
-            image_width, image_height: clamp bounds - the padded box
-                never extends past `[0, image_width]` x `[0, image_height]`.
-            margin: fraction of the box's width/height to pad outward on
-                each side.
-
-        Returns:
-            The padded, clamped `(x1, y1, x2, y2)` as a float32 ndarray.
-        """
+        """Grow a `(x1, y1, x2, y2)` box by `margin` times its own
+        width/height on every side (0.15: 15% left and 15% right), clamped
+        to the image. Returns a float32 array."""
         x1, y1, x2, y2 = box
         pad_x = (x2 - x1) * margin
         pad_y = (y2 - y1) * margin
@@ -687,28 +670,10 @@ class BackgroundEraser(PreprocessingStep):
         ], dtype=np.float32)
 
     def _flatten_output_name(self, path) -> str:
-        """Build a unique output filename that encodes `path`'s ancestor
-        directory names (relative to `self.input_path`), instead of just
-        its bare basename.
-
-        `output_dir` is a single flat directory, but `self.input_path` is
-        often a tree of subfolders (e.g. one per survey/album) that reuse
-        the same simple, sequential filenames (`001.jpg`, `002.jpg`, ...)
-        independently of each other. Saving under the bare basename would
-        make images from different subfolders silently overwrite one
-        another whenever their names collide - keeping the parent folder
-        names in the output filename instead makes every name unique.
-
-        Args:
-            path: the original (nested) source image path.
-
-        Returns:
-            A flat filename such as `"2012_Survey Gladiatorenschule__006.jpg"`
-            for `<input_path>/2012_Survey Gladiatorenschule/006.jpg`. Falls
-            back to just the basename if `path` isn't actually under
-            `self.input_path` (e.g. `input_path` was a list of paths
-            rather than one common root directory).
-        """
+        """The output file name of a source image: its folders below
+        `input_path` joined with "__" (see `dataset.flatten_name`), so the
+        many `001.jpg`s of different subfolders don't overwrite each other
+        in the flat output folder."""
         return flatten_name(path, self.input_path)
 
 

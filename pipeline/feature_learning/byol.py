@@ -1,36 +1,20 @@
-"""BYOL (Bootstrap Your Own Latent): self-supervised feature learning
-without negative pairs, as a second alternative to the VAE's
-reconstruction-based objective (alongside `pipeline.feature_learning.simclr.SimCLR`).
+"""BYOL (Bootstrap Your Own Latent, Grill et al., 2020): self-supervised
+feature learning without negative pairs.
 
-Like SimCLR, BYOL (Grill et al., "Bootstrap Your Own Latent: A New
-Approach to Self-Supervised Learning", 2020) trains the encoder to relate
-two differently-augmented views of the same image - but unlike SimCLR, it
-never contrasts against *other* images at all. There's no NT-Xent, no
-negative pairs, and therefore no dependence on batch size for the loss to
-have enough negatives to be meaningful (SimCLR's `run()` docstring notes
-this exact limitation) - a real practical advantage on a dataset this
-size, where large batches are impractical.
-
-Instead, BYOL keeps two copies of the network:
+Like SimCLR, BYOL learns from two random views of each image, but it never
+compares an image with other images. So the loss does not need large
+batches, which suits a small dataset. It uses two copies of the network:
   - the "online" network (encoder + projector + predictor), trained by
-    gradient descent as usual.
-  - the "target" network (encoder + projector only, no predictor),
-    *never* trained by gradient descent - its weights are an exponential
-    moving average (EMA) of the online network's weights.
-The online network's predicted projection of one view is trained to
-match the target network's projection of the *other* view (stop-gradient
-on the target side), and vice versa.
+    gradient descent as usual;
+  - the "target" network (encoder + projector), never trained directly:
+    its weights slowly follow the online network's (an exponential moving
+    average, see `tau`).
+The online network learns to predict the target network's output for the
+other view of the same image.
 
-Reuses `pipeline.feature_learning.simclr.SimCLREncoder` (with BatchNorm)
-and `SimCLRDataset` (two augmented views per image) rather than
-duplicating them - BYOL needs both just as much as SimCLR does. If
-anything, BYOL is *more* dependent on BatchNorm than SimCLR: BYOL is the
-paper that first showed removing BatchNorm from this kind of
-architecture collapses training to a trivial constant solution, since
-without negative pairs, BatchNorm's cross-batch normalization is the main
-remaining mechanism stopping the online/target networks from converging
-on "predict the same constant regardless of input" as a trivially
-perfect (and useless) solution.
+It reuses SimCLR's encoder (with BatchNorm) and dataset (two views per
+image). Without negatives, BatchNorm is what stops both networks from
+settling on the useless solution "always output the same vector".
 """
 
 import copy
@@ -45,19 +29,15 @@ from torchvision import transforms
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
-from pipeline.feature_learning.simclr import SimCLREncoder, SimCLRDataset
+from pipeline.feature_learning.simclr import SimCLREncoder
 from pipeline.preprocessing.augmentation import build_augmentation_transform
-from pipeline.preprocessing.dataset import ImageDataset
+from pipeline.preprocessing.dataset import ImageDataset, TwoViewDataset
 
 
 class BYOL(nn.Module, FeatureLearningStep):
-    """Self-supervised feature learner with an online/target network pair
-    and no negative pairs. See the module docstring for the overall idea.
-
-    Once trained, downstream features are taken from the *online
-    encoder's* embedding (`h`) - same convention as `SimCLR` and `VAE`
-    (never from a projection/prediction head, which exist only to shape
-    the training loss).
+    """Self-supervised feature learner (see the module docstring). The
+    features are the online encoder's output `h`; the projector and
+    predictor only serve the loss.
     """
 
     def __init__(
@@ -80,21 +60,14 @@ class BYOL(nn.Module, FeatureLearningStep):
         Args:
             input_path: folder of images to train on / extract features
                 from (searched recursively).
-            f, n, s, k: `SimCLREncoder` architecture hyperparameters -
-                match the VAE's/SimCLR's own values here to keep a fair,
-                architecture-controlled comparison across all three.
-            hidden_dim: hidden layer size of the projector/predictor MLPs.
-            projection_dim: output size of the projector/predictor; a
-                smaller space than `k`, same reasoning as SimCLR's
-                `projection_dim`.
-            tau: EMA momentum for updating the target network's weights
-                from the online network's, each optimizer step:
-                `target = tau * target + (1 - tau) * online`. Close to 1
-                (0.99 here) means the target changes slowly/smoothly,
-                which is what keeps it a stable prediction target for the
-                online network. The original paper ramps this up to 1.0
-                over training via a cosine schedule; a fixed value is a
-                simpler approximation that's fine at this project's scale.
+            f, n, s, k: encoder layout, as in `vae.Encoder` (use the same
+                values as the VAE/SimCLR for a fair comparison).
+            hidden_dim: hidden layer size of the projector/predictor.
+            projection_dim: output size of the projector/predictor.
+            tau: after every step, `target = tau * target + (1 - tau) *
+                online`. Close to 1, the target changes slowly, so it is a
+                stable thing to predict. (The paper raises tau toward 1
+                during training; a fixed value is a simplification.)
         """
         nn.Module.__init__(self)
         # Architecture settings, logged to MLflow with each training run.
@@ -114,8 +87,8 @@ class BYOL(nn.Module, FeatureLearningStep):
         self.online_projector = self._make_mlp(k, hidden_dim, projection_dim)
         self.online_predictor = self._make_mlp(projection_dim, hidden_dim, projection_dim)
 
-        # Target network: an exact copy of the online encoder+projector at
-        # init, updated only via EMA afterward - never by its own gradient.
+        # The target network starts as a copy of the online one and is
+        # afterwards only moved by _update_target_network, not by gradients.
         self.target_encoder = copy.deepcopy(self.online_encoder)
         self.target_projector = copy.deepcopy(self.online_projector)
         for parameter in self.target_encoder.parameters():
@@ -125,11 +98,7 @@ class BYOL(nn.Module, FeatureLearningStep):
 
     @staticmethod
     def _make_mlp(input_dim, hidden_dim, output_dim):
-        """The projector/predictor MLP shape BYOL uses throughout: one
-        hidden layer with BatchNorm (see the module docstring for why
-        BatchNorm matters even more here than in SimCLR) before the
-        output projection.
-        """
+        """The projector/predictor: one hidden layer with BatchNorm."""
         return nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -138,23 +107,15 @@ class BYOL(nn.Module, FeatureLearningStep):
         )
 
     def forward(self, view1, view2):
-        """Computes BYOL's symmetric loss directly from a pair of views -
-        unlike `VAE`/`SimCLR`'s `forward`, which returns an embedding for
-        a single input. BYOL's online-predicts-target computation only
-        makes sense given two views at once, so returning the scalar loss
-        here (instead of, say, just the online embedding) avoids
-        duplicating this logic between `forward` and the training loop.
-
-        Returns:
-            A scalar loss tensor (already averaged over the batch and
-            both prediction directions).
+        """The training loss for a batch of view pairs (unlike VAE/SimCLR,
+        `forward` returns the loss, since it needs both views at once):
+        the online network predicts the target's output for the other view,
+        in both directions, averaged over the batch.
         """
         online_p1 = self.online_predictor(self.online_projector(self.online_encoder(view1)))
         online_p2 = self.online_predictor(self.online_projector(self.online_encoder(view2)))
 
-        # Stop-gradient on the target side: the target network is only
-        # ever updated via EMA (see _update_target_network), never by
-        # backpropagating through these calls.
+        # No gradients through the target network (it is only moved by EMA).
         with torch.no_grad():
             target_z1 = self.target_projector(self.target_encoder(view1))
             target_z2 = self.target_projector(self.target_encoder(view2))
@@ -166,19 +127,13 @@ class BYOL(nn.Module, FeatureLearningStep):
 
     @torch.no_grad()
     def _update_target_network(self):
-        """Push the target network's weights toward the online network's
-        current weights by `tau`. Called once per training step, after
-        the optimizer has updated the online network - never the other
-        way around, and never via gradient descent on the target side.
-        """
-        for online_param, target_param in zip(
-            self.online_encoder.parameters(), self.target_encoder.parameters()
-        ):
-            target_param.data.mul_(self.tau).add_(online_param.data, alpha=1 - self.tau)
-        for online_param, target_param in zip(
-            self.online_projector.parameters(), self.target_projector.parameters()
-        ):
-            target_param.data.mul_(self.tau).add_(online_param.data, alpha=1 - self.tau)
+        """Move the target weights a step toward the online weights:
+        target = tau * target + (1 - tau) * online. Called after every
+        optimizer step."""
+        pairs = [(self.online_encoder, self.target_encoder), (self.online_projector, self.target_projector)]
+        for online, target in pairs:
+            for online_param, target_param in zip(online.parameters(), target.parameters()):
+                target_param.data.mul_(self.tau).add_(online_param.data, alpha=1 - self.tau)
 
     def run(
         self,
@@ -192,39 +147,13 @@ class BYOL(nn.Module, FeatureLearningStep):
         early_stopping_min_delta=0.0,
         early_stopping_smoothing_window=10,
     ) -> pd.DataFrame:
-        """Either train the online/target networks from scratch, or just
-        embed `input_path`'s images with the current (e.g. previously
-        loaded) online encoder weights.
-
-        Args:
-            mode: 'train_model' trains for `epochs` epochs and then
-                extracts features from the trained online encoder;
-                'extract_features' (default) skips training and just runs
-                inference - use this once you already have trained
-                weights loaded.
-            epochs: maximum training epochs, only used when
-                mode='train_model' (may stop earlier via early stopping).
-            lr: Adam learning rate, only used when mode='train_model'.
-            batch_size: batch size for both training and feature
-                extraction. Unlike SimCLR, BYOL has no negative-pair pool,
-                so this doesn't need to be large for the loss itself to
-                make sense - pick it based on memory/throughput, not on
-                needing "enough negatives".
-            view_transform: PIL-to-tensor transform used to generate each
-                of the two augmented views per image; only used when
-                mode='train_model'. See `train_model`'s docstring - same
-                mechanism as `SimCLR.run`'s `view_transform`.
-            early_stopping_patience: stop after this many consecutive
-                epochs with no improvement in the smoothed training loss.
-            early_stopping_min_delta: minimum decrease in smoothed
-                training loss to count as an improvement.
-            early_stopping_smoothing_window: number of most recent epochs
-                averaged together for the early-stopping signal, so a
-                single noisy epoch can't trigger a stop on its own.
+        """mode='train_model': train (see `train_model` for the arguments),
+        then extract features. mode='extract_features' (default): only
+        extract features with the current weights (e.g. a loaded
+        checkpoint); only `batch_size` is used then.
 
         Returns:
-            A DataFrame with one 'filename' and 'features' (`h` as a
-            numpy array) row per image, as produced by `extract_features`.
+            The DataFrame from `extract_features`.
         """
         if mode not in {"extract_features", "train_model"}:
             raise ValueError(
@@ -258,44 +187,26 @@ class BYOL(nn.Module, FeatureLearningStep):
         early_stopping_min_delta=0.0,
         early_stopping_smoothing_window=10,
     ):
-        """Train the online network (encoder+projector+predictor) to
-        predict the target network's projection of the other augmented
-        view, updating the target network via EMA after every step, then
-        extract and return features from the trained online encoder.
-
-        There's no validation split here (this is unsupervised training,
-        not classification), so early stopping instead watches a smoothed
-        moving average of the *training* loss - see `EarlyStopping` - and
-        stops once it's stopped improving for `early_stopping_patience`
-        epochs, restoring the best-epoch weights before returning.
+        """Train the online network, moving the target network after every
+        step, then extract and return the features. Early stopping watches
+        a moving average of the training loss (there is no validation set)
+        and restores the best epoch's weights.
 
         Args:
-            folder: image folder to train on.
-            epochs: maximum number of training epochs (may stop earlier
-                via early stopping).
-            lr: Adam learning rate. Only the *online* network's
-                parameters are optimized - the target network is never
-                touched by the optimizer, only by `_update_target_network`.
-            batch_size: training batch size (see `run`'s note on why this
-                is much less constrained than SimCLR's).
-            view_transform: PIL-to-tensor transform used to generate the
-                two augmented views of each image. If not given, builds
-                one from `build_augmentation_transform()`'s defaults. To
-                reuse an existing, already-tuned `Augmentor`'s exact
-                settings instead, pass its `.transform` composed with
-                `transforms.ToTensor()` - see `SimCLR.train_model`'s
-                docstring for a worked example (identical mechanism here).
-            early_stopping_patience: stop after this many consecutive
-                epochs with no improvement in the smoothed training loss.
-            early_stopping_min_delta: minimum decrease in smoothed
-                training loss to count as an improvement.
-            early_stopping_smoothing_window: number of most recent epochs
-                averaged together for the early-stopping signal, so a
-                single noisy epoch can't trigger a stop on its own.
+            folder: image folder to train on (ignored in the in-memory mode).
+            epochs: maximum number of epochs.
+            lr: Adam learning rate (only the online network is optimized).
+            batch_size: training batch size; no negatives are needed, so
+                choose it for memory and speed.
+            view_transform: PIL -> tensor transform making each view; see
+                `SimCLR.train_model`.
+            early_stopping_patience: stop after this many epochs without
+                improvement of the smoothed loss.
+            early_stopping_min_delta: smallest decrease that counts.
+            early_stopping_smoothing_window: epochs in the moving average.
 
         Returns:
-            The DataFrame from `extract_features` (filenames + latent
-            vectors), run once training is complete.
+            The DataFrame from `extract_features`.
         """
         self._log_training_start(**{k: v for k, v in locals().items() if k not in ("self", "folder")})
         device = next(self.parameters()).device
@@ -310,15 +221,13 @@ class BYOL(nn.Module, FeatureLearningStep):
                 f"Warning: {self.name} makes its own augmented views (view_transform); "
                 "the pipeline's train_transform (Augmentor) is ignored."
             )
-        dataset = SimCLRDataset(self._collect_inputs(folder), view_transform)
+        dataset = TwoViewDataset(self._collect_inputs(folder), view_transform)
         print(f"Dataset size: {len(dataset)}")
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True, drop_last=True,
             num_workers=16, pin_memory=True, persistent_workers=True,
         )
-        # Only the online network is trained by gradient descent - the
-        # target network's weights only ever move via EMA (see
-        # _update_target_network), so it's deliberately excluded here.
+        # Only the online network is optimized (see _update_target_network).
         optimizer = optim.Adam(
             list(self.online_encoder.parameters())
             + list(self.online_projector.parameters())
@@ -369,24 +278,11 @@ class BYOL(nn.Module, FeatureLearningStep):
         return self.extract_features(batch_size=batch_size)
 
     def extract_features(self, batch_size=32) -> pd.DataFrame:
-        """Run the *online* encoder over every image in `self.input_path`
-        in eval mode and collect its embedding (`h`) as that image's
-        feature vector.
-
-        Args:
-            batch_size: inference batch size.
-
-        Returns:
-            A DataFrame with one 'filename' and 'features' (`h` as a
-            numpy array) row per image; also written to
-            `<output_path>/features.csv`. Same shape as
-            `VAE.extract_features`'s/`SimCLR.extract_features`'s output,
-            so it drops straight into the same downstream
-            clustering/evaluation code.
-        """
+        """Encode every image with the online encoder (eval mode) and return
+        its output `h` as the features: a DataFrame with 'filename' and
+        'features', also written to `<output_path>/features.csv`."""
         device = next(self.parameters()).device
-        # target_size=None: this pipeline's Normalizer step already makes
-        # every image the same size, so resizing here would be redundant.
+        # target_size=None: the Normalizer already made all images one size.
         dataset = ImageDataset(self._collect_inputs(), grayscale=True, target_size=None)
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=False,
@@ -416,19 +312,9 @@ class BYOL(nn.Module, FeatureLearningStep):
 
     @staticmethod
     def _byol_loss(pred, target):
-        """BYOL's per-sample loss: the squared error between L2-normalized
-        vectors, `||pred/||pred|| - target/||target|||^2`, which expands
-        to `2 - 2 * cosine_similarity(pred, target)` - 0 when pred and
-        target point in exactly the same direction, up to 4 when they
-        point in opposite directions. `target` is expected to already be
-        detached from the graph (see `forward`'s `torch.no_grad()` block).
-
-        Args:
-            pred: (N, projection_dim) online network's prediction.
-            target: (N, projection_dim) target network's projection.
-
-        Returns:
-            (N,) per-sample loss values (not yet reduced to a scalar).
+        """Per-sample loss: squared distance of the length-normalized
+        vectors, which equals 2 - 2 * cosine_similarity (0 = same
+        direction, 4 = opposite). Returns an (N,) tensor.
         """
         pred = F.normalize(pred, dim=1)
         target = F.normalize(target, dim=1)

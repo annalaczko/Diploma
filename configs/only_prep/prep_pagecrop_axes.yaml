@@ -1,0 +1,55 @@
+# Only preprocessing, crop proportional to the scan (half its width), coordinate system drawn.
+# One of four variants that differ only in the crop and the axes (everything else is the same):
+#   prep_tightcrop.yaml       crop fitted to each shard, no axes
+#   prep_tightcrop_axes.yaml  crop fitted to each shard, axes drawn
+#   prep_pagecrop.yaml        crop = half the scan width (shards keep their relative size), no axes
+#   prep_pagecrop_axes.yaml   crop = half the scan width, axes drawn
+# Each runs on both splits (the sweep), so train and test get exactly the same steps.
+# Run:  python run_experiment.py configs/only_prep/prep_pagecrop_axes.yaml
+# All four:  for c in configs/only_prep/prep_*.yaml; do python run_experiment.py "$c"; done
+# The images land in data/pipeline/PREP-pagecrop05-axes__raw_pathdata-legion_raw_<split>__<time>/PreprocessingStep/AxisRenderer/
+# (the PREP- prefix keeps these folders together at the top of data/pipeline/).
+
+# ===================================================================== run
+experiment: prep             # MLflow experiment name
+name: PREP-pagecrop05-axes   # run name; the sweep adds the split to it
+stop_after: preprocessing    # no model, no clustering
+sweep:                       # one run per split
+  data.raw_path: [data/legion_raw_train, data/legion_raw_test]
+
+# ===================================================================== data
+data:
+  source: raw
+  raw_path: data/legion_raw_train   # set by the sweep: the 5732 train scans and the 439 test scans
+
+# ===================================================================== preprocessing
+preprocessing:
+  mode: memory               # memory: only the last step's images are saved | disk: every step's are
+  batch_size: 256            # images preprocessed at once in memory mode
+  steps:
+    - BackgroundEraser:
+        mode: segmentation
+        model: models/yolov8n_seg_finetuned.pt
+        batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
+        mask_margin: 0.01
+        crop_size: 0.5   # square side = half the scan width, centered on the shard (keeps the relative sizes; larger shards are cut off, listed in MLflow as clipped.txt)
+        record_axes: true    # find the coordinate system (into extracted_metadata.csv); AxisRenderer draws it
+        debug_images: 0
+    - Normalizer:
+        target_size: 256
+        background_color: [255, 255, 255]
+    - Repair:
+        contrast_factor: 5
+        dilate_kernel_size: 1
+        dilate_iterations: 1
+        skeletonize: false
+        output_thickness: 2
+        debug_images: 0
+    # Draws the coordinate system: the image is extended with white so the axes fit (the content
+    # shrinks), then the axes are drawn. Images without axes pass through unchanged.
+    - AxisRenderer:
+        axis_thickness: 2    # width of the drawn axes (px)
+        margin: 0.03         # white space beyond the axis ends (fraction of the image)
+        binarize: true       # after shrinking: darker than threshold -> black, rest white (keeps thin lines visible)
+        threshold: 235
+        antialias: false

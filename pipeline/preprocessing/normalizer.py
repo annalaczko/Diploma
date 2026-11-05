@@ -1,3 +1,5 @@
+"""Normalizer: pads and resizes every image to one square size."""
+
 from pathlib import Path
 
 from PIL import Image
@@ -8,15 +10,13 @@ from pipeline.preprocessing.dataset import ImageRecord, collect_image_paths
 
 
 class Normalizer(PreprocessingStep):
-    """Pad images to a square canvas, resize them to 256x256, and save them.
+    """Make every image the same size: pad it to a square (centered, with
+    `background_color` around it), then resize it to `target_size` x
+    `target_size` (256 by default).
 
-    This gives every downstream step (feature learning, YOLO, ...) images
-    with a consistent size and aspect ratio, without distorting the
-    original content: padding preserves the aspect ratio, only the final
-    resize changes scale.
-
-    Supports a single file, a directory, or a list/tuple of valid image paths.
-    Missing paths are ignored. The output directory is returned by run().
+    Padding instead of stretching keeps the drawing's proportions; only the
+    final resize changes its scale. The feature learners need one fixed
+    input size, so a Normalizer is part of every preprocessing chain.
     """
 
     def __init__(
@@ -42,8 +42,8 @@ class Normalizer(PreprocessingStep):
             background_color: RGB fill color used for the padding added
                 around non-square source images.
             image_extensions: file suffixes treated as input images.
-            rename: currently unused/reserved; output files keep their
-                original filenames regardless of this flag.
+            rename: unused (output files keep their names); kept because
+                it is part of the step's logged settings.
         """
         super().__init__(
             input_path=input_path,
@@ -59,7 +59,8 @@ class Normalizer(PreprocessingStep):
         self.rename = rename
 
     def run(self) -> Path:
-        """Pad each image to a square, resize to 256x256, and save under output_path."""
+        """Disk mode: normalize every image under `input_path` and save it
+        under the same name in `output_path`."""
         output_dir = Path(self.output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -87,12 +88,8 @@ class Normalizer(PreprocessingStep):
         return padded.resize((self.target_size, self.target_size), Image.Resampling.LANCZOS)
 
     def pad_to_square(self, image: Image.Image, fill_color=(0, 0, 0)) -> Image.Image:
-        """Pad the image with a background color to the nearest square size.
-
-        Centers the original image on a new `max(width, height)`-sized
-        canvas filled with `fill_color`, so aspect ratio is preserved
-        (unlike a plain resize to a square, which would stretch it).
-        """
+        """Center the image on a `max(width, height)` square canvas filled
+        with `fill_color`."""
         width, height = image.size
         max_side = max(width, height)
 

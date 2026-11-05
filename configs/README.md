@@ -15,13 +15,16 @@ new config, and delete what you don't change.
 | `vae.yaml` / `vae_axes.yaml` | VAE trained on `legion/raster[_axes]/train`, features of `test` clustered and evaluated (clustering sweep) |
 | `handcrafted.yaml` / `handcrafted_axes.yaml` | hand-crafted profile measures of vectorized images with their `_svg/` (nothing trained; clustering sweep) |
 | `dinov3.yaml` / `dinov3_axes.yaml` | frozen pretrained DINOv3 (the sandbox.ipynb method) on `legion/raster[_axes]/test` (nothing trained; clustering sweep) |
+| `dinov3_finetune.yaml` | DINOv3 fine-tuned self-supervised (NT-Xent, no labels) on `legion/raster/train`, features of `test` clustered and evaluated (clustering sweep) |
 | `only_prep/*.yaml` | preprocessing only (`stop_after: preprocessing`): raster / vector images, with or without the axes |
 
 The three feature methods are chosen with `model.type: vae | handcrafted | dinov3`
 (`simclr` and `byol` also work). Switching `model.type` (also with
 `--set model.type=...`) drops the `model.params` that belong to the other
-kind of model. `handcrafted` and `dinov3` train nothing, so they take no
-`model.checkpoint`; dinov3 only uses `training.batch_size`. DINOv3 needs
+kind of model. `handcrafted` and a frozen `dinov3` train nothing, so they
+take no `model.checkpoint`, and the frozen dinov3 only uses
+`training.batch_size`. With `model.params.finetune: true`, dinov3 trains
+like the learned models (`training.*`, `model.checkpoint`). DINOv3 needs
 `transformers` and a one-off `huggingface-cli login` (the weights are gated).
 
 ## Sweeps

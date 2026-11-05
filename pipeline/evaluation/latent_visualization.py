@@ -1,25 +1,26 @@
-"""Visual checks of a trained VAE's latent space.
+"""Plots for looking at a latent (feature) space, used in the notebooks.
 
     thumbnail_map       - every image drawn at its 2D (t-SNE) position, its
-                          ink tinted by group (cluster or true class), so you
-                          can see which shapes sit next to each other and
-                          where groups blend into one another.
-    cluster_transitions - walks the latent space in a straight line from
-                          one cluster's medoid to the next and decodes
-                          each step, with the closest real image under each
-                          step - shows how one cluster's shape morphs into
-                          the next one's.
+                          ink tinted by group (cluster or true class): which
+                          shapes sit next to each other, where groups blend.
+    cluster_transitions - walks in a straight line from one cluster's
+                          medoid to the next, decodes each step with the
+                          VAE, and shows the closest real image under it:
+                          how one cluster's shape morphs into the next one's.
+    neighbour_paths     - the same with real images only (no decoder
+                          needed, so it works for any features, e.g. DINOv3).
 
-`encode_folder` produces the inputs both need (latent means + small
-thumbnails) from an image folder and a trained `VAE`.
+`encode_folder` produces the inputs (latent means + small thumbnails) from
+an image folder and a trained `VAE`; `load_thumbnails` only the thumbnails.
 """
 
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgb
-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-from pathlib import Path
+from matplotlib.offsetbox import AnnotationBbox, OffsetImage
 from PIL import Image
 from sklearn.manifold import TSNE
 
@@ -52,11 +53,7 @@ def encode_folder(vae, folder, device, batch_size=128, thumb_size=64):
             mus.append(mu.cpu())
     mu = torch.cat(mus).numpy()
 
-    thumbs = np.stack([
-        np.asarray(Image.open(p).convert("L").resize((thumb_size, thumb_size), Image.LANCZOS),
-                   dtype=np.float32) / 255.0
-        for p in dataset.paths
-    ])
+    thumbs = np.stack([_thumbnail(p, thumb_size) for p in dataset.paths])
     return [Path(p).name for p in dataset.paths], mu, thumbs
 
 
@@ -64,11 +61,13 @@ def load_thumbnails(folder, filenames, thumb_size=64):
     """(n, thumb_size, thumb_size) thumbnails in [0, 1] for `filenames`
     (in that order) from `folder` - for features computed elsewhere, e.g.
     a features CSV from a model without a decoder."""
-    return np.stack([
-        np.asarray(Image.open(Path(folder) / f).convert("L").resize((thumb_size, thumb_size), Image.LANCZOS),
-                   dtype=np.float32) / 255.0
-        for f in filenames
-    ])
+    return np.stack([_thumbnail(Path(folder) / f, thumb_size) for f in filenames])
+
+
+def _thumbnail(path, size):
+    """A (size, size) grayscale thumbnail of an image file, values in [0, 1]."""
+    image = Image.open(path).convert("L").resize((size, size), Image.LANCZOS)
+    return np.asarray(image, dtype=np.float32) / 255.0
 
 
 def decode(vae, z, device):

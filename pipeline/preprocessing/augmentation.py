@@ -1,12 +1,15 @@
-"""Data-augmentation preprocessing step: writes randomly perturbed copies
-of each input image (crop+resize, color jitter, blur, flip) to grow a
-small labelled dataset without collecting more real images.
+"""Augmentor: random variations of the images (crop, brightness/contrast,
+blur, mirror), so a model trained on few images overfits less.
+
+In disk mode it writes the variations as extra files; in the in-memory mode
+the Pipeline applies its `transform` on the fly during training instead.
 """
 
 from pathlib import Path
 
+import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -25,13 +28,11 @@ def build_augmentation_transform(
     blur_probability=0.5,
     horizontal_flip=True,
 ):
-    """Build a random crop+resize / color-jitter / blur / flip pipeline.
-
-    Factored out of `Augmentor` so the same augmentation recipe can be
-    reused wherever on-the-fly random views of an image are needed - e.g.
-    `pipeline.feature_learning.simclr.SimCLRDataset` generates its two
-    positive-pair views this way, instead of duplicating the transform
-    definition. See `Augmentor`'s docstring for what each argument means.
+    """The random transform PIL image -> PIL image: random crop resized to
+    `output_size`, brightness/contrast jitter, sometimes a blur, and
+    sometimes a left-right mirror. Also used by SimCLR/BYOL to make their
+    two random views of an image. The arguments are explained in
+    `Augmentor`.
     """
     return transforms.Compose([
         transforms.RandomResizedCrop(output_size, scale=crop_scale, ratio=crop_ratio),
@@ -41,6 +42,108 @@ def build_augmentation_transform(
             p=blur_probability,
         ),
         transforms.RandomHorizontalFlip(p=0.5 if horizontal_flip else 0.0),
+    ])
+
+
+class ThickenLines:
+    """Spreads the dark lines of a white-background drawing with a minimum
+    filter of `size` pixels.
+
+    A class rather than a lambda: DataLoader workers get the transform
+    pickled (Python 3.14 starts them with 'forkserver'), and a lambda
+    defined inside a function cannot be pickled.
+    """
+
+    def __init__(self, size=3):
+        self.size = size
+
+    def __call__(self, image):
+        return image.filter(ImageFilter.MinFilter(self.size))
+
+
+class EraseLineSegments:
+    """Blanks out `min_patches`..`max_patches` small squares centred on line
+    pixels, so pieces of the drawing go missing, as in a broken sherd or an
+    interrupted line. Works on the INVERTED image (lines bright, background
+    0), as used inside `build_line_drawing_augmentation`.
+
+    The centres are picked among the line pixels (brighter than 127), so
+    every patch removes some of the drawing, not just empty background. A
+    patch's side is `min_size`..`max_size` times the drawing's extent (the
+    longer side of its bounding box), so small drawings lose small pieces.
+    Randomness comes from torch, which DataLoader workers seed separately
+    (numpy's global generator would repeat the same patches in every worker).
+    """
+
+    def __init__(self, min_patches=1, max_patches=3, min_size=0.05, max_size=0.15):
+        self.min_patches = min_patches
+        self.max_patches = max_patches
+        self.min_size = min_size
+        self.max_size = max_size
+
+    def __call__(self, image):
+        pixels = torch.from_numpy(np.array(image))
+        line = (pixels > 127).nonzero()  # (row, col) of the line pixels
+        if len(line) == 0:
+            return image
+        side = int((line.max(dim=0).values - line.min(dim=0).values).max()) + 1  # the drawing's extent
+        num_patches = int(torch.randint(self.min_patches, self.max_patches + 1, ()))
+        for _ in range(num_patches):
+            row, col = line[int(torch.randint(len(line), ()))].tolist()
+            half = int(side * (self.min_size + (self.max_size - self.min_size) * float(torch.rand(()))) / 2)
+            pixels[max(row - half, 0):row + half + 1, max(col - half, 0):col + half + 1] = 0
+        return Image.fromarray(pixels.numpy())
+
+
+def build_line_drawing_augmentation(
+    output_size=256,
+    rotation_degrees=5.0,
+    translate=0.08,
+    scale=(0.9, 1.1),
+    elastic_alpha=50.0,
+    elastic_sigma=6.0,
+    elastic_probability=0.5,
+    thicken_probability=0.5,
+    thicken_size=3,
+    erase_probability=0.5,
+):
+    """A random transform PIL image -> PIL image for dark line drawings on a
+    white background, made for self-supervised fine-tuning (DINOv3).
+
+    Unlike `build_augmentation_transform` it doesn't crop (the size of a
+    sherd can tell its type, so the scale changes only a little) and doesn't
+    mirror (the drawings follow a fixed left/right convention). It varies
+    what differs between drawings of the same type, and moves the drawing
+    enough that its exact position and size can't be used to match the two
+    views:
+      - an affine transform: a rotation of at most `rotation_degrees`
+        either way, a shift of at most `translate` times the image size in
+        each direction, and a resize by a factor within `scale`;
+      - sometimes (`elastic_probability`) an elastic distortion, as if
+        drawn by another hand: pixels moved by a smoothed random field,
+        `elastic_alpha` its strength, `elastic_sigma` its smoothness
+        (both in pixels);
+      - sometimes (`thicken_probability`) thicker lines: a minimum filter
+        of `thicken_size` pixels spreads the dark lines. There is no
+        thinning, it would erase the 1-2 pixel lines;
+      - sometimes (`erase_probability`) missing pieces of the lines
+        (`EraseLineSegments`), as in a broken sherd.
+    The emptied corners stay white, the background colour: the geometric
+    steps run on the inverted image (black background, fill 0), because
+    torchvision blends a non-zero fill in with a mask, which leaves grey
+    lines along the transformed image's border. The result is resized to
+    `output_size`.
+    """
+    return transforms.Compose([
+        transforms.RandomApply([ThickenLines(thicken_size)], p=thicken_probability),
+        transforms.Lambda(ImageOps.invert),
+        transforms.RandomAffine(rotation_degrees, translate=(translate, translate), scale=scale,
+                                interpolation=transforms.InterpolationMode.BILINEAR, fill=0),
+        transforms.RandomApply([transforms.ElasticTransform(alpha=elastic_alpha, sigma=elastic_sigma, fill=0)],
+                               p=elastic_probability),
+        transforms.RandomApply([EraseLineSegments()], p=erase_probability),
+        transforms.Lambda(ImageOps.invert),
+        transforms.Resize((output_size, output_size)),
     ])
 
 

@@ -1,37 +1,30 @@
-"""Supervised classifier built on top of a trained VAE's encoder.
-
-See `pipeline.feature_learning.vae.VAE` for the unsupervised counterpart
-whose encoder `VAEClassifier` wraps and (optionally) fine-tunes.
+"""VAEClassifier: a supervised pottery-type classifier on top of a trained
+VAE's encoder. It shows how much type information the VAE's latent space
+holds (with `freeze_encoder=True`, only a small head on top is trained).
 """
 
-import pandas as pd
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from pathlib import Path
-
-from pipeline import tracking
-from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
-from pipeline.feature_learning.early_stopping import EarlyStopping
-from pipeline.preprocessing.dataset import ImageDataset, InMemoryImages, image_entries
-
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
 
+from pipeline import tracking
+from pipeline.feature_learning.early_stopping import EarlyStopping
+from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
+from pipeline.preprocessing.dataset import ImageDataset, InMemoryImages, image_entries
+
 
 class VAEClassifier(nn.Module, FeatureLearningStep):
-    """Supervised classifier built on top of a (typically pretrained) VAE
-    encoder: reuses its conv layers to embed an image into the latent
-    space, then predicts a pottery type label from that embedding with a
-    small MLP head (see `__init__`).
+    """A VAE encoder plus a small MLP head that predicts the pottery type.
 
-    Inherits from both `nn.Module` (for the actual network/training) and
-    `FeatureLearningStep` (so it fits into the same Step/Pipeline
-    interface as the unsupervised approaches, even though its `run()`
-    trains a classifier rather than extracting features).
+    It is a `FeatureLearningStep` so it fits the same Step/Pipeline
+    interface, but its `run()` trains the classifier (no features.csv).
     """
 
     def __init__(
@@ -84,24 +77,18 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         self.labels_path = labels_path
         self.freeze_encoder = freeze_encoder
 
-        # The classifier head takes mu and sigma concatenated, so its input
-        # is twice the encoder's latent dimensionality. Including sigma
-        # (the encoder's per-dimension uncertainty for this image) gives
-        # the head strictly more information than mu alone - at worst it
-        # can learn to ignore it, at best it's a useful signal (e.g. an
-        # unusual/hard-to-encode image tends to have high sigma).
+        # The head gets mu and sigma side by side, so its input is twice the
+        # latent size. sigma (the encoder's uncertainty) can only add
+        # information; the head can learn to ignore it.
         latent_size = self.encoder.fc_mu.out_features * 2
 
         if freeze_encoder:
             for parameter in self.encoder.parameters():
                 parameter.requires_grad = False
 
-        # Two-hidden-layer MLP head, halving the width each layer
-        # (latent_size -> latent_size/2 -> latent_size/4 -> num_classes),
-        # clamped to a minimum of 32 units so this stays sane for small
-        # latent sizes. LayerNorm on the input stabilizes training since
-        # the VAE's latent scale isn't otherwise normalized; Dropout
-        # combats overfitting given the relatively small labelled dataset.
+        # MLP head: latent_size -> /2 -> /4 (at least 32 units) -> classes.
+        # LayerNorm evens out the scale of the latent values, Dropout
+        # fights overfitting on the small labelled set.
         hidden_size_1 = max(latent_size // 2, 32)
         hidden_size_2 = max(hidden_size_1 // 2, 32)
         self.classifier = nn.Sequential(
@@ -116,11 +103,8 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         )
 
     def forward(self, x):
-        """Embed `x` with the VAE encoder and run the classifier head on
-        the concatenation of its mean (`mu`) and log-variance (`sigma`) -
-        deterministic (no sampling), so classification stays reproducible,
-        but now uses everything the encoder outputs instead of just `mu`.
-        Returns raw logits (n, num_classes)."""
+        """Class scores (logits, shape (n, num_classes)) from the encoder's
+        mu and sigma (no random sampling, so the result is reproducible)."""
         mu, sigma = self.encoder(x)
         embedding = torch.cat([mu, sigma], dim=1)
         return self.classifier(embedding)
@@ -182,8 +166,6 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             'validation_accuracy_smoothed'.
         """
 
-        # Checking label path correctness and reading labels
-
         self._log_training_start(**{k: v for k, v in locals().items() if k not in ("self", "folder")})
         if not self.labels_path:
             raise ValueError("labels_path is required")
@@ -191,7 +173,8 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         labels_df = pd.read_csv(self.labels_path)
         labels_df["ID"] = labels_df["ID"].astype(str)
 
-        # Checking that the number of classes is correct and encoding labels
+        # Type names -> integer ids. The labels file is expected to hold
+        # exactly the 28 pottery types of the dataset.
         encoder = LabelEncoder()
         labels_df["label"] = encoder.fit_transform(
             labels_df["TypeRev"].astype(str)
@@ -202,17 +185,13 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
                 f"Expected 28 classes, got {len(encoder.classes_)}"
             )
 
-        # Creating a mapping from image IDs to labels and filtering the dataset to include only labelled images
-
         labels_by_id = dict(
             zip(labels_df["ID"], labels_df["label"])
         )
 
-        # Filtering the dataset to include only labelled images
-
-        # Work with indices into `entries` rather than the paths
-        # themselves, so the same code serves image paths on disk and
-        # in-memory images (see `set_images`).
+        # Keep only the labelled images (looked up by file name without
+        # extension). Indices into `entries` work the same for paths on
+        # disk and for in-memory images (see `set_images`).
         entries, names = image_entries(self._collect_inputs())
         in_memory = isinstance(entries, InMemoryImages)
         indices = sorted(
@@ -243,8 +222,6 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             len(classes),
         ).to(classifier_device)
 
-
-
         train_idx, val_idx, train_labels, val_labels = train_test_split(
             indices,
             labels,
@@ -267,10 +244,7 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
             "pin_memory": torch.cuda.is_available(),
         }
 
-        # target_size=None: this pipeline's Normalizer step already makes every
-        # image 256x256, so resizing here would just be repeated wasted work
-        # (every image, every epoch); a wrong-sized image will fail loudly when
-        # DataLoader tries to batch it, rather than being silently resized.
+        # target_size=None: the Normalizer already made every image 256x256.
         train_loader = torch.utils.data.DataLoader(
             ImageDataset(train_paths, labels=train_labels, grayscale=True, target_size=None,
                          transform=self.train_transform),
@@ -287,9 +261,8 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
         device = next(self.parameters()).device
 
         if class_weighted_loss:
-            # Inverse-frequency weighting so rare classes contribute as much
-            # to the loss as common ones, computed on the train split only
-            # (val stays untouched so val_acc reflects true performance).
+            # Weight each class inversely to its frequency in the training
+            # split, so rare types count as much as common ones.
             class_weights = compute_class_weight(
                 class_weight="balanced",
                 classes=np.arange(len(classes)),
@@ -386,9 +359,6 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
                 f"val_acc_smoothed={smoothed_val_acc:.4f}"
             )
 
-            # Early stopping runs on the moving average of val_acc rather
-            # than the raw per-epoch value, so a single noisy epoch can't
-            # trigger it while the underlying trend is still improving.
             if should_stop:
                 print(
                     f"Early stopping at epoch {epoch + 1} "
@@ -419,10 +389,9 @@ class VAEClassifier(nn.Module, FeatureLearningStep):
 
     @staticmethod
     def _filter_rare_classes(paths, labels, min_samples_per_class):
-        """Drop samples belonging to classes with fewer than
-        `min_samples_per_class` labelled images, then remap the surviving
-        class ids to a dense 0..N-1 range (required since the classifier's
-        output layer size and CrossEntropyLoss both assume contiguous ids).
+        """Drop the classes with fewer than `min_samples_per_class` images,
+        then renumber the remaining classes 0..N-1 (the output layer and
+        CrossEntropyLoss need consecutive ids).
 
         Args:
             paths: one entry per sample (image paths, or indices into them).

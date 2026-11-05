@@ -64,8 +64,10 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "default.yaml"
 PROCESSED_ROOT = REPO_ROOT / "data" / "processed"
 
 MODELS = {"vae": VAE, "simclr": SimCLR, "byol": BYOL, "handcrafted": HandcraftedFeatures, "dinov3": DINOv3}
-# Feature steps not trained here - measuring (handcrafted) or a frozen
-# pretrained backbone (dinov3): nothing to train or load.
+# Feature steps with their own params, not the learned models' shared
+# encoder ones, and not trained here - measuring (handcrafted) or a frozen
+# pretrained backbone (dinov3) - except dinov3 with `finetune: true`, which
+# trains like a learned model (see `_learned`).
 MEASURED = {"handcrafted", "dinov3"}
 PREPROCESSING_STEPS = {
     cls.__name__: cls
@@ -79,7 +81,7 @@ NAME_KEYS = {
     "simclr": [("k", "k"), ("projection_dim", "proj")],
     "byol": [("k", "k"), ("tau", "tau")],
     "handcrafted": [("efd_harmonics", "efd")],
-    "dinov3": [("model_name", "")],
+    "dinov3": [("model_name", ""), ("finetune_method", ""), ("unfreeze_blocks", "u")],
 }
 # How a parameter's value is written in run names, where not as it is.
 NAME_FORMATS = {"model_name": short_model_name}
@@ -302,7 +304,7 @@ def validate(config: dict, defaults: dict, check_clustering: bool = True) -> Non
     if pointless:
         raise ValueError(f"sweep {pointless} would not change anything: this run does not get to "
                          f"{'/'.join(unused)}")
-    measured = config["model"]["type"] in MEASURED
+    measured = not _learned(config["model"])
     if measured and config["model"]["checkpoint"]:
         raise ValueError(f"model.type: {config['model']['type']} is not trained here: remove model.checkpoint")
     if (config["stop_after"] != "preprocessing" and not measured and not features
@@ -371,7 +373,7 @@ def run_name(config: dict) -> str:
     parts += [f"{label}{NAME_FORMATS.get(key, _fmt)(params[key])}"
               for key, label in NAME_KEYS[model["type"]] if key in params]
 
-    if model["type"] in MEASURED:
+    if not _learned(model):
         features = params.get("features")
         if features is not None and tuple(features) != tuple(FEATURE_GROUPS):
             parts.append("-".join(features))
@@ -433,8 +435,15 @@ def _path_parts(path) -> list[str]:
         return list(path.parts[-2:])
 
 
+def _learned(model_config: dict) -> bool:
+    """Whether the feature step is trained (or loaded from a checkpoint)
+    here: the learned models, and DINOv3 with `finetune: true`."""
+    return (model_config["type"] not in MEASURED
+            or bool((model_config.get("params") or {}).get("finetune")))
+
+
 def _trains(config: dict) -> bool:
-    return bool(config["training"]["train"]) and config["model"]["type"] not in MEASURED
+    return bool(config["training"]["train"]) and _learned(config["model"])
 
 
 def _fmt(value) -> str:
@@ -466,12 +475,15 @@ def build_preprocessing_steps(config: dict, run_id: str) -> list:
 def build_model(config: dict, run_id: str, device):
     """The feature step: a learned model (on `device`, with `model.checkpoint`
     loaded if given - a plain state_dict, as saved by `save_model` or
-    torch.save), or one not trained here (HandcraftedFeatures, DINOv3)."""
+    torch.save), or one not trained here (HandcraftedFeatures, frozen
+    DINOv3). A fine-tuned DINOv3 is not an nn.Module (it picks its device
+    itself) but has state_dict/load_state_dict for its trained parts."""
     model_config = config["model"]
     model = MODELS[model_config["type"]](run_id=run_id, **(model_config.get("params") or {}))
-    if not isinstance(model, torch.nn.Module):
+    if not _learned(model_config):
         return model
-    model = model.to(device)
+    if isinstance(model, torch.nn.Module):
+        model = model.to(device)
     if model_config.get("checkpoint"):
         state = torch.load(resolve_path(model_config["checkpoint"]), map_location=device, weights_only=True)
         model.load_state_dict(state)
@@ -651,8 +663,11 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
     with tracking.start_run(config["experiment"], run_name=run_id) as mlflow_run:
         _log_run_info(config, config_path, run_id, run_dir)
         tracking.set_tags(tags or {})
-        built = {}
+        built = {}  # clustering_factory puts the clustering step here
 
+        # 1. Get cluster labels. Either from the features of an earlier run
+        #    (data.features), or by running preprocessing (raw images only)
+        #    and the feature step through a Pipeline, which then clusters.
         if data.get("features"):
             # Only clustering and evaluation, on the features of an earlier run.
             features_path = resolve_path(data["features"])
@@ -662,7 +677,8 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
         else:
             model = build_model(config, run_id, device) if stop_after != "preprocessing" else None
             training = dict(config["training"])
-            train = training.pop("train") and isinstance(model, torch.nn.Module)
+            training.pop("train")
+            train = model is not None and _trains(config)
             extract_path = resolve_path(data.get("extract_path")) if model is not None else None
             # Training on one folder, features from another: cluster only after the second extraction.
             separate = extract_path is not None and train
@@ -685,6 +701,7 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
                 save_preprocessed="last" if raw else None,
                 **(feature_kwargs if model is not None else {}),
             )
+            # 2. Note where everything went; save the trained model.
             features_path = Path(model.output_path) / "features.csv" if model is not None else None
             image_steps = [step for step in steps if not isinstance(step, Augmentor)]
             preprocessed_path = Path(image_steps[-1].output_path) if image_steps else None
@@ -694,7 +711,9 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
             tracking.set_tags({"model_path": model_path})
 
             if separate:
-                # Keep the training images' features next to the ones clustered.
+                # 3. data.extract_path: extract features from the other folder
+                #    with the trained model, then cluster those. The training
+                #    images' features are kept as features_train.csv.
                 features_path.replace(features_path.with_name("features_train.csv"))
                 model.set_images(None)
                 model.input_path = str(extract_path)
@@ -702,6 +721,8 @@ def run_experiment(config_path=None, overrides: Iterable[str] = (), dry_run: boo
                 if stop_after is None:
                     result["labels"] = clustering_factory(config, run_id, built)(str(features_path)).run()
 
+        # 4. Evaluate the clusters and write clusters.csv, the feature
+        #    importance and metrics.json.
         predicted, metrics = result.get("labels"), None
         if stop_after is None:
             clustering = built["step"]

@@ -1,10 +1,14 @@
-"""Abstract base for feature learning steps."""
+"""Abstract base class of the feature-learning steps.
+
+A feature-learning step turns every preprocessed image into one fixed-length
+vector of numbers (its "features") and writes them to features.csv, which
+the clustering step then reads. The images come either from a folder
+(`input_path`) or, in the in-memory pipeline mode, from `set_images`.
+"""
 
 from abc import abstractmethod
-from typing import Any
-import pandas as pd
 
-import numpy as np
+import pandas as pd
 
 from pipeline import tracking
 from pipeline.preprocessing.dataset import InMemoryImages, collect_image_paths
@@ -12,12 +16,11 @@ from pipeline.steps.step import Step
 
 
 class FeatureLearningStep(Step):
-    """Common contract for feature learning approaches
-    (pretrained models, self-supervised retraining, VAE baseline).
+    """Base class of the feature learners (VAE, SimCLR, BYOL, DINOv3,
+    handcrafted measurements).
 
-    `run` takes preprocessed images and returns a fixed-length
-    feature vector (or matrix of vectors) per input, so that all
-    approaches are directly comparable downstream.
+    `run()` produces one fixed-length feature vector per image, so the
+    approaches can be compared with the same clustering and evaluation.
     """
 
     def __init__(
@@ -38,13 +41,13 @@ class FeatureLearningStep(Step):
             save_results=save_results,
             run_id=run_id,
         )
-        # In-memory pipeline mode (see `set_images`); None = read from input_path.
+        # Set by `set_images` in the in-memory mode; None = read input_path.
         self.images: InMemoryImages | None = None
         self.train_transform = None
 
     def set_images(self, images: InMemoryImages, train_transform=None) -> None:
-        """Use already-preprocessed in-memory images instead of reading
-        `input_path` from disk (see `pipeline.pipeline.Pipeline`).
+        """Use images that are already preprocessed in memory instead of
+        reading `input_path` (see `pipeline.pipeline.Pipeline`).
 
         Args:
             images: the preprocessed images.
@@ -72,8 +75,9 @@ class FeatureLearningStep(Step):
     def run(self) -> pd.DataFrame:
         raise NotImplementedError
 
-    # MLflow logging shared by the training loops (no-ops without an active
-    # run, see pipeline.tracking). Metric names are prefixed 'feature/'.
+    # MLflow logging shared by the training loops. Like everything in
+    # pipeline.tracking, these do nothing without an active MLflow run.
+    # Metric names start with 'feature/'.
 
     def _log_training_start(self, **train_args) -> None:
         """Log the model's configuration (its scalar attributes, e.g. f, n,
@@ -98,11 +102,3 @@ class FeatureLearningStep(Step):
     def _log_features(self, features_csv) -> None:
         """Attach the extracted features.csv to the run."""
         tracking.log_artifact(features_csv, artifact_path="feature")
-
-    @staticmethod
-    def l2_normalize(vectors: np.ndarray) -> np.ndarray:
-        """L2-normalize feature vectors row-wise (required before
-        distance/cosine similarity comparisons)."""
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        norms[norms == 0] = 1
-        return vectors / norms

@@ -1,29 +1,27 @@
-"""Concrete feature learning steps built around a convolutional VAE.
+"""VAE: a variational autoencoder used as an unsupervised feature learner.
 
-    VAE - unsupervised: trains an Encoder/Decoder pair to reconstruct
-    pottery-sherd images, and can extract the encoder's latent means as a
-    feature vector per image.
+How it works, in short:
+    - The Encoder compresses a 256x256 drawing into `k` numbers: the mean
+      (`mu`) and log-variance (`sigma`) of a Gaussian in "latent space".
+    - During training, a random point `z` is drawn from that Gaussian and
+      the Decoder tries to redraw the original image from it.
+    - The loss is reconstruction error + beta * KL divergence. The KL term
+      keeps the latent space smooth, so similar sherds get similar codes.
+    - After training, `mu` of each image is its feature vector, which is
+      what clustering uses.
 
-The supervised counterpart, `VAEClassifier` (which wraps a trained `VAE`'s
-encoder with a classifier head), lives in
-`pipeline.feature_learning.vae_classifier` - a separate file since it's a
-distinct model/training loop that only depends on `VAE` through its
-`encoder` attribute.
-
-Encoder/Decoder are the underlying conv-net architecture; image loading
-(path discovery + tensor conversion) is delegated to
-`pipeline.preprocessing.dataset`, shared with the preprocessing steps.
+`VAEClassifier` (vae_classifier.py) puts a classifier head on a trained
+VAE's encoder.
 """
 
 import math
+from pathlib import Path
 from typing import Literal
-import pandas as pd
 
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from pathlib import Path
-from PIL import ImageOps
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
@@ -109,37 +107,13 @@ class VAE(nn.Module, FeatureLearningStep):
         min_lr=1e-8,
         beta_max=None,
     ) -> pd.DataFrame:
-        """Either train the VAE from scratch, or just embed `input_path`'s
-        images with the current (e.g. previously loaded) weights.
-
-        Args:
-            mode: 'train_model' trains for `epochs` epochs and then
-                extracts features from the trained model; 'extract_features'
-                (default) skips training and just runs inference - use
-                this once you already have trained weights loaded.
-            epochs: maximum training epochs, only used when
-                mode='train_model' (may stop earlier via early stopping).
-            lr: Adam learning rate, only used when mode='train_model'.
-            batch_size: batch size for both training and feature extraction.
-            early_stopping_patience: stop after this many consecutive
-                epochs with no improvement in the smoothed training ELBO.
-            early_stopping_min_delta: minimum decrease in smoothed
-                training ELBO to count as an improvement.
-            early_stopping_smoothing_window: number of most recent epochs
-                averaged together for the early-stopping signal, so a
-                single noisy epoch can't trigger a stop on its own.
-            lr_scheduler_factor: multiplier applied to the learning rate
-                when the ELBO plateaus (ReduceLROnPlateau).
-            lr_scheduler_patience: epochs with no ELBO improvement before
-                the learning rate is reduced.
-            min_lr: lower bound the learning rate is never reduced below.
-            beta_max: KL weight reached on the flat stage of each beta cycle
-                (see `train_model`); 1.0 is the plain VAE, > 1 a beta-VAE.
-                None (default) uses the value given to the constructor.
+        """mode='train_model': train (see `train_model` for the arguments),
+        then extract features. mode='extract_features' (default): only
+        extract features with the current weights (e.g. a loaded
+        checkpoint); only `batch_size` is used then.
 
         Returns:
-            A DataFrame with one 'filename' and 'features' (latent vector)
-            row per image, as produced by `extract_features`.
+            The DataFrame from `extract_features`.
         """
         if mode not in {"extract_features", "train_model"}:
             raise ValueError(
@@ -166,16 +140,16 @@ class VAE(nn.Module, FeatureLearningStep):
         return self.extract_features(batch_size=batch_size)
 
     def forward(self, x):
-        """Encode `x`, sample a latent `z` via the reparameterization 
-        trick (so gradients can flow through the sampling step), and
-        decode it back into a reconstructed image.
+        """Encode `x`, draw a random latent `z` from N(mu, exp(sigma)) and
+        decode it back into an image.
 
         Returns:
-            (x_reconstructed, mu, sigma): the reconstruction plus the
-            encoder's mean and log-variance, both needed by
-            `_loss_function` to compute the KL-divergence term.
+            (x_reconstructed, mu, sigma): the reconstruction and the
+            encoder's mean and log-variance (needed for the KL term).
         """
         mu, sigma = self.encoder(x)
+        # Reparameterization trick: z = mu + noise * std, so the gradient
+        # can flow back through mu and sigma despite the random draw.
         std = torch.exp(0.5 * sigma)
         eps = torch.randn_like(std)
         z = mu + eps * std
@@ -198,82 +172,53 @@ class VAE(nn.Module, FeatureLearningStep):
         min_lr=1e-8,
         beta_max=None,
     ):
-        """Train the VAE (encoder + decoder) to reconstruct images from
-        `folder`, using a cyclically annealed KL weight (`beta`, see
-        `_cyclical_beta`) to avoid posterior collapse, then extract and
-        return features from the trained model.
+        """Train the encoder and decoder to reconstruct the images, then
+        extract and return the features.
 
-        There's no validation split here (this is unsupervised
-        reconstruction, not classification), so early stopping instead
-        watches a smoothed moving average of the *training* ELBO - see
-        `EarlyStopping` - and stops once it's stopped improving for
-        `early_stopping_patience` epochs, restoring the best-epoch
-        weights before returning.
+        The KL weight `beta` follows a cyclical schedule (`_cyclical_beta`):
+        in each of 4 cycles it rises from 0 to `beta_max`, then stays there.
+        Starting each cycle low lets the decoder learn to use the latent
+        code before the KL term pushes it toward the prior. `beta_max > 1`
+        (a beta-VAE) makes latent information more expensive, so the code
+        keeps the overall shape rather than pixel details (line thickness,
+        small breaks), which is what clustering needs.
 
-        The KL weight follows a cyclical schedule (`_cyclical_beta`) scaled
-        by `beta_max`: each cycle ramps beta from 0 to `beta_max`, then
-        holds it there. `beta_max > 1` (a beta-VAE) makes information in
-        the latent code more expensive: the reconstruction term is summed
-        over all 256x256 pixels but the KL only over the `k` latent dims,
-        so at beta=1 the model can afford to spend latent capacity on
-        pixel-level detail (line thickness, small breaks) instead of just
-        the shard's shape - which is what downstream clustering needs.
-
-        The learning rate is adapted with `ReduceLROnPlateau`, also driven
-        by the monitored loss. Both are only fed epochs from the *flat*
-        stage of each cycle (beta == beta_max), skipping the ramp
-        entirely: there beta is constant, so the beta-weighted loss -
-        the objective actually being optimized - is comparable from
-        epoch to epoch, also across cycles. During the ramp it isn't (it
-        rises with beta), and when beta drops back to 0 at a cycle
-        restart, the unregularized KL blows up for several epochs, which
-        would otherwise exhaust the early-stopping patience (and halve the
-        LR) right at the start of every new cycle. Skipped epochs don't
-        enter the smoothing window or count toward patience, and the
-        restored "best" weights are always from a beta == beta_max epoch.
-        (With beta_max=1 the monitored loss equals the ELBO; monitoring
-        the ELBO itself for beta_max > 1 would instead reward epochs that
-        encode *more* in the latent - the opposite of the point.)
+        Early stopping (`EarlyStopping`, on a moving average of the training
+        loss; there is no validation set) and the learning-rate scheduler
+        (`ReduceLROnPlateau`) only look at the epochs where beta == beta_max.
+        Only there is the loss comparable between epochs: during the ramp
+        it changes with beta, and right after a cycle restart the KL term
+        jumps up for a few epochs. The best weights are restored at the end.
 
         Args:
-            folder: image folder to train on (passed to `ImageDataset`);
-                ignored in in-memory mode (see `set_images`).
-            epochs: maximum number of training epochs (may stop earlier
-                via early stopping).
+            folder: image folder to train on (ignored in the in-memory mode).
+            epochs: maximum number of epochs.
             lr: Adam learning rate.
-            batch_size: training batch size.
-            early_stopping_patience: stop after this many consecutive
-                epochs with no improvement in the smoothed training ELBO.
-            early_stopping_min_delta: minimum decrease in smoothed
-                training ELBO to count as an improvement.
-            early_stopping_smoothing_window: number of most recent epochs
-                averaged together for the early-stopping signal, so a
-                single noisy epoch can't trigger a stop on its own.
-            lr_scheduler_factor: multiplier applied to the learning rate
-                when the ELBO plateaus (ReduceLROnPlateau).
-            lr_scheduler_patience: epochs with no ELBO improvement before
-                the learning rate is reduced.
-            min_lr: lower bound the learning rate is never reduced below.
-            beta_max: KL weight reached on the flat stage of each beta cycle
-                (see `train_model`); 1.0 is the plain VAE, > 1 a beta-VAE.
-                None (default) uses the value given to the constructor.
+            batch_size: training (and extraction) batch size.
+            early_stopping_patience: stop after this many monitored epochs
+                without improvement of the smoothed loss.
+            early_stopping_min_delta: smallest decrease that counts.
+            early_stopping_smoothing_window: epochs in the moving average.
+            lr_scheduler_factor: multiply the lr by this on a plateau.
+            lr_scheduler_patience: plateau length (epochs) before that.
+            min_lr: the lr never goes below this.
+            beta_max: KL weight on the flat stage of each beta cycle; 1.0 is
+                the plain VAE, > 1 a beta-VAE. None uses the constructor's.
 
         Returns:
-            The DataFrame from `extract_features` (filenames + latent
-            vectors), run once training is complete.
+            The DataFrame from `extract_features`.
         """
         if beta_max is None:
             beta_max = self.beta_max
         self._log_training_start(**{k: v for k, v in locals().items() if k not in ("self", "folder")})
         device = next(self.parameters()).device
-        # target_size=None: this pipeline's Normalizer step already makes every
-        # image 256x256, so resizing here would just be repeated wasted work
-        # (every image, every epoch); a wrong-sized image will fail loudly when
-        # DataLoader tries to batch it, rather than being silently resized.
-        # train_transform: on-the-fly augmentation in in-memory mode (see set_images).
+        # target_size=None: the Normalizer already made every image 256x256
+        # (an image of another size makes batching fail instead of being
+        # silently resized). train_transform: on-the-fly augmentation in
+        # the in-memory mode (see set_images).
         dataset = ImageDataset(self._collect_inputs(folder), grayscale=True, target_size=None,
                                transform=self.train_transform)
-        print(f"Dataset size: {dataset.__len__()}")
+        print(f"Dataset size: {len(dataset)}")
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True,
             num_workers=16, pin_memory=True, persistent_workers=True
@@ -321,7 +266,7 @@ class VAE(nn.Module, FeatureLearningStep):
 
             average_loss = train_loss / len(loader)
             average_elbo = train_elbo / len(loader)
-            # Only monitor the flat (beta == beta_max) stage - see the docstring.
+            # Only the flat stage (beta == beta_max) is monitored, see the docstring.
             if cycle_frac >= 1.0:
                 scheduler.step(average_loss)
                 smoothed_loss, should_stop = early_stopping.step(average_loss, epoch + 1, model=self)
@@ -360,23 +305,14 @@ class VAE(nn.Module, FeatureLearningStep):
         return self.extract_features(batch_size=batch_size)
 
     def extract_features(self, batch_size=32) -> pd.DataFrame:
-        """Run the encoder over every image in `self.input_path` in eval
-        mode and collect both the latent mean (`mu`) and log-variance
-        (`sigma`) as that image's feature vectors - not a sampled `z`, so
-        features are deterministic and reproducible across calls.
-
-        Args:
-            batch_size: inference batch size.
+        """Encode every image (eval mode: no dropout, no random draw) and
+        return its latent mean `mu` as the features, plus the log-variance
+        `sigma` (the encoder's uncertainty per dimension; only stored,
+        clustering uses `mu`).
 
         Returns:
-            A DataFrame with one 'filename', 'features' (`mu` as a numpy
-            array) and 'sigma' (log-variance as a numpy array) row per
-            image; also written to `<output_path>/features.csv`.
-            `sigma` reflects the encoder's uncertainty per latent
-            dimension for that image - e.g. a high value on a dimension
-            means the encoder isn't confident about that image's value
-            there, which can be useful to inspect even though downstream
-            steps here (clustering, the classifier) only use `mu`.
+            A DataFrame with 'filename', 'features' (mu) and 'sigma' per
+            image, also written to `<output_path>/features.csv`.
         """
         device = next(self.parameters()).device
         # See train_model's ImageDataset call for why target_size=None here.
@@ -411,22 +347,11 @@ class VAE(nn.Module, FeatureLearningStep):
         self._log_features(output_file)
         return result
 
-    def _loss_function(self, recon_x, x, mu, logvar, beta=1.0):
-        """Standard beta-VAE loss: reconstruction error (`self.recon_loss`,
-        BCE by default) plus a KL-divergence term pulling the
-        latent distribution toward a standard normal, weighted by `beta`.
-        A higher `beta` trades off reconstruction quality for a latent
-        space that's more disentangled/regularized (better for downstream
-        clustering, worse for pixel-perfect reconstructions).
-        """
-        recon, KLD = self._loss_terms(recon_x, x, mu, logvar)
-        return recon + beta * KLD
-
     def _loss_terms(self, recon_x, x, mu, logvar):
-        """The two unweighted components of `_loss_function`: the
-        reconstruction error (`self.recon_loss`) and the KL divergence.
-        Kept separate so the training loop can also track the
-        beta-independent ELBO (recon + KLD).
+        """The two parts of the VAE loss, unweighted: the reconstruction
+        error (`self.recon_loss`) and the KL divergence of N(mu, exp(logvar))
+        from the standard normal. The training loss is recon + beta * KLD;
+        recon + KLD is the ELBO, also tracked.
         """
         recon = self.recon_loss(recon_x, x)
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
@@ -434,13 +359,10 @@ class VAE(nn.Module, FeatureLearningStep):
 
     @staticmethod
     def _cyclical_beta(epoch, T, M, R=0.5):
-        """Cyclical KL-annealing schedule (Fu et al., "Cyclical Annealing
-        Schedule", 2019): ramps beta linearly from 0 to 1 over the first
-        `R` fraction of each cycle, then holds it at 1 for the rest of the
-        cycle, repeating for `M` cycles across training. This avoids
-        posterior collapse (the decoder ignoring the latent code, which a
-        constant high beta from epoch 1 tends to cause) while still
-        reaching full KL regularization within each cycle.
+        """Cyclical KL annealing (Fu et al., 2019): training is split into
+        `M` cycles; in each, beta rises linearly from 0 to 1 over the first
+        `R` fraction, then stays at 1. This prevents "posterior collapse"
+        (the decoder learning to ignore the latent code).
 
         Args:
             epoch: current epoch (1-indexed, matches 'e' in the paper).
@@ -460,15 +382,12 @@ class VAE(nn.Module, FeatureLearningStep):
 
 
 class Encoder(nn.Module):
-    """Downsamples a 256x256 grayscale image to a `k`-dimensional latent
-    distribution (mu, sigma), via 4 blocks that each roughly halve the
-    spatial resolution while doubling the channel count.
-
-    Expects a 1x256x256 input (batch dim aside); with the default f=4,
-    n=3, s=1, the four blocks bring it to 128x32x32 before flattening to
-    the 131072-dim vector that `fc_mu`/`fc_sigma` project down to `k`
-    (that flatten size is hardcoded to match those exact defaults - it
-    must be recomputed by hand if f/n/s/the input resolution change).
+    """Compresses a 1x256x256 image into a `k`-dimensional Gaussian
+    (mu, sigma). Each block halves the resolution and doubles the channels:
+    256 -> 128 -> 64 -> 32 px, ending at 128x32x32 with the default
+    f=4/n=3/s=1. That is flattened to 131072 numbers, which `fc_mu` and
+    `fc_sigma` project down to `k`. The 131072 is hardcoded: recompute it
+    if f/n/s or the input size change. SimCLR and BYOL use the same layout.
     """
 
     def __init__(self, f=4, n=3, s=1, k=128, p=1):
@@ -542,13 +461,11 @@ class Encoder(nn.Module):
         return mu, sigma
 
 class Decoder(nn.Module):
-    """Mirror image of `Encoder`: projects a `k`-dim latent vector back up
-    to a 1x256x256 reconstruction through the same 4 blocks in reverse,
-    using transposed convolutions to upsample instead of downsample.
+    """The Encoder in reverse: transposed convolutions grow a latent
+    vector back into a 1x256x256 image.
 
-    Note the `fc` layer here is applied by the caller (`VAE.forward`),
-    not inside this module's own `forward` - `forward` expects an
-    already-reshaped (batch, 2**(f+3), 32, 32) feature map as input.
+    Its `fc` layer (latent vector -> 128x32x32) is applied by the caller
+    (`VAE.forward`), so `forward` gets the already reshaped feature map.
     """
 
     def __init__(self, f=4, n=3, s=1, k=128, p=1):
@@ -609,29 +526,3 @@ class Decoder(nn.Module):
         x = self.conv4(x)
 
         return torch.sigmoid(x)
-
-def resize_with_padding(img, target_size=256, fill=255):
-    """Resize `img` to fit within a `target_size` x `target_size` box
-    (preserving aspect ratio via `thumbnail`), then pad it to exactly
-    that size with `fill`, centering the resized image.
-
-    Standalone alternative to `Normalizer.pad_to_square` used directly in
-    notebooks/scripts that want padding without instantiating a full
-    pipeline Step - same goal (aspect-ratio-preserving square canvas),
-    different implementation (resize-then-pad here vs pad-then-resize in
-    Normalizer).
-
-    Args:
-        img: a PIL Image.
-        target_size: final width/height in pixels.
-        fill: fill value for the padding (0-255 for a grayscale/RGB image).
-
-    Returns:
-        A new PIL Image of exactly (target_size, target_size).
-    """
-    img = img.copy()
-    img.thumbnail((target_size, target_size))
-    delta_w = target_size - img.size[0]
-    delta_h = target_size - img.size[1]
-    padding = (delta_w // 2, delta_h // 2, delta_w - delta_w // 2, delta_h - delta_h // 2)
-    return ImageOps.expand(img, padding, fill=fill)

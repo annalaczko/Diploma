@@ -1,23 +1,14 @@
+"""Shape tests of the VAE (Encoder / Decoder / VAE): the spatial sizes
+(256 -> 32 in the encoder, 32 -> 256 in the decoder) and the channel counts
+come out as the Conv2d / ConvTranspose2d formulas predict.
+
+    pytest tests/test_feature_learning.py -v
 """
-Shape teszt suite a VAE feature learning stephez (Encoder / Decoder / VAE).
-
-Cél: bebiztositani, hogy a spatial meretek (256 -> 32 az encoderben,
-32 -> 256 a decoderben) es a csatornaszamok pontosan ugy alakulnak,
-ahogy a ConvTranspose2d / Conv2d formulak alapjan varjuk.
-
-Futtatas:
-    pytest test_feature_learning.py -v
-
-FONTOS: igazitsd az alabbi import sort a sajat projekt struktrurajahoz
-(pl. ha a VAE osztaly masik fajlban van, mint amit korabban kuldtel).
-"""
-import pytest
-import pandas as pd
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
-from pipeline.clustering.hierarchical_clustering import HierarchicalClustering
 from pipeline.feature_learning.vae import VAE, Encoder, Decoder
 
 BATCH_SIZE = 4
@@ -27,7 +18,7 @@ LATENT_DIM = 128
 
 @pytest.fixture
 def sample_batch():
-    """Egy batch veletlen grayscale 256x256 kep [0,1] tartomanyban (BCE loss elvarasa)."""
+    """A batch of random grayscale 256x256 images in [0, 1] (what BCE expects)."""
     return torch.rand(BATCH_SIZE, 1, IMG_SIZE, IMG_SIZE)
 
 
@@ -47,7 +38,7 @@ def vae():
 
 
 # ---------------------------------------------------------------------------
-# ENCODER: (N, 1, 256, 256) -> mu, sigma mindketto (N, 128)
+# ENCODER: (N, 1, 256, 256) -> mu, sigma, both (N, 128)
 # ---------------------------------------------------------------------------
 class TestEncoder:
     def test_output_shape(self, encoder, sample_batch):
@@ -57,9 +48,9 @@ class TestEncoder:
 
     def test_intermediate_spatial_downsampling(self, encoder, sample_batch):
         """
-        A spatial meretnek blokkonkent feleznie kell:
+        The spatial size halves per block:
         256 (conv0, same) -> 128 (block1) -> 64 (block2) -> 32 (block3).
-        Ez adja ki a flatten_size = 128 * 32 * 32 = 131072 erteket a kodban.
+        That gives flatten_size = 128 * 32 * 32 = 131072 in the code.
         """
         activations = {}
 
@@ -79,7 +70,7 @@ class TestEncoder:
         assert activations["conv1_1"][-2:] == (128, 128)
         assert activations["conv2_1"][-2:] == (64, 64)
         assert activations["conv3_1"][-2:] == (32, 32)
-        assert activations["conv3_1"][1] == 128  # csatorna: 2**(f+3)
+        assert activations["conv3_1"][1] == 128  # channels: 2**(f+3)
 
 
 # ---------------------------------------------------------------------------
@@ -88,15 +79,15 @@ class TestEncoder:
 class TestDecoder:
     def test_output_shape_from_reshaped_latent(self, decoder):
         """
-        decoder.forward() mar a reshape-elt (N,128,32,32) tenzort varja --
-        az fc + view lepes a VAE.forward()-ban tortenik, nem itt.
+        decoder.forward() expects the already reshaped (N,128,32,32) tensor:
+        the fc + view step happens in VAE.forward(), not here.
         """
         z_spatial = torch.randn(BATCH_SIZE, LATENT_DIM, 32, 32)
         out = decoder(z_spatial)
         assert out.shape == (BATCH_SIZE, 1, IMG_SIZE, IMG_SIZE)
 
     def test_fc_layer_reshapes_latent_correctly(self, decoder):
-        """decoder.fc: 128-vektorbol pontosan 128*32*32 elem, ami (N,128,32,32)-re view-olhato."""
+        """decoder.fc: a 128-vector becomes exactly 128*32*32 values, viewable as (N,128,32,32)."""
         z = torch.randn(BATCH_SIZE, LATENT_DIM)
         z_flat = decoder.fc(z)
         assert z_flat.shape == (BATCH_SIZE, 128 * 32 * 32)
@@ -106,10 +97,9 @@ class TestDecoder:
 
     def test_intermediate_spatial_upsampling(self, decoder):
         """
-        A spatial meretnek blokkonkent duplazodnia kell:
+        The spatial size doubles per block:
         32 -> 64 (block1) -> 128 (block2) -> 256 (block3).
-        A stride=1 retegek (conv0, conv*_0, conv4) "same" konvolucioként
-        nem valtoztatjak a meretet -- ezt is ellenorizzuk.
+        The stride-1 layers (conv0, conv*_0, conv4) keep the size ("same").
         """
         activations = {}
 
@@ -136,11 +126,11 @@ class TestDecoder:
 
 
 # ---------------------------------------------------------------------------
-# VAE: teljes end-to-end kor (encoder -> reparam trick -> decoder)
+# VAE: the whole forward pass (encoder -> reparameterization -> decoder)
 # ---------------------------------------------------------------------------
 class TestVAEEndToEnd:
     def test_reconstruction_shape_matches_input(self, vae, sample_batch):
-        """A legfontosabb teszt: recon merete pontosan egyezzen a bemenettel (BCE loss miatt kritikus)."""
+        """The reconstruction has exactly the input's shape (the BCE loss needs that)."""
         recon, mu, sigma = vae(sample_batch)
         assert recon.shape == sample_batch.shape
         assert mu.shape == (BATCH_SIZE, LATENT_DIM)
@@ -148,7 +138,7 @@ class TestVAEEndToEnd:
 
     @pytest.mark.parametrize("batch_size", [1, 2, 8])
     def test_variable_batch_sizes(self, vae, batch_size):
-        """Batch-meret fuggetlenseg: a modellnek barmilyen batch_size-ra mukodnie kell."""
+        """The model works with any batch size."""
         x = torch.rand(batch_size, 1, IMG_SIZE, IMG_SIZE)
         recon, mu, sigma = vae(x)
         assert recon.shape == (batch_size, 1, IMG_SIZE, IMG_SIZE)
@@ -156,21 +146,17 @@ class TestVAEEndToEnd:
         assert sigma.shape == (batch_size, LATENT_DIM)
 
     def test_output_values_in_valid_range(self, vae, sample_batch):
-        """
-        Mivel a loss BCE (binary_cross_entropy), a decoder kimenetenek
-        [0,1] tartomanyba kellene esnie -- de a jelenlegi Decoder.forward()
-        vegen NINCS Sigmoid a conv4 utan! Ez a teszt varhatoan elbukik,
-        amig ez hianyzik -- ez a celja: figyelmeztetni ra.
-        """
+        """The loss is BCE, so the decoder output must lie in [0, 1] (the
+        sigmoid at the end of Decoder.forward)."""
         recon, _, _ = vae(sample_batch)
         assert recon.min() >= 0.0 and recon.max() <= 1.0, (
-            "A decoder kimenete nincs [0,1] tartomanyba szoritva -- "
-            "hianyzik egy Sigmoid a conv4 utan, ami a BCE losshoz kell."
+            "The decoder output is not in [0, 1]: the sigmoid after conv4, "
+            "needed by the BCE loss, is missing."
         )
 
 
 class TestFeatureExport:
-    def test_extract_features_saves_filename_and_vector_csv(self, vae, tmp_path):
+    def test_extract_features_saves_filename_and_vector_csv(self, tmp_path):
         image_dir = tmp_path / "images"
         image_dir.mkdir()
 
@@ -178,14 +164,14 @@ class TestFeatureExport:
             img = Image.new("L", (256, 256), color=255 * (i + 1) % 256)
             img.save(image_dir / f"sample_{i}.png")
 
-        out = vae.extract_features(str(image_dir), batch_size=1, csv_path=str(tmp_path / "features.csv"))
+        vae = VAE(input_path=str(image_dir), output_path=str(tmp_path / "out"))
+        out = vae.extract_features(batch_size=1)
 
-        assert isinstance(out["features"], np.ndarray)
-        assert out["features"].shape[0] == 2
-        assert len(out["filenames"]) == 2
-        assert out["csv_path"].endswith("features.csv")
+        assert list(out["filename"]) == ["sample_0.png", "sample_1.png"]
+        assert isinstance(out["features"][0], np.ndarray)
+        assert out["features"][0].shape == (LATENT_DIM,)
 
-        csv_lines = (tmp_path / "features.csv").read_text(encoding="utf-8").splitlines()
+        csv_lines = (tmp_path / "out" / "features.csv").read_text(encoding="utf-8").splitlines()
         assert csv_lines[0].startswith("filename,")
         assert "sample_0.png" in csv_lines[1]
 

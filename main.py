@@ -7,7 +7,8 @@ import torch
 from pipeline.clustering import HierarchicalClustering
 from pipeline.feature_learning import VAE
 from pipeline.pipeline import Pipeline
-from pipeline.preprocessing import Augmentor, BackgroundEraser, Normalizer, Repair
+# Used by the commented-out preprocessing steps below.
+from pipeline.preprocessing import Augmentor, BackgroundEraser, Normalizer, Repair  # noqa: F401
 
 run_id = "example_run"
 source_folder = "data/pipeline/example_run/PreprocessingStep/Repair"

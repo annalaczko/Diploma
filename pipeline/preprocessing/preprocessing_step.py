@@ -1,8 +1,8 @@
-"""Abstract base for preprocessing steps."""
+"""Abstract base class of the preprocessing steps (BackgroundEraser,
+Normalizer, Repair, Vectorizer, AxisRenderer, Augmentor)."""
 
 from abc import abstractmethod
 from pathlib import Path
-from typing import Any
 
 from pipeline import tracking
 from pipeline.preprocessing.dataset import ImageRecord
@@ -10,22 +10,21 @@ from pipeline.steps.step import Step
 
 
 class PreprocessingStep(Step):
-    """Common contract for all preprocessing steps
-    (e.g. image enhancement, object detection).
+    """Base class of the steps that clean and prepare the images.
 
-    Preprocessing steps are usually chained one after another, in one of
-    two modes:
+    The steps are chained one after another, in one of two modes:
       - disk mode: `run()` reads every image under `self.input_path` and
-        writes its results to `self.output_path`, which the next step
-        then uses as its `input_path`.
+        writes the results to `self.output_path`. That folder is then the
+        next step's `input_path`.
       - in-memory mode: `process_batch(records)` takes a list of
-        `ImageRecord`s and returns the processed list, nothing is written
-        (see `pipeline.pipeline.Pipeline`).
-    Both modes should call the same per-image code, so they can't drift apart.
+        `ImageRecord`s (name + image) and returns the processed list;
+        nothing is written (see `pipeline.pipeline.Pipeline`).
+    Both modes call the same per-image method of the step, so they always
+    produce the same images.
 
-    Side outputs (debug overlays, SVGs) go to `side_output_dir(kind)`, a
-    `_<kind>` folder inside the step's output folder; image collection skips
-    `_` folders, so they are never taken for the next step's input.
+    Extra outputs (debug overlays, SVGs) go to `side_output_dir(kind)`, a
+    `_<kind>` folder inside the output folder. Image collection skips `_`
+    folders, so the next step never mistakes them for input.
     """
 
     def side_output_dir(self, kind: str) -> Path:
@@ -41,8 +40,7 @@ class PreprocessingStep(Step):
         save_results: bool = True,
         run_id: str | None = None,
     ):
-        # See Step.__init__ for what each argument controls (output path
-        # resolution, whether to delete input data after the step runs, etc).
+        # The arguments are explained in Step.__init__.
         super().__init__(
             input_path=input_path,
             output_path=output_path,

@@ -1,0 +1,40 @@
+# Night run, GPU 0: NT-Xent, T-A, unfreeze_blocks 2 and 3, 50 epochs
+# Train on tightcrop/axes/train, cluster and evaluate the test_top5 images.
+# Augmentation: build_line_drawing_augmentation (pipeline/preprocessing/augmentation.py), set in code.
+# The commands for the whole GPU queue: configs/night/README.md. Every option: configs/template.yaml.
+
+data:
+  source: preprocessed
+  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/tightcrop/axes/train
+  extract_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/tightcrop/axes/test_top5
+  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  features: null             # must stay null: with extract_path the features are computed in this run
+
+experiment: dinov3-night     # MLflow experiment (separate from the runs with the old augmentation)
+name: NTX-T-A
+stop_after: null
+sweep:                       # each model setting trained once, its features clustered 3 ways
+  model.params.unfreeze_blocks: [2, 3]
+  clustering.method: [average, ward]
+  clustering.metric: [euclidean, cosine]
+  clustering.cluster_num: [5]
+
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    finetune: true
+    finetune_method: nt_xent
+    unfreeze_blocks: 2
+    projection_dim: 128      # projection head output, what the loss sees (the features stay the CLS token)
+    temperature: 0.1         # NT-Xent temperature
+  checkpoint: null
+
+training:
+  train: true
+  epochs: 50
+  lr: 1.0e-05
+  batch_size: 256            # images per step (x2 views)
+  early_stopping_patience: 10       # the harder augmentation makes the loss noisier than before
+  early_stopping_min_delta: 0.0
+  early_stopping_smoothing_window: 3

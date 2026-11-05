@@ -132,7 +132,7 @@ def test_train_model_reduces_loss_over_a_few_epochs(tmp_path):
     # so per-epoch losses can be collected without parsing print output.
     from torchvision import transforms
 
-    from pipeline.feature_learning.simclr import SimCLRDataset
+    from pipeline.preprocessing.dataset import TwoViewDataset
     from pipeline.preprocessing.augmentation import build_augmentation_transform
     from pipeline.preprocessing.dataset import collect_image_paths
 
@@ -144,7 +144,7 @@ def test_train_model_reduces_loss_over_a_few_epochs(tmp_path):
     model = _make_model(source_dir, tau=0.9)
 
     view_transform = transforms.Compose([build_augmentation_transform(), transforms.ToTensor()])
-    dataset = SimCLRDataset(collect_image_paths(str(source_dir)), view_transform)
+    dataset = TwoViewDataset(collect_image_paths(str(source_dir)), view_transform)
     loader = torch.utils.data.DataLoader(dataset, batch_size=4, shuffle=True, drop_last=True)
     optimizer = torch.optim.Adam(
         list(model.online_encoder.parameters())

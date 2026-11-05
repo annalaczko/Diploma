@@ -1,21 +1,17 @@
-"""Abstract base for clustering steps."""
+"""Abstract base class of the clustering steps."""
 
 from abc import abstractmethod
 from typing import Any
-
-import numpy as np
 
 from pipeline.steps.step import Step
 
 
 class ClusteringStep(Step):
-    """Common contract for clustering methods applied to fixed
-    feature representations.
+    """Base class of clustering methods that group fixed feature vectors.
 
-    Unlike the base `Step.run(data)`, concrete clustering steps take no
-    `run()` argument - they read their input (a feature matrix, or the
-    CSV path it's stored at) from config passed to `__init__` instead,
-    and `run()` returns cluster labels (n_samples,).
+    A clustering step reads its features (a features.csv written by a
+    feature-learning step) in `__init__`, and `run()`, which takes no
+    argument, returns one cluster label per image.
     """
 
     def __init__(
@@ -27,8 +23,8 @@ class ClusteringStep(Step):
         save_results: bool = False,
         run_id: str = "default_run",
     ):
-        """See `Step.__init__` for what each argument controls; `input_path`
-        here is expected to be a CSV of precomputed feature vectors."""
+        """`input_path` is the features CSV; the other arguments are
+        explained in `Step.__init__`."""
         super().__init__(
             input_path=input_path,
             output_path=output_path,

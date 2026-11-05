@@ -145,7 +145,11 @@ def test_vae_train_model_stops_early_when_loss_plateaus(tmp_path, monkeypatch, c
 
     model.train_model(str(source_dir), epochs=5, batch_size=2)
 
-    assert _count_epoch_lines(capsys) == 1
+    # The VAE only checks early stopping on the flat stage of the beta
+    # cycle (beta == beta_max), so it stops on the first such epoch.
+    first_flat = next(e for e in range(1, 6) if VAE._cyclical_beta(e, 5, 4) >= 1.0)
+    assert first_flat == 2
+    assert _count_epoch_lines(capsys) == first_flat
 
 
 def test_simclr_train_model_stops_early_when_loss_plateaus(tmp_path, monkeypatch, capsys):

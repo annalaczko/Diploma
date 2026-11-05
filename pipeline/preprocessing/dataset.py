@@ -1,13 +1,13 @@
-"""Shared image-loading utilities used across the pipeline.
+"""Finding and loading images: the helpers every step uses.
 
-Two pieces, both centralizing logic that used to be copy-pasted (and
-drifting inconsistently) across preprocessing steps and feature-learning
-models:
-
-    collect_image_paths - find image files under a path/list of paths.
-    ImageDataset         - a torch Dataset that loads those files as
-                            tensors, for both unsupervised (VAE) and
-                            supervised (VAEClassifier) training.
+    collect_image_paths  find the image files under a folder (or list of paths)
+    flatten_name         a unique flat file name for a file in a folder tree
+    ImageRecord          one image plus its name, as passed between steps in memory
+    iter_image_batches   load images batch by batch (in-memory mode)
+    prefetch             load the next batch in the background meanwhile
+    InMemoryImages       the final preprocessed images, as one numpy array
+    ImageDataset         a torch Dataset that turns images into tensors for training
+    TwoViewDataset       a torch Dataset that yields two random transformed views of each image
 """
 
 import queue
@@ -28,73 +28,53 @@ DEFAULT_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 
 def collect_image_paths(input_value, image_extensions=DEFAULT_IMAGE_EXTENSIONS) -> list[Path]:
-    """Collect every existing image path under `input_value`.
+    """Every existing image file under `input_value`.
 
     Args:
-        input_value: a single path (str or Path), or a list/tuple of
-            paths. Each entry may point at a file or a directory;
-            directories are searched recursively (`Path.rglob("*")`),
-            skipping subfolders whose name starts with "_": a step's side
-            outputs (`_debug`, `_svg`, see
-            `PreprocessingStep.side_output_dir`), which are not inputs.
-            `None` entries and paths that don't exist on disk are
-            silently skipped, so callers can pass optional or
-            partially-missing input without pre-filtering it themselves.
-        image_extensions: iterable of file suffixes (e.g. ".png") that
-            count as images. Matching is case-insensitive.
+        input_value: a path (str or Path) or a list/tuple of paths, each a
+            file or a folder. Folders are searched recursively, except
+            subfolders starting with "_" (a step's side outputs such as
+            `_debug` or `_svg`, see `PreprocessingStep.side_output_dir`).
+            `None` entries and missing paths are skipped.
+        image_extensions: file suffixes (e.g. ".png") that count as
+            images, case-insensitive.
 
     Returns:
-        A de-duplicated list of `Path` objects pointing at existing image
-        files, in the order they were discovered (directory contents are
-        sorted before being added, so results are deterministic).
+        The image paths without duplicates, in a fixed order (folder
+        contents sorted by name).
     """
     candidates = input_value if isinstance(input_value, (list, tuple)) else [input_value]
     collected: list[Path] = []
     seen: set[str] = set()
 
+    def add(path: Path) -> None:
+        # The same file can be reached twice (e.g. via two input paths).
+        if path.suffix.lower() in image_extensions and str(path.resolve()) not in seen:
+            seen.add(str(path.resolve()))
+            collected.append(path)
+
     for raw_path in candidates:
-        if raw_path is None:
+        if raw_path is None or not Path(raw_path).exists():
             continue
-
         path = Path(raw_path)
-        if not path.exists():
-            continue
-
         if path.is_file():
-            if path.suffix.lower() in image_extensions:
-                resolved = path.resolve()
-                if str(resolved) not in seen:
-                    seen.add(str(resolved))
-                    collected.append(path)
+            add(path)
             continue
-
-        # Directory: recurse and keep only files with a matching extension.
         for nested in sorted(path.rglob("*")):
-            if not nested.is_file():
-                continue
-            if any(part.startswith("_") for part in nested.relative_to(path).parts[:-1]):
-                continue
-            if nested.suffix.lower() not in image_extensions:
-                continue
-            resolved = nested.resolve()
-            if str(resolved) not in seen:
-                seen.add(str(resolved))
-                collected.append(nested)
+            in_side_folder = any(part.startswith("_") for part in nested.relative_to(path).parts[:-1])
+            if nested.is_file() and not in_side_folder:
+                add(nested)
 
     return collected
 
 
 def flatten_name(path, root) -> str:
-    """Build a flat, collision-free filename for `path` that encodes its
-    ancestor directory names relative to `root`, e.g.
-    `"2012_Survey Gladiatorenschule__006.jpg"` for
-    `<root>/2012_Survey Gladiatorenschule/006.jpg`.
+    """A flat file name for `path` that includes its folders below `root`,
+    joined with "__": `<root>/2012_Survey/006.jpg` -> `2012_Survey__006.jpg`.
 
-    Input trees often reuse the same simple, sequential filenames
-    (`001.jpg`, ...) in every subfolder, so saving (or naming) images by
-    their bare basename would make them collide. Falls back to just the
-    basename if `path` isn't under `root` (e.g. `root` is a list of paths
-    or None).
+    The raw scans reuse names like `001.jpg` in every subfolder, so the bare
+    file name would not be unique. If `path` is not under `root` (or `root`
+    is a list or None), the bare file name is used.
     """
     path = Path(path)
     try:
@@ -107,9 +87,8 @@ def flatten_name(path, root) -> str:
 
 @dataclass
 class ImageRecord:
-    """One image travelling through the in-memory pipeline: the filename
-    it would have had on disk (so downstream filename-based joins, e.g.
-    labels by stem, keep working) and the image itself."""
+    """One image travelling through the in-memory pipeline, with the file
+    name it would have on disk (labels are later looked up by that name)."""
     name: str
     image: Image.Image
 
@@ -117,11 +96,10 @@ class ImageRecord:
 def iter_image_batches(input_path, batch_size=64, image_extensions=DEFAULT_IMAGE_EXTENSIONS,
                        num_workers=8):
     """Yield the images under `input_path` as lists of `ImageRecord`s,
-    `batch_size` at a time, so only one batch of full-resolution images
-    is ever held in memory. Names are flattened relative to `input_path`
-    (see `flatten_name`), matching what `BackgroundEraser` writes in disk
-    mode, and EXIF orientation is applied, as `cv2.imread` does there.
-    The images of a batch are decoded on `num_workers` threads.
+    `batch_size` at a time, so only one batch of full-size scans is in
+    memory at once. The names are made with `flatten_name`, the same names
+    `BackgroundEraser` writes in disk mode. The images of a batch are
+    decoded on `num_workers` threads.
     """
     paths = collect_image_paths(input_path, image_extensions)
     if not paths:
@@ -131,9 +109,8 @@ def iter_image_batches(input_path, batch_size=64, image_extensions=DEFAULT_IMAGE
 
     def load(path):
         with Image.open(path) as image:
-            # Apply EXIF orientation, like cv2.imread does in
-            # BackgroundEraser's disk mode - many scans are stored
-            # rotated with an orientation tag.
+            # Many scans are stored rotated, with an EXIF orientation tag.
+            # Apply it, as cv2.imread does in BackgroundEraser's disk mode.
             image = ImageOps.exif_transpose(image)
             image.load()
             return ImageRecord(flatten_name(path, input_path), image.copy())
@@ -145,8 +122,8 @@ def iter_image_batches(input_path, batch_size=64, image_extensions=DEFAULT_IMAGE
 
 def prefetch(iterable, depth=1):
     """Iterate over `iterable` while a background thread already produces
-    the next `depth` items - e.g. loads the next batch of images while the
-    current one is being processed. Errors are raised in the caller."""
+    the next `depth` items, e.g. loads the next batch of images while the
+    current one is processed. An error in the thread is raised here."""
     items = queue.Queue(maxsize=depth)
     stop = threading.Event()
     done = object()
@@ -181,13 +158,11 @@ def prefetch(iterable, depth=1):
 
 
 class InMemoryImages:
-    """The final output of an in-memory preprocessing run: every image as
-    one row of a single `(N, H, W)` uint8 grayscale array, plus its name.
+    """The result of in-memory preprocessing: all images in one
+    `(N, H, W)` uint8 grayscale array (`images`), plus their `names`.
 
-    One big numpy array (instead of a list of PIL images) is what makes
-    this cheap to share with DataLoader worker processes: after fork they
-    read the same memory pages, whereas touching thousands of separate
-    Python objects would copy them into every worker.
+    One big array instead of a list of PIL images is cheap to share with
+    DataLoader worker processes (they read the same memory after fork).
     """
 
     def __init__(self, names, images: np.ndarray):
@@ -253,20 +228,11 @@ def open_image(entries, idx) -> Image.Image:
 
 
 class ImageDataset(Dataset):
-    """General-purpose torch Dataset for the images used across this
-    pipeline: loads each path with PIL and, unless disabled, converts it
-    to single-channel grayscale and resizes it to a fixed square size.
+    """Torch Dataset of images: each item is a (1, H, W) float tensor in
+    [0, 1], grayscale and resized to `target_size` x `target_size`.
 
-    Optionally pairs each image with an integer label, which is what lets
-    a single class serve both feature-learning models in this pipeline:
-      - VAE (unsupervised): `ImageDataset(paths)`, no labels - iterating
-        yields plain image tensors.
-      - VAEClassifier (supervised): `ImageDataset(paths, labels=...)` -
-        iterating yields (image, label) tuples.
-    Previously these were two separate, near-duplicate Dataset classes
-    that had drifted out of sync (one resized/grayscaled, the other
-    didn't, and silently relied on its input already being the right
-    shape) - this replaces both.
+    Without labels it yields image tensors (unsupervised training, e.g.
+    VAE); with `labels` it yields (image, label) pairs (VAEClassifier).
     """
 
     def __init__(self, paths, labels=None, grayscale=True, target_size=256, transform=None):
@@ -277,21 +243,15 @@ class ImageDataset(Dataset):
             labels: optional sequence of integer class ids, aligned with
                 `paths`. If given, `__getitem__` returns (image, label)
                 tuples; if omitted, it returns just the image tensor.
-            grayscale: if True (default), convert every image to
-                single-channel grayscale before returning it - matches
-                what the VAE encoder expects.
-            target_size: if given (default 256), resize every image that
-                isn't already exactly (target_size, target_size) - most
-                images here already are, having gone through a Normalizer
-                step, so this is usually a cheap no-op rather than a real
-                resize. Pass None to skip resizing entirely and keep each
-                image's original size - only safe if every image already
-                shares one size, since a DataLoader can't batch mismatched
-                shapes.
+            grayscale: convert to one-channel grayscale (what the encoders
+                expect).
+            target_size: resize images of another size to this square
+                size. After a Normalizer they already have it, so usually
+                nothing happens. None keeps every image's own size (they
+                must then all be equal, or batching fails).
             transform: optional PIL -> PIL transform applied on every
-                fetch, after grayscale/resize and before conversion to a
-                tensor - e.g. `Augmentor.transform` for on-the-fly
-                augmentation (a different random view every epoch).
+                fetch, after grayscale/resize, e.g. `Augmentor.transform`
+                for a different random view every epoch.
         """
         self.paths, self.names = image_entries(paths)
         self.transform = transform
@@ -299,10 +259,7 @@ class ImageDataset(Dataset):
         self.grayscale = grayscale
         self.target_size = target_size
 
-        pre_resize_steps = []
-        if grayscale:
-            pre_resize_steps.append(transforms.Grayscale(num_output_channels=1))
-        self.pre_resize = transforms.Compose(pre_resize_steps) if pre_resize_steps else None
+        self.pre_resize = transforms.Grayscale(num_output_channels=1) if grayscale else None
         self.to_tensor = transforms.ToTensor()
 
     def __len__(self):
@@ -313,11 +270,8 @@ class ImageDataset(Dataset):
         if self.pre_resize is not None:
             image = self.pre_resize(image)
 
-        # Only actually resize if needed: most images here already went
-        # through a Normalizer step and are already target_size x
-        # target_size, so unconditionally resizing every image on every
-        # __getitem__ call (i.e. every epoch) would repeat an expensive,
-        # no-op interpolation millions of times over a long training run.
+        # Resize only if needed: after a Normalizer most images already have
+        # the right size, and this runs for every image in every epoch.
         if self.target_size is not None and image.size != (self.target_size, self.target_size):
             image = image.resize((self.target_size, self.target_size), Image.Resampling.LANCZOS)
 
@@ -329,3 +283,29 @@ class ImageDataset(Dataset):
         if self.labels is not None:
             return image, self.labels[idx]
         return image
+
+
+class TwoViewDataset(Dataset):
+    """Yields two random views of each image (a "positive pair"). They are
+    made anew on every fetch, so each epoch sees different variations."""
+
+    def __init__(self, paths, transform):
+        """
+        Args:
+            paths: sequence of image file paths, or an `InMemoryImages`.
+            transform: a torchvision transform applied
+                independently twice per image to produce the two views;
+                typically `build_augmentation_transform(...)` composed
+                with `transforms.ToTensor()`.
+        """
+        self.paths, _ = image_entries(paths)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        image = open_image(self.paths, idx).convert("L")
+        view1 = self.transform(image)
+        view2 = self.transform(image)
+        return view1, view2

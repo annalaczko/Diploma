@@ -13,10 +13,10 @@ bottleneck for downstream classification.
 pipeline/feature_learning/
 ├── featurelearning_step.py   # FeatureLearningStep: abstract base
 ├── early_stopping.py          # EarlyStopping: shared moving-average stopping logic
-├── vae.py                     # VAE, Encoder, Decoder, resize_with_padding
+├── vae.py                     # VAE, Encoder, Decoder
 ├── reconstruction_losses.py   # interchangeable VAE reconstruction losses (BCE, Dice, soft-IoU, BCE+Dice)
 ├── vae_classifier.py          # VAEClassifier
-├── simclr.py                  # SimCLR, SimCLREncoder, SimCLRDataset
+├── simclr.py                  # SimCLR, SimCLREncoder
 ├── byol.py                    # BYOL
 ├── handcrafted_features.py    # HandcraftedFeatures: profile measures from the Vectorizer's SVGs (model.type: handcrafted)
 └── dinov3.py                  # DINOv3: pretrained backbone (frozen or fine-tuned), CLS token as features (model.type: dinov3)
@@ -36,13 +36,6 @@ Common contract for feature-learning approaches. `run()` takes preprocessed
 images (from `self.input_path`) and returns a fixed-length feature vector
 (or matrix of vectors) per input, so different approaches stay directly
 comparable downstream. Also provides:
-
-```python
-FeatureLearningStep.l2_normalize(vectors: np.ndarray) -> np.ndarray
-```
-
-L2-normalizes feature vectors row-wise — required before distance/cosine
-similarity comparisons.
 
 ```python
 step.set_images(images: InMemoryImages, train_transform=None)
@@ -146,7 +139,7 @@ variance.
 
 `folder` is ignored in in-memory mode (see `set_images` above).
 
-Loss (`_loss_function`, a standard beta-VAE loss):
+Loss (a standard beta-VAE loss; `_loss_terms` computes the two parts):
 
 ```
 loss = recon_loss(reconstruction, input) + beta * KLD(mu, logvar)
@@ -422,7 +415,7 @@ pre-projection representation transfers better to downstream tasks, while
 ### `train_model(folder, epochs=100, lr=1e-3, batch_size=128, temperature=0.5, view_transform=None, early_stopping_patience=15, early_stopping_min_delta=0.0, early_stopping_smoothing_window=10)`
 
 For each batch, builds two independently-augmented views of every image
-(via `SimCLRDataset`), embeds both views, and minimizes the NT-Xent
+(via `TwoViewDataset` from `pipeline.preprocessing.dataset`), embeds both views, and minimizes the NT-Xent
 contrastive loss (`_nt_xent_loss`) between them. As with `VAE`, there's no
 validation split, so early stopping watches a smoothed moving average of
 the epoch's **training loss** (`mode="min"`) and restores the best-epoch
@@ -459,13 +452,6 @@ Same output shape as `VAE.extract_features`: a `filename` + `features`
 `<output_path>/features.csv` - drop-in compatible with the same
 downstream clustering/evaluation code, just point it at a different CSV.
 
-### `SimCLRDataset(paths, transform)`
-
-Yields two independently-augmented views of each image per `__getitem__`
-call (freshly randomized every time, so every training epoch sees
-different crops/jitter/blur) - the positive pair the contrastive loss is
-trained on. Has no labels, unlike `ImageDataset`.
-
 ## `BYOL` — self-supervised feature learning without negative pairs
 
 A third unsupervised alternative (Grill et al., "Bootstrap Your Own
@@ -487,8 +473,8 @@ match the *target* network's actual projection of the other view
 (stop-gradient on the target side), and vice versa - no labels, no
 negatives.
 
-Reuses `SimCLREncoder` and `SimCLRDataset` from `simclr.py` rather than
-duplicating them. If anything, BYOL depends on `SimCLREncoder`'s
+Reuses `SimCLREncoder` from `simclr.py` and `TwoViewDataset` from
+`pipeline.preprocessing.dataset` rather than duplicating them. If anything, BYOL depends on `SimCLREncoder`'s
 BatchNorm even more than SimCLR does: without negative pairs at all,
 BatchNorm's cross-batch normalization is the main mechanism left
 preventing the online/target networks from collapsing onto "predict the
@@ -558,14 +544,6 @@ downstream clustering/evaluation code.
 Computed in both directions (`forward` sums both) and averaged over the
 batch to get the final scalar loss.
 
-## `resize_with_padding(img, target_size=256, fill=255)`
-
-Standalone helper (used directly in notebooks): resizes a PIL image to fit
-within a `target_size` × `target_size` box (`thumbnail`, preserving aspect
-ratio), then pads it to exactly that size, centered. Same goal as
-`Normalizer.pad_to_square` (an aspect-ratio-preserving square canvas), but a
-different implementation (resize-then-pad here, vs. pad-then-resize in
-`Normalizer`) for use outside a full pipeline `Step`.
 
 ## Hand-crafted features (`handcrafted_features.py`)
 
@@ -638,9 +616,18 @@ the pottery types better than the purpose-built encoders.
 DINOv3(
     input_path=None,            # folder of preprocessed images (or set_images)
     model_name="facebook/dinov3-vitb16-pretrain-lvd1689m",   # or -vits16- / -vitl16-
-    finetune=False,             # True: run(mode="train_model") fine-tunes first (skeleton)
+    finetune=False,             # True: run(mode="train_model") fine-tunes first
     device=None,                # None = cuda if available
     output_path=None, name=None, run_id="default_run",
+    unfreeze_blocks=2,          # finetune: last N transformer blocks (+ final norm) trained
+    projection_dim=128,         # nt_xent: projection head output, what the loss sees (features stay the CLS token)
+    temperature=0.1,            # nt_xent: NT-Xent temperature
+    finetune_method="nt_xent",  # finetune objective: "nt_xent" (contrastive) | "dino" (teacher-student)
+    num_prototypes=4096,        # dino: size of the DINOHead output (soft pseudo-classes)
+    teacher_momentum=0.996,     # dino: teacher = m * teacher + (1 - m) * student after every step
+    teacher_temp=0.04,          # dino: teacher softmax temperature (low = sharp targets)
+    student_temp=0.1,           # dino: student softmax temperature
+    center_momentum=0.9,        # dino: momentum of the center subtracted from the teacher's logits
 )
 ```
 
@@ -650,18 +637,73 @@ other training arguments, so it stands in for a learned model, and writes
 and memory mode (same features). `transformers` is imported, and the
 weights loaded, only on the first run.
 
-With `finetune=True`, `run(mode="train_model", epochs=20, lr=1e-5, ...)`
-first calls `finetune_model` (AdamW on the unfrozen parameters,
-`EarlyStopping` on the training loss), then extracts features with the
-fine-tuned weights; with `finetune=False` that mode raises `ValueError`.
-Fine-tuning is still a skeleton: `_setup_finetuning` (what to unfreeze,
-head), `_train_loader` and `_finetune_loss` raise `NotImplementedError`,
-saving `model.pt` is a TODO, and `run_experiment` does not train it yet
-(`dinov3` is still in `MEASURED`).
+With `finetune=True`, `run(mode="train_model", epochs=100, lr=1e-5, ...)`
+first calls `finetune_model`, then extracts features with the fine-tuned
+weights; with `finetune=False` that mode raises `ValueError`. The
+fine-tuning is self-supervised, so it needs no labels (the TypeRev labels
+exist only for the test images, which the evaluation uses).
+`finetune_method` picks the objective:
 
-In configs: `model.type: dinov3`, `model.params: {model_name: ...}`;
-`training` is ignored except `batch_size`, and there is no checkpoint. The
-run name shows the backbone (`dinov3-vitl16__...`) when `model_name` is
-set. The checkpoints are gated: accept the license on the model page and
-run `huggingface-cli login` (or set `HF_TOKEN`) once; afterwards the
+- **`"nt_xent"`** (default, SimCLR-style contrastive): a projection head
+  (MLP, CLS token h -> z of `projection_dim`) and `_nt_xent` on the two
+  views' z: each view's positive is the other view of its image, the
+  other 2N-2 views are negatives; cross-entropy over the cosine
+  similarities / `temperature`, the diagonal masked out. The features
+  stay h (the head absorbs the invariances the loss forces).
+- **`"dino"`** (DINO self-distillation, the objective DINOv3 was
+  pretrained with, in its basic form: CLS token only, two global views,
+  centering; no iBOT/KoLeo/Gram terms, no multi-crop): the student is the
+  backbone + a `DINOHead` (MLP -> L2-normalized bottleneck -> cosine with
+  `num_prototypes` normalized prototypes). The teacher is a copy of both,
+  never trained by gradients: after every optimizer step
+  `_update_teacher` moves its trained parts by EMA (`teacher_momentum`).
+  `_dino_loss` is the cross-entropy between the teacher's centered,
+  sharpened softmax (`teacher_temp`) for one view and the student's
+  (`student_temp`) for the other, both directions; there are no
+  negatives. `center`, the moving average of the teacher's raw logits
+  (`_update_center`, after the loss), together with the sharpening keeps
+  the outputs from collapsing. The features come from the teacher. It
+  keeps a second copy of the backbone, so it needs more GPU memory. The
+  loss starts near log(num_prototypes) and often rises first, so a
+  larger `early_stopping_patience` is safer.
+
+Common to both:
+
+- `_setup_finetuning` unfreezes the last `unfreeze_blocks` transformer
+  blocks and the final layernorm, and builds the head (and, with "dino",
+  the teacher and its `center` buffer).
+- `_train_loader` gives two random views of every image (`TwoViewDataset`
+  with `build_line_drawing_augmentation` from `augmentation.py`: a small
+  rotation, shift and resize, sometimes an elastic distortion, thicker
+  lines or missing line pieces; no crop, so the sherd's scale is roughly
+  kept, and no mirroring), resized and
+  normalized as the image processor does for extraction. A pipeline `train_transform` is ignored.
+- `_finetune_loss` runs both views through the backbone in one pass and
+  computes the chosen loss.
+- `finetune_model`: AdamW on `_student_modules()` (the unfrozen blocks,
+  norm and head), `EarlyStopping` on the smoothed training loss, which
+  snapshots `_finetuned_modules()` (the student, and with "dino" also the
+  teacher and `center`) and restores the best epoch at the end.
+  With "dino" it also logs, per epoch, statistics of the teacher's
+  targets (`_dino_epoch_metrics`), because a low DINO loss alone does not
+  tell learning from collapse: `teacher_entropy` (one image's target,
+  low = sharp), `teacher_batch_entropy` (the batch's mean target, ~0 =
+  collapse), `prototypes_used` (distinct argmax prototypes in the epoch)
+  and `top_prototype_share` (near 1 = collapse).
+- `state_dict()` / `load_state_dict()` hold only `_finetuned_modules()`
+  (~57 MB for vitb16 with 2 blocks and "nt_xent", about twice that with
+  "dino"; the rest comes from `model_name`), so `run_experiment` saves it
+  to `model.pt` and loads `model.checkpoint` like the learned models.
+  With "dino" the keys are prefixed `student.` / `teacher.`; with
+  "nt_xent" they are unprefixed, as before. DINOv3 itself is not an
+  `nn.Module`.
+
+In configs: `model.type: dinov3`, `model.params: {model_name: ...}`.
+Frozen, `training` is ignored except `batch_size`, and there is no
+checkpoint. With `model.params.finetune: true` it trains with `training.*`
+and takes a checkpoint (`configs/dinov3_finetune.yaml`: fine-tuned on
+`legion/raster/train`, features of `test`). The run name shows the
+backbone (`dinov3-vitl16__...`) when `model_name` is set,
+`finetune_method` (`-dino`) and `unfreeze_blocks` (`-u2`) when given. The checkpoints are gated: accept
+the license on the model page and run `huggingface-cli login` (or set `HF_TOKEN`) once; afterwards the
 weights come from the local cache.

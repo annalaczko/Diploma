@@ -1,4 +1,17 @@
-"""Base abstract class for all pipeline steps."""
+"""The `Step` base class that every pipeline stage builds on.
+
+Every piece of work in this project (cleaning an image, training a model,
+clustering features, ...) is a `Step`. A step knows where it reads from
+(`input_path`), where it writes to (`output_path`) and does its work in
+`run()`. The class hierarchy has two levels:
+
+    Step                      this file: paths and naming, shared by all
+      PreprocessingStep       pipeline/preprocessing/preprocessing_step.py
+      FeatureLearningStep     pipeline/feature_learning/featurelearning_step.py
+      ClusteringStep          pipeline/clustering/clustering_step.py
+      EvaluationStep          pipeline/evaluation/evaluation_step.py
+        -> concrete steps, e.g. Normalizer, VAE, HierarchicalClustering
+"""
 
 import shutil
 from abc import ABC, abstractmethod
@@ -6,19 +19,17 @@ from pathlib import Path
 from typing import Any
 
 
-# Where steps write when no output_path is given: <repo>/data/pipeline,
-# anchored to this file rather than the working directory, so a notebook
-# in notebooks/ and a script run from the repo root write to the same place.
+# Where steps write when no output_path is given: <repo>/data/pipeline.
+# It is anchored to this file, not to the working directory, so a notebook
+# in notebooks/ and a script at the repo root write to the same place.
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "data" / "pipeline"
 
 
 class Step(ABC):
-    """Abstract base class for every stage in the pipeline
-    (preprocessing, feature learning, clustering, evaluation).
+    """Abstract base class of every stage in the pipeline.
 
-    Each concrete step must implement `run`, which takes the
-    input data and returns the processed output. Subclasses can
-    add their own config via __init__.
+    Concrete steps implement `run()`. Most of them take no argument there:
+    they read `self.input_path` (or images handed over in memory) instead.
     """
 
     def __init__(
@@ -32,21 +43,19 @@ class Step(ABC):
     ):
         """
         Args:
-            input_path: where this step reads its input from (a file,
-                directory, or step-specific value such as a CSV path).
-            output_path: where this step writes its output. If omitted,
-                a directory is auto-derived (see below) and created.
-            save_results: whether the step should persist its output to
-                `output_path` (steps decide for themselves how to honor
-                this - it is not enforced here).
-            name: human-readable step name, used in logging/`__repr__`.
-                Defaults to the concrete class name.
-            delete_input_data: if True, `delete_input_data()` empties
-                `input_path` after the step considers itself done (the
-                concrete `run()` implementation must call it explicitly).
-            run_id: identifies this pipeline run; used to namespace the
-                auto-derived output directory so different runs (e.g.
-                different experiments) don't overwrite each other's data.
+            input_path: what the step reads: a file, a folder, or a
+                step-specific value such as a CSV path.
+            output_path: where the step writes. If omitted, a folder is
+                created automatically (see below).
+            save_results: whether the step should write its output. Each
+                step decides itself how to honor this.
+            name: readable name for logs; defaults to the class name.
+            delete_input_data: if True, the step's `run()` may call
+                `delete_input_data()` to empty `input_path` when it is done.
+            run_id: name of the experiment run. All steps of one run should
+                share it, so their outputs end up in one folder:
+                data/pipeline/<run_id>/<stage>/<step>/, e.g.
+                data/pipeline/my_run/PreprocessingStep/Normalizer/.
         """
         self.input_path = input_path
         self.save_results = save_results
@@ -54,9 +63,6 @@ class Step(ABC):
         if output_path:
             self.output_path = output_path
         else:
-            # Group outputs as data/pipeline/<run_id>/<stage>/<step>, where
-            # <stage> is the step's stage base class (e.g. PreprocessingStep)
-            # and <step> is the concrete class (e.g. Normalizer).
             default_output = (
                 DEFAULT_OUTPUT_ROOT
                 / run_id
@@ -72,13 +78,10 @@ class Step(ABC):
 
 
     def _stage_name(self) -> str:
-        """Name of the stage base class this step belongs to: the class in
-        its MRO (other than the concrete class itself) that subclasses
-        `Step` directly (e.g. `FeatureLearningStep` for `VAE`, even though
-        `VAE` lists `nn.Module` first, and `PreprocessingStep` for a
-        subclass of a concrete step, not that step). Falls back
-        to the concrete class name for a step that subclasses `Step`
-        directly."""
+        """The stage this step belongs to, e.g. 'PreprocessingStep' for a
+        Normalizer: the first class in the inheritance chain (MRO) that
+        derives from `Step` directly. A step deriving from `Step` itself
+        uses its own class name."""
         for cls in self.__class__.__mro__[1:]:
             if Step in cls.__bases__:
                 return cls.__name__
@@ -86,17 +89,13 @@ class Step(ABC):
 
     @abstractmethod
     def run(self, data: Any) -> Any:
-        """Execute the step on the given data and return the result.
-        
-           Returns the path to the output data generated by this step.
-        """
+        """Do the step's work and return its result (usually the output
+        folder or a table). The stage base classes narrow this signature."""
         raise NotImplementedError
 
     def delete_input_data(self) -> None:
-        """Delete all files and subfolders inside the configured input directory.
-
-        The directory itself is preserved, only its contents are removed.
-        """
+        """Delete everything inside `input_path` (a file is deleted, a
+        folder is emptied but kept)."""
         if not self.input_path:
             return
 
@@ -115,7 +114,7 @@ class Step(ABC):
                 child.unlink()
 
     def __call__(self, data: Any) -> Path:
-        # allows step_instance(data) as a shortcut for step_instance.run(data)
+        # step(data) is a shortcut for step.run(data).
         return self.run(data)
 
     def __repr__(self) -> str:

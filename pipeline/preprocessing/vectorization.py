@@ -6,6 +6,14 @@ or learned model). Ported from giappetto/shard_svg_batch.py; used by the
 Main entry point: `trace_image(gray) -> TraceResult` (raises RuntimeError
 when nothing can be traced); `render_polylines` draws the result back to a
 clean raster, `write_svg` / `write_debug` save it for inspection.
+
+How a drawing is traced:
+    1. segment_drawing   gray image -> binary mask of the ink
+    2. skeletonize       every stroke thinned to 1 px
+    3. component_paths   each connected piece -> its longest path(s)
+    4. bridge_gaps       join strokes whose ends almost meet
+    5. smooth / simplify fewer, smoother points per line
+    6. keep the longest lines (shorter ones are hatching or notes)
 """
 
 from __future__ import annotations

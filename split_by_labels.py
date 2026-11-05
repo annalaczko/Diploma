@@ -1,75 +1,87 @@
-"""Split a folder of preprocessed images into train/ and test/ by a labels
-file: an image goes to test/ if its file name without the extension
-(e.g. "a__007" for "a__007.jpg") is in the labels file's ID column, every
-other image to train/. The IDs are used as they are.
+"""Split the images under a folder into test/ and train/ subfolders of that
+same folder by the labels file: an image whose ID (file name without
+extension, with its subfolders joined by "__", see `flatten_name`) is in the
+labels file goes to test/, every other image to train/.
 
-    python split_by_labels.py data/processed/<run id>
-    python split_by_labels.py data/processed/<run id> --labels data/other_labels.csv --id-column ID
-    python split_by_labels.py data/processed/<run id> --copy --out data/processed/legion/no_axes
+    python split_by_labels.py <folder> [--labels data/ocr_data.csv] [--copy] [--dry-run]
 
-By default the images are moved into <folder>/train and <folder>/test, so the
-folder ends up as the layout run_experiment.py expects
-(data.preprocessed_path: <folder>/train). Only images directly in the folder
-are split, so running it again does not touch train/ and test/.
+The subfolders below <folder> are kept (<folder>/a/b/001.jpg ->
+<folder>/test/a/b/001.jpg), so running the pipeline on <folder>/test gives
+the same flat names (and IDs) as running it on <folder>. Works for raw scans
+(nested folders) and preprocessed images (flat "a__b__001.png" names) alike.
+By default the files are hard links (no extra disk space, the originals stay);
+--copy copies them instead.
 """
 
 import argparse
+import os
 import shutil
-import unicodedata
 from pathlib import Path
 
 import pandas as pd
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+from pipeline.preprocessing.dataset import collect_image_paths, flatten_name
+
+SPLITS = ("train", "test")
 
 
-def _key(name: str) -> str:
-    # Accented names (e.g. "Künette") can be stored in two Unicode forms.
-    return unicodedata.normalize("NFC", name.strip())
+def split_by_labels(folder: str, labels_path: str = "data/ocr_data.csv", copy: bool = False,
+                    dry_run: bool = False) -> dict[str, list[Path]]:
+    """Put every image under `folder` into `folder/test` (its ID is in the
+    `ID` column of `labels_path`) or `folder/train` (it isn't).
 
+    Images already inside `folder/train` or `folder/test`, and side outputs
+    in "_" folders (`_debug`, `_svg`), are left out. Files that already
+    exist at the destination are skipped, so the script can be run again.
 
-def split_by_labels(folder, labels="data/ocr_data.csv", out=None, copy=False, id_column="ID"):
+    Returns:
+        {"train": [...], "test": [...]}: the source image paths of each split.
+    """
     folder = Path(folder)
-    out = Path(out) if out else folder
-    table = pd.read_csv(labels)
-    if id_column not in table:
-        raise SystemExit(f"{labels} has no column {id_column!r} (columns: {list(table.columns)})")
-    test_ids = {_key(str(i)) for i in table[id_column].dropna()}
+    ids = set(pd.read_csv(labels_path)["ID"].astype(str))
 
-    images = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
-    if not images:
-        raise SystemExit(f"No images directly in {folder}")
-    train_dir, test_dir = out / "train", out / "test"
-    train_dir.mkdir(parents=True, exist_ok=True)
-    test_dir.mkdir(parents=True, exist_ok=True)
+    images = [p for p in collect_image_paths(folder)
+              if p.relative_to(folder).parts[0] not in SPLITS]
+    print(f"Found {len(images)} images under {folder}, {len(ids)} labelled IDs in {labels_path}")
 
-    transfer = shutil.copy2 if copy else shutil.move
-    n_test = 0
-    for image in images:
-        is_test = _key(image.stem) in test_ids  # stem: the file name without its extension
-        transfer(str(image), str((test_dir if is_test else train_dir) / image.name))
-        n_test += is_test
+    splits = {split: [] for split in SPLITS}
+    found_ids = set()
+    for path in images:
+        image_id = Path(flatten_name(path, folder)).stem
+        if image_id in ids:
+            found_ids.add(image_id)
+            splits["test"].append(path)
+        else:
+            splits["train"].append(path)
 
-    found = {_key(p.stem) for p in images}
-    missing = sorted(test_ids - found)
-    print(f"{'Copied' if copy else 'Moved'} {len(images)} images from {folder}")
-    print(f"  train: {len(images) - n_test} -> {train_dir}")
-    print(f"  test:  {n_test} -> {test_dir}")
+    for split, paths in splits.items():
+        print(f"{split.capitalize():5}: {len(paths)} -> {folder / split}")
+    missing = sorted(ids - found_ids)
     if missing:
-        print(f"  {len(missing)} labelled IDs have no image in {folder} (e.g. {missing[0]})")
+        print(f"{len(missing)} labelled IDs have no image under {folder}, e.g. {missing[:3]}")
+    if dry_run:
+        return splits
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Split images into train/test by the OCR labels")
-    parser.add_argument("folder", help="folder with the images (only files directly in it)")
-    parser.add_argument("--labels", default="data/ocr_data.csv", help="labels CSV (default: %(default)s)")
-    parser.add_argument("--id-column", default="ID",
-                        help="column with the image names without extension (default: %(default)s)")
-    parser.add_argument("--out", default=None, help="where train/ and test/ are created (default: the folder itself)")
-    parser.add_argument("--copy", action="store_true", help="copy instead of move, keeping the originals")
-    args = parser.parse_args()
-    split_by_labels(args.folder, args.labels, args.out, args.copy, args.id_column)
+    for split, paths in splits.items():
+        for path in paths:
+            target = folder / split / path.relative_to(folder)
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if copy:
+                shutil.copy2(path, target)
+            else:
+                os.link(path, target)
+    return splits
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("folder", help="folder searched (recursively) for images; train/ and test/ are created in it")
+    parser.add_argument("--labels", default="data/ocr_data.csv",
+                        help="CSV with an ID column (file name without extension); these images go to test/")
+    parser.add_argument("--copy", action="store_true", help="copy the files instead of hard-linking them")
+    parser.add_argument("--dry-run", action="store_true", help="only print the counts, write nothing")
+    args = parser.parse_args()
+
+    split_by_labels(args.folder, args.labels, args.copy, args.dry_run)

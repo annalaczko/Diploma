@@ -1,12 +1,9 @@
-"""Shared early-stopping logic, used by every feature-learning training
-loop in this package (`VAE`, `SimCLR`, `BYOL`, `VAEClassifier`): stop once
-a smoothed metric has stopped improving for several epochs in a row, and
-restore the best-epoch weights afterward.
+"""Early stopping shared by every training loop (`VAE`, `SimCLR`, `BYOL`,
+`VAEClassifier`): stop once a smoothed metric has not improved for several
+epochs in a row, and restore the weights of the best epoch.
 
-Factored out of `VAEClassifier` (the first of these to have early
-stopping) so the unsupervised approaches - which have no validation split
-and instead watch their own smoothed *training* loss - can reuse the exact
-same moving-average-plus-patience logic instead of re-implementing it.
+The unsupervised models watch their training loss (mode="min"), the
+classifier its validation accuracy (mode="max").
 """
 
 

@@ -1,0 +1,53 @@
+# Only preprocessing: the fixed half-page-width crop of configs/only_prep/raster_crop.yaml, then the
+# coordinate system drawn onto the images (AxisRenderer), for both splits: the train scans (to fine-tune on)
+# and the test scans (to extract features from and evaluate), so both get exactly the same steps.
+# Run:  python run_experiment.py configs/only_prep/raster_crop_axes.yaml
+# The images land in data/pipeline/<run name>/PreprocessingStep/AxisRenderer/; use those folders as
+# data.preprocessed_path and data.extract_path in configs/dinov3_finetune.yaml.
+
+# ===================================================================== run
+experiment: prep             # MLflow experiment name
+name: raster-crop_with_axes     # run name; the sweep adds the split to it
+stop_after: preprocessing    # no model, no clustering
+sweep:                       # one run per split
+  data.raw_path: [data/legion_raw_train, data/legion_raw_test]
+
+# ===================================================================== data
+data:
+  source: raw
+  raw_path: data/legion_raw   # set by the sweep: the 5732 train scans (hard links into data/legion_raw,
+                                    # the same images as data/processed/legion/raster/train) and the 439 test scans
+
+# ===================================================================== preprocessing
+# The steps of configs/only_prep/raster_crop.yaml, plus AxisRenderer.
+preprocessing:
+  mode: memory               # memory: only the last step's images are saved | disk: every step's are
+  batch_size: 256            # images preprocessed at once in memory mode
+  steps:
+    - BackgroundEraser:
+        mode: segmentation
+        model: models/yolov8n_seg_finetuned.pt
+        batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
+        mask_margin: 0.01
+        crop_size: 0.5       # square side = half the scan width, centered on the shard; null = fitted to the shard
+                             # (shards larger than that are cut off, listed in MLflow as clipped.txt)
+        record_axes: true    # needed: AxisRenderer draws the axes found here
+        debug_images: 0
+    - Normalizer:
+        target_size: 256
+        background_color: [255, 255, 255]
+    - Repair:
+        contrast_factor: 5
+        dilate_kernel_size: 1
+        dilate_iterations: 1
+        skeletonize: false
+        output_thickness: 2
+        debug_images: 0
+    # Draws the coordinate system: the image is extended with white so the axes fit (the content
+    # shrinks), then the axes are drawn. Images without axes pass through unchanged.
+    - AxisRenderer:
+        axis_thickness: 2    # width of the drawn axes (px)
+        margin: 0.03         # white space beyond the axis ends (fraction of the image)
+        binarize: true       # after shrinking: darker than threshold -> black, rest white (keeps thin lines visible)
+        threshold: 235
+        antialias: false

@@ -1,0 +1,58 @@
+# DINOv3 fine-tuned self-supervised (NT-Xent on two random views, no labels) on the TRAIN images,
+# then the features of the TEST images clustered and evaluated. The frozen baseline: configs/dinov3.yaml.
+# The TypeRev labels exist only for the test images, so training on train keeps them out of training.
+# Gated on Hugging Face: accept the license on the model page and `huggingface-cli login` once.
+# Every option: configs/template.yaml.
+#
+# To use it: set the two folders under "data" (marked EDIT), then
+#   python run_experiment.py configs/dinov3_finetune.yaml --dry-run   # check the paths
+#   python run_experiment.py configs/dinov3_finetune.yaml
+# Both folders hold ready images (e.g. the PreprocessingStep/Repair output of
+# configs/only_prep/raster_crop.yaml, run once on the train and once on the test split).
+# Relative paths are relative to the repository root.
+
+# ===================================================================== data
+data:
+  source: preprocessed       # ready images, no preprocessing in this run
+  # EDIT: TRAIN folder, the model is fine-tuned on these (their features: features_train.csv)
+  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/pagecrop/axes/train
+  # EDIT: TEST folder, features, clustering and evaluation come from these
+  extract_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/pagecrop/axes/test
+  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  features: null             # must stay null: with extract_path the features are computed in this run
+
+# ===================================================================== run
+experiment: dinov3-experiments          # MLflow experiment name
+name: finetune-P-A                   # run name; null = generated (model, params, clustering, data) + date-time
+stop_after: null             # null = whole run | features (no clustering/evaluation)
+sweep:                       # one run per combination (see pipeline/README.md#sweeps); the model is
+                             # fine-tuned once, the clustering settings re-cluster the same test features.
+                             # Combinations that cannot run (ward/centroid with a non-euclidean metric, auto with
+                             # a second metric) are left out and listed.
+  model.params.unfreeze_blocks: [1,2] 
+  training.epochs: [30, 80]
+  clustering.method: [ average]
+  clustering.metric: [euclidean]
+  clustering.cluster_num: [15]
+
+# ===================================================================== model
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m   # or -vits16- (smaller), -vitb16-
+    finetune: true           # train the last blocks (training.train: true) before extracting features
+    unfreeze_blocks: 2       # last N transformer blocks (+ final norm) trained, the rest stays frozen
+    projection_dim: 128      # projection head output, what the loss sees (the features stay the CLS token)
+    temperature: 0.1         # NT-Xent temperature; lower = sharper, harder negatives
+  checkpoint: null           # model.pt of an earlier fine-tuning run: continue it, or with train: false only extract
+
+# ===================================================================== training
+training:                    # arguments of DINOv3.run()
+  train: true                # true = fine-tune on preprocessed_path, then extract from extract_path
+                             # false = only extract from extract_path (needs model.checkpoint)
+  epochs: 100                # maximum epochs (early stopping may end sooner)
+  lr: 1.0e-5                 # AdamW; small, so the pretrained blocks are only adjusted
+  batch_size: 256            # images per step (x2 views); also the extraction batch; lower it on CUDA out-of-memory
+  early_stopping_patience: 5        # stop after this many epochs without improvement of the smoothed loss
+  early_stopping_min_delta: 0.0     # minimum improvement that counts
+  early_stopping_smoothing_window: 3    # epochs in the moving average early stopping watches

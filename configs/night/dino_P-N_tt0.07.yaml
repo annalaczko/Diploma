@@ -1,0 +1,42 @@
+# Night run, GPU 2: DINO, P-N, unfreeze_blocks 2, teacher_temp 0.07 (the one change from dino_P-N.yaml's u2 run)
+# Train on pagecrop/no_axes/train, cluster and evaluate the test_top5 images.
+# Augmentation: build_line_drawing_augmentation (pipeline/preprocessing/augmentation.py), set in code.
+# The commands for the whole GPU queue: configs/night/README.md. Every option: configs/template.yaml.
+
+data:
+  source: preprocessed
+  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/pagecrop/no_axes/train
+  extract_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/pagecrop/no_axes/test_top5
+  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  features: null             # must stay null: with extract_path the features are computed in this run
+
+experiment: dinov3-night     # MLflow experiment (separate from the runs with the old augmentation)
+name: DINO-P-N-u2-tt0.07
+stop_after: null
+sweep:                       # each model setting trained once, its features clustered 3 ways
+  clustering.method: [average, ward]
+  clustering.metric: [euclidean, cosine]
+  clustering.cluster_num: [5]
+
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    finetune: true
+    finetune_method: dino
+    unfreeze_blocks: 2
+    num_prototypes: 1024     # size of the head output (soft pseudo-classes)
+    teacher_momentum: 0.99   # ~22 steps per epoch: the teacher lags ~1/(1-m) = 100 steps (~5 epochs)
+    teacher_temp: 0.07       # low = sharp teacher targets
+    student_temp: 0.1
+    center_momentum: 0.9
+  checkpoint: null
+
+training:
+  train: true
+  epochs: 50
+  lr: 3.0e-05
+  batch_size: 256            # images per step (x2 views)
+  early_stopping_patience: 30       # the DINO loss often rises in the first epochs
+  early_stopping_min_delta: 0.0
+  early_stopping_smoothing_window: 3

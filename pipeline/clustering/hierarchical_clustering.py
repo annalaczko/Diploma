@@ -1,20 +1,29 @@
-"""Concrete clustering steps."""
+"""HierarchicalClustering: groups the feature vectors into a fixed number
+of clusters with agglomerative (bottom-up) clustering.
+
+Agglomerative clustering starts with every image as its own cluster and
+repeatedly merges the two closest clusters. The `metric` says how the
+distance of two vectors is measured (e.g. euclidean, cosine); the `method`
+(linkage) says how the distance of two clusters follows from it (e.g.
+'ward' merges the pair that increases the within-cluster variance least).
+The merge tree is finally cut so that `cluster_num` clusters remain.
+"""
+
+import re
 
 import numpy as np
-import re as regex_module
+import pandas as pd
+from scipy.cluster import hierarchy
+from scipy.spatial.distance import pdist
 
 from pipeline import tracking
 from pipeline.clustering.clustering_step import ClusteringStep
-from scipy.cluster import hierarchy
-from scipy.spatial.distance import pdist
-import pandas as pd
 
 
 class HierarchicalClustering(ClusteringStep):
-    """Hierarchical clustering over precomputed feature vectors, built on
-    scipy. Supports the same linkage methods and distance metrics used by
-    Parisotto, and can sweep all of their combinations to pick the best one
-    by cophenetic correlation (see `compare_all`).
+    """Hierarchical clustering of the vectors in a features.csv (scipy).
+    `compare_all` can pick the method/metric pair with the best cophenetic
+    correlation (the same methods and metrics as Parisotto's work).
     """
 
     METHODS = ('single', 'complete', 'average', 'weighted', 'centroid', 'ward')
@@ -51,8 +60,8 @@ class HierarchicalClustering(ClusteringStep):
         features = pd.read_csv(input_path)
         self.vectors = self.parse_feature_string(features['features'].values)
         self.filenames = features['filename'].tolist() if 'filename' in features else None
-        self.methods=list(self.METHODS)
-        self.metrics=list(self.METRICS)
+        self.methods = list(self.METHODS)
+        self.metrics = list(self.METRICS)
 
         self.best_method = method if method in self.methods else 'average'
         self.best_metric = metric if metric in self.metrics else 'euclidean'
@@ -60,16 +69,12 @@ class HierarchicalClustering(ClusteringStep):
 
 
     def run(self):
-        """Cluster `self.vectors` into `self.cluster_num` flat clusters
-        using `self.best_method`/`self.best_metric` (either passed in at
-        construction, or the winners from a prior `compare_all()` call).
+        """Cluster `self.vectors` into `self.cluster_num` clusters with
+        `best_method`/`best_metric` (as given, or chosen by `compare_all`).
 
         Returns:
-            fclusterdata : ndarray
-                    A vector of length n. T[i] is the flat cluster number to
-                    which original observation i belongs.
+            An array with the cluster number (1, 2, ...) of every image.
         """
-
         result = hierarchy.fclusterdata(self.vectors, t=self.cluster_num, criterion="maxclust", metric=self.best_metric, method=self.best_method)
         self._log_run(result)
         return result
@@ -97,29 +102,20 @@ class HierarchicalClustering(ClusteringStep):
         tracking.log_table(pd.DataFrame({"filename": names, "cluster": labels}), "clustering/clusters.csv")
 
     def compare_all(self):
-        """Try every (method, metric) combination and rank them by
-        cophenetic correlation, a measure of how well a linkage's
-        dendrogram distances preserve the original pairwise distances
-        (higher = the clustering better reflects the true data geometry).
-
-        As a side effect, updates `self.best_method`/`self.best_metric`
-        to the winning combination, so a subsequent `run()` call uses it.
+        """Try every (method, metric) pair and keep the one with the highest
+        cophenetic correlation: how well the distances in the merge tree
+        match the original distances between the vectors (higher = more
+        faithful). Sets `best_method`/`best_metric`, which `run()` uses.
 
         Returns:
-            list of dict: one entry per (method, metric) combination, with
-            keys 'method', 'metric' and 'cophenetic coefficient score'.
+            One dict per pair: 'method', 'metric' and 'cophenetic
+            coefficient score' (scipy's `cophenet` result, a tuple whose
+            first element is the coefficient).
         """
-
-        results=[]
-        
+        results = []
         for metric in self.metrics:
-
-            # Compute the distance matrix for the current metric
-            distance_matrix=pdist(self.vectors, metric=metric)
-
-            for method in self.methods:    
-
-                # Creating the linkage matrix and computing the cophenetic score for the current method and metric
+            distance_matrix = pdist(self.vectors, metric=metric)
+            for method in self.methods:
                 linkage_matrix = hierarchy.linkage(distance_matrix, method = method, metric = metric)
                 cophenetic_score = hierarchy.cophenet(linkage_matrix, distance_matrix)
 
@@ -148,25 +144,20 @@ class HierarchicalClustering(ClusteringStep):
         return results
 
     def parse_feature_string(self, values):
-        """Turn the 'features' column of a feature-learning CSV into a
-        dense (n_samples, n_features) float matrix.
+        """Turn the 'features' column of a features.csv back into an
+        (n_samples, n_features) float matrix.
 
-        Feature vectors get written to CSV as their string repr (e.g.
-        numpy's `"[0.1, 0.2, ...]"` or space-separated form), since CSV
-        cells can't hold arrays directly. This undoes that: for each row,
-        strips brackets, normalizes comma/whitespace separators, and
-        parses the numbers back out.
+        A CSV cell cannot hold an array, so the vectors are stored as text,
+        e.g. "[0.1 0.2 ...]" (numpy's print form), "0.1, 0.2" or "0.1 0.2".
+        Brackets and commas are dropped and the numbers parsed.
 
         Args:
-            values: the CSV column's values - typically a pandas Series
-                or numpy array of strings, but a single string or an
-                already-numeric array/row is also accepted.
+            values: the column (pandas Series or array of strings); a single
+                string or an already numeric row also works.
 
         Returns:
-            A single 1D array if `values` was a single row/string, else a
-            stacked (n_samples, n_features) array. Raises ValueError if
-            the parsed rows don't all share the same length, since
-            clustering requires a consistent feature dimensionality.
+            A 1D array for a single string, else the stacked matrix. Raises
+            ValueError if the rows have different lengths.
         """
         def _parse_one(raw):
             """Parse a single cell into a 1D float array, or None if it's missing (NaN)."""
@@ -181,7 +172,7 @@ class HierarchicalClustering(ClusteringStep):
                 cleaned = cleaned[1:-1]
 
             cleaned = cleaned.replace(',', ' ')
-            cleaned = regex_module.sub(r'\s+', ' ', cleaned).strip()
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
 
             if not cleaned:
                 return np.empty(0, dtype=float)

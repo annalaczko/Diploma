@@ -56,6 +56,9 @@ def test_typos_and_inconsistent_settings_are_rejected(tmp_path):
     (["model.type=dinov3"], "dinov3__ward-euclidean-c55__legion-no_axes-train"),
     (["model.type=dinov3", "model.params.model_name=facebook/dinov3-vitl16-pretrain-lvd1689m"],
      "dinov3-vitl16__ward-euclidean-c55__legion-no_axes-train"),
+    (["model.type=dinov3", "model.params.finetune=true", "model.params.finetune_method=dino",
+      "model.params.unfreeze_blocks=3"],
+     "dinov3-dino-u3_e100__ward-euclidean-c55__legion-no_axes-train"),
 ])
 def test_run_name_describes_the_config(overrides, expected):
     assert run_name(load_config(None, overrides)) == expected

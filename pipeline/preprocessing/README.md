@@ -16,7 +16,7 @@ pipeline/preprocessing/
 ├── repair.py                # Repair
 ├── normalizer.py            # Normalizer
 ├── augmentation.py           # Augmentor
-├── dataset.py                # collect_image_paths, ImageDataset (shared, also used by feature_learning)
+├── dataset.py                # collect_image_paths, ImageDataset, TwoViewDataset (shared, also used by feature_learning)
 └── utils.py                   # convert_json_to_yolo: standalone LabelMe -> YOLO conversion script
 ```
 
@@ -453,6 +453,17 @@ transformed copies named `<stem>_aug<i><suffix>`. Built on
 regardless of the source image's own dimensions - only the kept-original
 copy (if any) is left at its original size.
 
+`build_line_drawing_augmentation(output_size=256, rotation_degrees=5.0,
+translate=0.08, scale=(0.9, 1.1), elastic_alpha=50.0, elastic_sigma=6.0,
+elastic_probability=0.5, thicken_probability=0.5, thicken_size=3,
+erase_probability=0.5)`, in the same file, is a second recipe for dark line
+drawings on white, used by DINOv3's fine-tuning: a small rotation, shift
+and resize (no crop, so the size stays roughly the same; no mirroring),
+sometimes an elastic distortion, sometimes thicker lines (a minimum
+filter), sometimes missing pieces of the lines (`EraseLineSegments`:
+1-3 squares centred on line pixels, 5-15% of the drawing's extent). The
+background stays white. The Augmentor itself doesn't use it.
+
 ## `dataset.py` — shared image-loading helpers
 
 These live in `preprocessing` because it's the one place in the codebase
@@ -515,12 +526,24 @@ This single class replaces what used to be two separate, near-duplicate
 `Dataset` classes in `pipeline.feature_learning.vae` (one for the VAE, one
 for the classifier) that had drifted out of sync with each other.
 
+### `TwoViewDataset(paths, transform)`
+
+The dataset of the contrastive / self-distillation learners (`SimCLR`,
+`BYOL`, and the `DINOv3` fine-tuning): each `__getitem__` converts the image
+to grayscale and applies `transform` (PIL in, tensor out, e.g.
+`build_augmentation_transform()` + `ToTensor()`) twice, independently,
+returning the pair `(view1, view2)` - two random views of the same image,
+the "positive pair" the loss pulls together. They are made anew on every
+fetch, so each epoch sees different variations. It has no labels, unlike
+`ImageDataset`. `paths` may also be an `InMemoryImages`.
+
 ## `utils.py` — `convert_json_to_yolo`
 
 A standalone one-off script (not a `Step`), unrelated to the classes above.
-Converts LabelMe-style polygon annotation JSON files into YOLO segmentation
-label `.txt` files. Run directly (`python -m pipeline.preprocessing.utils`)
-against a folder of LabelMe exports. Two things worth knowing if you reuse
-it: it hardcodes class id `1` for every polygon (this dataset only ever
-labels one class), and it only converts the *first* shape in each JSON file
-— multi-polygon annotations would lose everything past the first one.
+Converts LabelMe annotation JSON files into YOLO detection label `.txt`
+files (`0 x_center y_center width height`, normalized to the image size).
+Run directly (`python -m pipeline.preprocessing.utils`) against a folder of
+LabelMe exports. Two things worth knowing if you reuse it: it writes class
+id `0` for every box (this dataset only ever labels one class), and it only
+uses the first two points of the *first* shape in each JSON file, as the
+box's opposite corners.

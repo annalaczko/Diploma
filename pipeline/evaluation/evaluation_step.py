@@ -1,23 +1,29 @@
-"""Abstract base for evaluation steps."""
+"""Evaluation steps: how good is a clustering?
+
+Two kinds of evaluation:
+  - EvaluationWithNoGroundTruth: needs only the features and the cluster
+    labels (silhouette score: are clusters compact and well separated?).
+  - EvaluationWithGroundTruth: compares the clusters with the known pottery
+    types (ARI, NMI and accuracy under the best cluster <-> type matching).
+"""
 
 from abc import abstractmethod
-from typing import Any, Dict
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
 
 from pipeline import tracking
 from pipeline.steps.step import Step
-import pandas as pd
-import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 
 class EvaluationStep(Step):
-    """Common contract for evaluation methods
-    (ARI, NMI, F-measure, precision@k, nearest-neighbour retrieval, silhouette).
-
-    `run` takes predicted labels (and ground truth / features as needed)
-    and returns a dict of metric name -> value, also logged to the active
-    MLflow run as 'eval/<name>'.
+    """Base class of the evaluations. They get their inputs in `__init__`
+    (they don't call `Step.__init__`: there is no folder to read or write),
+    and `run()` returns {metric name: value}, also logged to MLflow as
+    'eval/<name>'.
     """
 
     @abstractmethod
@@ -25,9 +31,9 @@ class EvaluationStep(Step):
         raise NotImplementedError
 
 class EvaluationWithNoGroundTruth(EvaluationStep):
-    """Unsupervised evaluation: scores cluster labels using only the
-    features themselves (no true labels needed), via the silhouette
-    score - useful when the dataset isn't fully labelled.
+    """Silhouette score of the clusters, computed from the features alone
+    (no true labels needed). Ranges from -1 to 1; higher means each image
+    is closer to its own cluster than to the nearest other one.
     """
 
     def __init__(self, features, y_pred):
@@ -57,9 +63,11 @@ class EvaluationWithNoGroundTruth(EvaluationStep):
         return f"-----\nEvaluation results: \nSilhouette Score = {self.silhouette}\n-----\n\n"
 
 class EvaluationWithGroundTruth(EvaluationStep):
-    """Supervised evaluation: compares predicted cluster/class labels
-    against known true labels using ARI, NMI, and a best-match accuracy
-    (see `clustering_accuracy`).
+    """Compares the clusters with the true labels:
+      - ARI (adjusted Rand index): agreement of the two groupings, 0 = random.
+      - NMI (normalized mutual information): shared information, 0..1.
+      - ACC: accuracy under the best one-to-one cluster <-> class matching
+        (see `clustering_accuracy`).
     """
 
     def __init__(self, y_true, y_pred):
@@ -100,16 +108,12 @@ class EvaluationWithGroundTruth(EvaluationStep):
 
 
     def clustering_accuracy(self, y_true, y_pred):
-        """Best-case accuracy under the optimal cluster-id <-> true-label
-        matching (since cluster labels are arbitrary integers with no
-        inherent correspondence to the true class ids).
-
-        Builds a (true classes x predicted clusters) contingency matrix,
-        then uses the Hungarian algorithm (`linear_sum_assignment`) to
-        find the one-to-one matching between clusters and true classes
-        that maximizes the number of correctly "matched" samples -
-        equivalent to the standard unsupervised clustering accuracy
-        metric used in the clustering literature.
+        """Accuracy under the best one-to-one matching of clusters to
+        classes. Cluster ids are arbitrary (cluster 3 has nothing to do with
+        class 3), so first each cluster is paired with the class it fits
+        best: the Hungarian algorithm (`linear_sum_assignment`) picks the
+        pairing that maximizes the number of correctly placed samples. This
+        is the standard clustering accuracy of the literature.
 
         Args:
             y_true: (n_samples,) ground-truth labels (any hashable type).

@@ -1,9 +1,9 @@
 """Run one experiment from a config file (see configs/default.yaml for every
 setting and pipeline/experiment.py for what a run records):
 
-    python run_experiment.py configs/vae_k16_beta32.yaml
-    python run_experiment.py configs/vae_k16_beta32.yaml --set clustering.cluster_num=30
-    python run_experiment.py configs/vae_k16_beta32.yaml --dry-run
+    python run_experiment.py configs/vae.yaml
+    python run_experiment.py configs/vae.yaml --set clustering.cluster_num=30
+    python run_experiment.py configs/vae.yaml --dry-run
 
 A config with a `sweep` runs one experiment per combination of its values
 (see pipeline.experiment.run_sweep).

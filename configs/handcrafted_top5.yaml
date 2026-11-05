@@ -1,0 +1,29 @@
+# Handcrafted features of the top-5-type test images, clustered and evaluated.
+# Same features and clustering as the run handcrafted__methodward-metriceuclidean-cluster_num5__20261030-133334
+# (Vectorizer output, features: position, size, axis_distance, thickness, fourier; ward, 5 clusters);
+# its features.csv filtered to the 356 images of data/processed/pagecrop/no_axes/test_top5
+# (data/pipeline/handcrafted-top5__20261030-133334/), so only the clustering runs again.
+#   python run_experiment.py configs/handcrafted_top5.yaml
+
+data:
+  source: preprocessed
+  labels: data/ocr_data.csv
+  features: data/pipeline/handcrafted-top5__20261030-133334/FeatureLearningStep/HandcraftedFeatures/features.csv
+
+experiment: pottery
+name: handcrafted-top5__methodward-metriceuclidean-cluster_num5
+stop_after: null
+
+model:
+  type: handcrafted
+  params:
+    features: [position, size, axis_distance, thickness, fourier]
+    efd_harmonics: 10
+
+clustering:
+  method: ward
+  metric: euclidean
+  cluster_num: 5
+  standardize: true
+  min_variance: 0.001
+  feature_importance: 10

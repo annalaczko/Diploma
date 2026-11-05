@@ -1,0 +1,50 @@
+# Which clustering is stable? Every clustering option on the test_top5 features of two independently
+# trained DINO P-A models with the same settings (dino_P-A.yaml unfreeze_blocks 3, and its repeat
+# dino_P-A_u3_repeat.yaml). Hierarchical clustering is deterministic, so running it twice on the same
+# features gives the same result: the instability comes from the training, and a clustering is stable
+# when it scores about the same on both models' features.
+# Nothing is trained; only the existing features.csv files are clustered and evaluated.
+#
+#   python run_experiment.py configs/clustering_stability_P-A.yaml --dry-run   # list the runs
+#   python run_experiment.py configs/clustering_stability_P-A.yaml
+#
+# Summary of every run (features x method x metric x standardize, with acc/ari/nmi):
+#   data/pipeline/sweep-clustering-stability-P-A__<time>/summary.csv
+
+data:
+  source: preprocessed
+  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  extract_path: null
+  features: null             # set by the sweep
+
+experiment: clustering-stability   # separate MLflow experiment
+name: clustering-stability-P-A
+stop_after: null
+sweep:
+  data.features:
+    # DINO-P-A, unfreeze_blocks 3 (first training)
+    - data/pipeline/DINO-P-A__unfreeze_blocks3-methodaverage-metriceuclidean__20261105-063354/FeatureLearningStep/DINOv3/features.csv
+    # DINO-P-A-u3-repeat (second training, same settings)
+    - data/pipeline/DINO-P-A-u3-repeat__methodaverage-metriceuclidean__20261105-093139/FeatureLearningStep/DINOv3/features.csv
+    # DINO-P-A-u3-repeat2 (third training)
+    - data/pipeline/DINO-P-A-u3-repeat2__methodaverage-metriceuclidean__20261105-112733/FeatureLearningStep/DINOv3/features.csv
+  clustering.method: [single, complete, average, weighted, centroid, ward]
+  clustering.metric: [euclidean, cityblock, chebyshev, cosine]   # centroid/ward: euclidean only, the rest is left out
+  clustering.standardize: [true, false]
+  clustering.cluster_num: [5]
+
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    finetune: true
+    finetune_method: dino
+    unfreeze_blocks: 3
+  checkpoint: null
+
+training:
+  train: true                # not used: with data.features nothing is trained or extracted
+
+clustering:
+  min_variance: 1.0e-3       # with standardize: drop dimensions whose variance is below this
+  feature_importance: 0      # off: 768 unnamed DINO dimensions

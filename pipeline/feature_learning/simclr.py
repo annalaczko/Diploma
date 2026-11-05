@@ -1,24 +1,13 @@
-"""SimCLR: contrastive self-supervised feature learning, as an
-alternative to the VAE's reconstruction-based objective.
+"""SimCLR: contrastive self-supervised feature learning (Chen et al., 2020).
 
-Motivation (see the project's notes on why the VAE encoder underperforms
-on classification): a VAE's encoder is only ever pushed to encode
-whatever makes *pixel reconstruction* easy - which, on largely-white
-line-drawing images, ends up being coarse shape rather than the fine
-typological detail that actually distinguishes pottery types. SimCLR
-(Chen et al., "A Simple Framework for Contrastive Learning of Visual
-Representations", 2020) instead trains the encoder to recognize that two
-differently-augmented views of the *same* image belong together and are
-different from every other image in the batch - a directly discriminative
-objective, with no labels required.
+The idea: make two random variations ("views") of every image. The encoder
+is trained so that the two views of the same image get similar vectors,
+and views of different images get different ones. No labels are needed.
 
-Uses the *same* f/n/s/k-controlled conv architecture as
-`pipeline.feature_learning.vae.Encoder` (so the two approaches are an
-apples-to-apples comparison of *objective*, not of network capacity), but
-as its own `SimCLREncoder` rather than reusing that class directly -
-`SimCLREncoder` adds BatchNorm after every convolution, which the VAE's
-Encoder has never needed but contrastive training does (see
-`SimCLREncoder`'s docstring for why).
+Compared with the VAE, which learns whatever helps to redraw the pixels,
+this objective directly rewards telling sherds apart. The encoder has the
+same layout as the VAE's (same f/n/s/k), so the two can be compared on the
+training objective alone; `SimCLREncoder` only adds BatchNorm.
 """
 
 from pathlib import Path
@@ -28,36 +17,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset
 from torchvision import transforms
 
 from pipeline.feature_learning.featurelearning_step import FeatureLearningStep
 from pipeline.feature_learning.early_stopping import EarlyStopping
 from pipeline.preprocessing.augmentation import build_augmentation_transform
-from pipeline.preprocessing.dataset import ImageDataset, image_entries, open_image
+from pipeline.preprocessing.dataset import ImageDataset, TwoViewDataset
 
 
 class SimCLREncoder(nn.Module):
-    """Downsamples a 256x256 grayscale image to a `k`-dim embedding,
-    through the same 4-block, f/n/s-controlled conv architecture as
-    `vae.Encoder` - but with a `BatchNorm2d` after every convolution, and
-    a single embedding head instead of a mu/sigma split (SimCLR only ever
-    needs one embedding per image, never a distribution to sample from).
+    """The VAE's Encoder layout (see `vae.Encoder`), with two differences:
+    a `BatchNorm2d` after every convolution, and one `k`-dim output (an
+    embedding, not a mean/variance pair).
 
-    Why BatchNorm here but not in the VAE's Encoder: contrastive losses
-    like NT-Xent are prone to *representation collapse* - the encoder
-    settling into emitting a near-constant embedding for every input,
-    since early in training (before any real structure has been learned)
-    that can look like a stable low-gradient point to the optimizer. Once
-    collapsed, every pairwise similarity is roughly equal, which is
-    exactly what produces a loss stuck at ln(2N-1) (the "random guessing"
-    baseline) no matter how long training runs. BatchNorm normalizes
-    activations *across the batch*, which prevents this by forcing the
-    batch's embeddings to stay spread out - this is why virtually every
-    contrastive/self-supervised architecture uses it (see also Grill et
-    al., "Bootstrap Your Own Latent", 2020, which studied this failure
-    mode directly). The VAE's reconstruction loss has no equivalent
-    collapse mode, so its Encoder never needed BatchNorm.
+    Why BatchNorm: contrastive training can "collapse", with the encoder
+    giving every image nearly the same vector (the loss then sticks at
+    ln(2N-1), the random-guess value). BatchNorm normalizes across the
+    batch, which keeps the vectors of a batch spread out. The VAE's loss
+    has no such failure mode, so its Encoder does without.
     """
 
     def __init__(self, f=4, n=3, s=1, k=128, p=1):
@@ -115,46 +92,13 @@ class SimCLREncoder(nn.Module):
         x = x.view(x.size(0), -1)
         return self.fc(x)
 
-
-class SimCLRDataset(Dataset):
-    """Yields two independently-augmented views of each image - the
-    positive pair SimCLR's contrastive loss is trained to recognize as
-    "the same underlying image". Unlike `ImageDataset`, this has no
-    labels and no notion of a fixed "correct" output - both views are
-    randomly generated fresh every time an item is fetched (i.e. every
-    epoch sees different crops/jitter/blur of the same source image).
-    """
-
-    def __init__(self, paths, transform):
-        """
-        Args:
-            paths: sequence of image file paths, or an `InMemoryImages`.
-            transform: a torchvision transform (PIL in, PIL out) applied
-                independently twice per image to produce the two views;
-                typically `build_augmentation_transform(...)` composed
-                with `transforms.ToTensor()`.
-        """
-        self.paths, _ = image_entries(paths)
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        image = open_image(self.paths, idx).convert("L")
-        view1 = self.transform(image)
-        view2 = self.transform(image)
-        return view1, view2
-
-
 class SimCLR(nn.Module, FeatureLearningStep):
-    """Contrastive feature learner: a `SimCLREncoder` backbone plus a
-    small projection head, trained with the NT-Xent contrastive loss on
-    pairs of augmented views. Once trained, features for downstream
-    clustering are taken from the *encoder* output (`h`), not the
-    projection head's output (`z`) - per the SimCLR paper, `h` transfers
-    better to downstream tasks, while `z` is only useful for computing
-    the contrastive loss during training and is discarded afterward.
+    """Contrastive feature learner: a `SimCLREncoder` plus a small
+    projection head, trained with the NT-Xent loss on pairs of views.
+
+    The features are the encoder's output `h`, not the projection head's
+    output `z`: `z` is only used by the loss (the SimCLR paper found `h`
+    works better for later tasks).
     """
 
     def __init__(
@@ -175,14 +119,10 @@ class SimCLR(nn.Module, FeatureLearningStep):
         Args:
             input_path: folder of images to train on / extract features
                 from (searched recursively).
-            f, n, s, k: `SimCLREncoder` architecture hyperparameters - see
-                its docstring for what each controls. Match the VAE's own
-                `f`/`n`/`s`/`k` values here to keep a fair,
-                architecture-controlled comparison between the two.
-            projection_dim: output size of the projection head `g(h)`
-                used only for the contrastive loss; smaller than `k` is
-                standard practice (forces the loss to work with a more
-                compressed space than the features actually extracted).
+            f, n, s, k: encoder layout, as in `vae.Encoder` (use the VAE's
+                values for a fair comparison).
+            projection_dim: output size of the projection head, only used
+                by the loss; usually smaller than `k`.
         """
         nn.Module.__init__(self)
         # Architecture settings, logged to MLflow with each training run.
@@ -225,47 +165,13 @@ class SimCLR(nn.Module, FeatureLearningStep):
         early_stopping_min_delta=0.0,
         early_stopping_smoothing_window=10,
     ) -> pd.DataFrame:
-        """Either train the encoder+projection head from scratch with the
-        contrastive loss, or just embed `input_path`'s images with the
-        current (e.g. previously loaded) encoder weights.
-
-        Args:
-            mode: 'train_model' trains for `epochs` epochs and then
-                extracts features from the trained encoder;
-                'extract_features' (default) skips training and just runs
-                inference - use this once you already have trained
-                weights loaded.
-            epochs: maximum training epochs, only used when
-                mode='train_model' (may stop earlier via early stopping).
-            lr: Adam learning rate, only used when mode='train_model'.
-            batch_size: batch size for both training and feature
-                extraction. Training batches double as the negative-pair
-                pool for the contrastive loss, so very small batch sizes
-                give the loss too few negatives to be a useful signal.
-            temperature: NT-Xent temperature - lower values sharpen the
-                loss's focus on the hardest negatives, but need a larger
-                batch_size to stay stable. 0.5 is a safer default than
-                the original paper's 0.1, which assumed batch sizes in
-                the thousands.
-            view_transform: PIL-to-tensor transform used to generate each
-                of the two augmented views per image; only used when
-                mode='train_model'. Defaults to
-                `build_augmentation_transform()` + `ToTensor()` if not
-                given. Pass this in to reuse an existing, already-tuned
-                `Augmentor`'s exact augmentation settings instead of
-                SimCLR defining its own separate config - see
-                `train_model`'s docstring for how.
-            early_stopping_patience: stop after this many consecutive
-                epochs with no improvement in the smoothed training loss.
-            early_stopping_min_delta: minimum decrease in smoothed
-                training loss to count as an improvement.
-            early_stopping_smoothing_window: number of most recent epochs
-                averaged together for the early-stopping signal, so a
-                single noisy epoch can't trigger a stop on its own.
+        """mode='train_model': train (see `train_model` for the arguments),
+        then extract features. mode='extract_features' (default): only
+        extract features with the current weights (e.g. a loaded
+        checkpoint); only `batch_size` is used then.
 
         Returns:
-            A DataFrame with one 'filename' and 'features' (`h` as a
-            numpy array) row per image, as produced by `extract_features`.
+            The DataFrame from `extract_features`.
         """
         if mode not in {"extract_features", "train_model"}:
             raise ValueError(
@@ -301,61 +207,38 @@ class SimCLR(nn.Module, FeatureLearningStep):
         early_stopping_min_delta=0.0,
         early_stopping_smoothing_window=10,
     ):
-        """Train the encoder+projection head with the NT-Xent contrastive
-        loss on pairs of randomly-augmented views of each image, then
-        extract and return features from the trained encoder.
-
-        There's no validation split here (this is unsupervised
-        contrastive training, not classification), so early stopping
-        instead watches a smoothed moving average of the *training* loss
-        - see `EarlyStopping` - and stops once it's stopped improving for
-        `early_stopping_patience` epochs, restoring the best-epoch
-        weights before returning.
+        """Train with the NT-Xent loss on pairs of views, then extract and
+        return the features. Early stopping watches a moving average of the
+        training loss (there is no validation set) and restores the best
+        epoch's weights.
 
         Args:
-            folder: image folder to train on.
-            epochs: maximum number of training epochs (may stop earlier
-                via early stopping).
+            folder: image folder to train on (ignored in the in-memory mode).
+            epochs: maximum number of epochs.
             lr: Adam learning rate.
-            batch_size: training batch size (see `run`'s note on why this
-                also controls the number of negatives per loss term).
-            temperature: NT-Xent temperature (see `run`).
-            view_transform: PIL-to-tensor transform used to generate the
-                two augmented views of each image. If not given, builds
-                one from `build_augmentation_transform()`'s defaults.
-
-                To reuse an `Augmentor` you've already configured (e.g.
-                with custom `crop_scale`/`brightness`/...), pass its
-                `.transform` attribute instead of letting SimCLR define
-                a second, separately-tuned augmentation config:
-
-                    from pipeline.preprocessing.augmentation import Augmentor
-                    from torchvision import transforms
-
-                    # Only used for its config/.transform - never call .run().
-                    augmentor = Augmentor(input_path=folder, crop_scale=(0.7, 1.0))
-                    view_transform = transforms.Compose([augmentor.transform, transforms.ToTensor()])
-
-                    simclr.train_model(folder, view_transform=view_transform)
-            early_stopping_patience: stop after this many consecutive
-                epochs with no improvement in the smoothed training loss.
-            early_stopping_min_delta: minimum decrease in smoothed
-                training loss to count as an improvement.
-            early_stopping_smoothing_window: number of most recent epochs
-                averaged together for the early-stopping signal, so a
-                single noisy epoch can't trigger a stop on its own.
+            batch_size: training batch size. The other images of a batch are
+                the "negatives" of the loss, so a very small batch gives a
+                weak training signal.
+            temperature: NT-Xent temperature; lower focuses on the hardest
+                negatives but needs larger batches. 0.5 is safer than the
+                paper's 0.1, which assumed batches of thousands.
+            view_transform: PIL -> tensor transform making each view;
+                default: `build_augmentation_transform()` + `ToTensor()`.
+                To reuse a configured Augmentor:
+                `transforms.Compose([augmentor.transform, transforms.ToTensor()])`.
+            early_stopping_patience: stop after this many epochs without
+                improvement of the smoothed loss.
+            early_stopping_min_delta: smallest decrease that counts.
+            early_stopping_smoothing_window: epochs in the moving average.
 
         Returns:
-            The DataFrame from `extract_features` (filenames + latent
-            vectors), run once training is complete.
+            The DataFrame from `extract_features`.
         """
         self._log_training_start(**{k: v for k, v in locals().items() if k not in ("self", "folder")})
         device = next(self.parameters()).device
 
         if view_transform is None:
-            # Same augmentation recipe as the Augmentor preprocessing step -
-            # SimCLR needs two independently, strongly augmented views of
-            # each image to have something non-trivial to contrast against.
+            # The Augmentor's default recipe.
             view_transform = transforms.Compose([
                 build_augmentation_transform(),
                 transforms.ToTensor(),
@@ -365,7 +248,7 @@ class SimCLR(nn.Module, FeatureLearningStep):
                 f"Warning: {self.name} makes its own augmented views (view_transform); "
                 "the pipeline's train_transform (Augmentor) is ignored."
             )
-        dataset = SimCLRDataset(self._collect_inputs(folder), view_transform)
+        dataset = TwoViewDataset(self._collect_inputs(folder), view_transform)
         print(f"Dataset size: {len(dataset)}")
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True, drop_last=True,
@@ -417,23 +300,11 @@ class SimCLR(nn.Module, FeatureLearningStep):
         return self.extract_features(batch_size=batch_size)
 
     def extract_features(self, batch_size=32) -> pd.DataFrame:
-        """Run the encoder over every image in `self.input_path` in eval
-        mode and collect `h` (the encoder's embedding, pre-projection) as
-        that image's feature vector.
-
-        Args:
-            batch_size: inference batch size.
-
-        Returns:
-            A DataFrame with one 'filename' and 'features' (`h` as a
-            numpy array) row per image; also written to
-            `<output_path>/features.csv`. Same shape as
-            `VAE.extract_features`'s output, so it drops straight into
-            the same downstream clustering/evaluation code.
-        """
+        """Encode every image (eval mode) and return the encoder output `h`
+        as its features: a DataFrame with 'filename' and 'features', also
+        written to `<output_path>/features.csv`."""
         device = next(self.parameters()).device
-        # target_size=None: this pipeline's Normalizer step already makes
-        # every image the same size, so resizing here would be redundant.
+        # target_size=None: the Normalizer already made all images one size.
         dataset = ImageDataset(self._collect_inputs(), grayscale=True, target_size=None)
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=False,
@@ -463,21 +334,14 @@ class SimCLR(nn.Module, FeatureLearningStep):
 
     @staticmethod
     def _nt_xent_loss(z1, z2, temperature):
-        """Normalized Temperature-scaled Cross Entropy loss (SimCLR's
-        contrastive loss).
+        """NT-Xent (normalized temperature-scaled cross entropy), SimCLR's loss.
 
-        For a batch of N images, z1/z2 are the N projected, L2-normalized
-        embeddings of each image's two augmented views. Stacking them
-        gives 2N embeddings; for each one, its *only* positive is the
-        other view of the same source image, and every other one of the
-        2N-2 remaining embeddings is a negative. The loss pushes the
-        cosine similarity high for the positive pair and low for all
-        negatives, scaled by `temperature` (lower = sharper distinction).
-
-        Implemented as a single cross-entropy over the (2N, 2N) cosine
-        similarity matrix - self-similarity (the diagonal) is masked out
-        so nothing is ever its own negative or positive, and the target
-        class for row i is simply the index of i's positive partner.
+        A batch of N images gives 2N vectors (two views each). For each
+        vector, the other view of the same image is the one "correct
+        answer" and the remaining 2N-2 are wrong. This is written as a
+        classification: cross-entropy over each row of the (2N, 2N) cosine
+        similarity matrix, whose target is the partner's index. The
+        diagonal (a vector with itself) is masked out.
 
         Args:
             z1, z2: (N, projection_dim) L2-normalized embeddings of the

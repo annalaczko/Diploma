@@ -33,7 +33,7 @@ preprocessing:               # only used when data.source is raw
     - Repair: {contrast_factor: 5, dilate_kernel_size: 1, dilate_iterations: 1, skeletonize: false, output_thickness: 2, debug_images: 0}
 
 model:
-  type: vae                  # vae | simclr | byol | handcrafted (measured from the Vectorizer's SVGs) | dinov3 (frozen pretrained backbone); the last two train nothing
+  type: vae                  # vae | simclr | byol | handcrafted (measured from the Vectorizer's SVGs) | dinov3 (pretrained backbone; frozen, or fine-tuned with params.finetune: true); handcrafted and frozen dinov3 train nothing
   params: {f: 4, n: 3, s: 1, k: 128}   # constructor arguments, e.g. beta_max / recon_loss for vae, tau for byol
                                        # (only used with type vae; another type starts from its own defaults)
   checkpoint: null           # .pt to start from: fine-tuned if training.train, otherwise only used to extract features

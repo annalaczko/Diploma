@@ -1,13 +1,21 @@
+"""Give the YOLO label files the same train/val/test split as the images:
+for every image in <images>/{train,val,test}, the label file with the same
+name (without extension) is copied to <labels>/{train,val,test}.
+
+    python mirror_split.py <split images folder> <all labels folder> <output labels folder>
+"""
+
 import argparse
-from pathlib import Path
 import shutil
+from pathlib import Path
+
 
 def mirror_split(images_split_dir: str, labels_source_dir: str, labels_final_dir: str, label_suffix: str = ".txt"):
     images_split_dir = Path(images_split_dir)
     labels_source_dir = Path(labels_source_dir)
     labels_final_dir = Path(labels_final_dir)
 
-    # label fájlok gyors kereséséhez: stem -> path lookup
+    # Label files by name without extension, for a quick lookup.
     label_lookup = {p.stem: p for p in labels_source_dir.rglob(f"*{label_suffix}") if p.is_file()}
     print(f"Found {len(label_lookup)} label files under {labels_source_dir}")
 
@@ -33,14 +41,14 @@ def mirror_split(images_split_dir: str, labels_source_dir: str, labels_final_dir
 
         print(f"{split}: {matched} labels matched, {len(missing)} missing")
         if missing:
-            print(f"  Hiányzó labelek (első 10): {missing[:10]}")
+            print(f"  Hiányzó labelek (első 10): {missing[:10]}")  # missing labels (first 10)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("images_split_dir", help="A mappa, ami már tartalmazza a train/val/test almappákat képekkel")
-    parser.add_argument("labels_source_dir", help="A mappa, ahol az összes label fájl van (rekurzívan keresi)")
-    parser.add_argument("labels_final_dir", help="Ide kerül a train/val/test label struktúra")
+    parser.add_argument("images_split_dir", help="folder that already has the train/val/test image subfolders")
+    parser.add_argument("labels_source_dir", help="folder with all label files (searched recursively)")
+    parser.add_argument("labels_final_dir", help="where the train/val/test label folders are created")
     parser.add_argument("--label_suffix", type=str, default=".txt")
     args = parser.parse_args()
 

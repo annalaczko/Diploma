@@ -1,21 +1,19 @@
-"""Repair step: full pre-skeleton-repair pipeline.
+"""Repair step: turns a cleaned scan into a crisp black-and-white line
+drawing.
 
-Reproduces the notebook workflow as a single pipeline step:
+The stages, in order (each is its own method, so it can be tried alone):
 
-    1. Contrast enhancement (ImageEnhance.Contrast)
-    2. Otsu threshold (inverted: dark lines on light background -> white
-       lines on black background) + dilation to pre-close small gaps
-    3. Skeletonization (skimage.morphology.skeletonize)
-    4. Endpoint-based gap repair: finds skeleton endpoints and joins
-       nearby pairs with a straight line, then (optionally)
-       re-skeletonizes so the output stays a clean 1px skeleton.
+    1. enhance_contrast      push gray pixels toward black or white
+    2. threshold_and_dilate  binarize (Otsu) and slightly thicken the lines
+    3. to_skeleton           thin every line to 1 px          } only with
+    4. repair_skeleton       join line ends that almost touch } skeletonize=True
+    5. thicken               draw the result with `output_thickness` px lines
 
-Each stage is also exposed as its own method, so it can be reused or
-tested independently of the full `run` pipeline.
+Inside the stages lines are white (255) on black (0), as OpenCV's
+morphology expects; the final image is inverted back to black on white.
 """
 
 from pathlib import Path
-from typing import Any
 
 import cv2
 import numpy as np
@@ -31,9 +29,9 @@ from pipeline.preprocessing.dataset import ImageRecord, collect_image_paths
 
 
 class Repair(PreprocessingStep):
-    """Cleans up and repairs broken hand-drawn/scanned line skeletons.
+    """Cleans up scanned line drawings and repairs small gaps in the lines.
 
-    Config (all optional, sensible defaults provided):
+    Settings (all optional):
         contrast_factor: factor passed to ImageEnhance.Contrast; higher
             values push mid-tones toward pure black/white.
         dilate_kernel_size: side length of the square structuring
@@ -113,12 +111,8 @@ class Repair(PreprocessingStep):
     # ------------------------------------------------------------------ #
 
     def run(self) -> Path:
-        """Process one image or every image found under `input_path`.
-
-        `data` is currently unused (kept for interface compatibility
-        with the rest of the pipeline) - the step reads directly from
-        `self.input_path`. Returns `self.output_path`.
-        """
+        """Disk mode: repair every image under `input_path` and save it
+        under the same name in `output_path`, which is returned."""
         input_paths = collect_image_paths(self.input_path, self.image_extensions)
         output_dir = Path(self.output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -163,21 +157,13 @@ class Repair(PreprocessingStep):
         return self.process_image(img)
 
     def process_image(self, img: Image.Image, return_stages: bool = False):
-        """Full pipeline on a single raw (grayscale) PIL image.
+        """All stages on one grayscale PIL image (see the module docstring).
+        Both modes (disk and in-memory) use this method.
 
-        contrast enhance -> threshold + dilate -> (if `skeletonize`) skeletonize
-        -> repair gaps -> (if `output_thickness > 1`) thicken.
-        Every internal stage works with the white-lines-on-black convention
-        (see `threshold_and_dilate`), but the final result is inverted back
-        to black lines on a white background before being returned, since
-        that's the convention the rest of the pipeline (and a human looking
-        at the file) expects.
-
-        Returns a uint8 array (0/255), the final processed image. With
-        `return_stages=True`, returns `(image, stages)` instead, where
-        `stages` is an ordered `{label: image}` dict of every intermediate
-        result (grayscale arrays, or BGR overlays for the steps that add or
-        remove pixels), for `_save_debug_image`.
+        Returns the result as a uint8 array (black lines, 0, on white, 255).
+        With `return_stages=True` it returns `(image, stages)`, where
+        `stages` is an ordered {label: image} dict of every intermediate
+        result, for the debug strip (`_save_debug_image`).
         """
         stages = {"input": np.array(img)}
         enhanced = self.enhance_contrast(img)
@@ -225,12 +211,8 @@ class Repair(PreprocessingStep):
         return dilated
 
     def to_skeleton(self, binary_arr: np.ndarray) -> np.ndarray:
-        """Stage 3: thin a binary (white lines on black bg) image to a 1px skeleton.
-
-        Note: expects white lines (255) on a black background (0), i.e. the
-        output convention of `threshold_and_dilate`. Uses Otsu again on the
-        already-binary array, which simply reproduces the 0/255 split.
-        """
+        """Stage 3: thin the white-on-black lines to a 1 px skeleton. (Otsu
+        on the already binary image just reproduces its 0/255 split.)"""
         thresh = threshold_otsu(binary_arr)
         binary = binary_arr > thresh  # True where the (white) line is
         skeleton = skeletonize(binary)
@@ -258,12 +240,8 @@ class Repair(PreprocessingStep):
         return connected
 
     def thicken(self, binary: np.ndarray, thickness: int) -> np.ndarray:
-        """Stage 5 (optional): uniformly thicken a 1px skeleton to `thickness` px.
-
-        Dilates the skeleton with a `thickness`x`thickness` kernel, which
-        turns each 1px-wide line into an approximately `thickness`-px-wide
-        line, centered on the original skeleton path.
-        """
+        """Stage 5: thicken the lines to about `thickness` px, by dilating
+        with a `thickness` x `thickness` square."""
         if thickness <= 1:
             return binary
         kernel = np.ones((thickness, thickness), np.uint8)
@@ -324,7 +302,8 @@ class Repair(PreprocessingStep):
     def _connect_nearby_endpoints(
         self, skeleton: np.ndarray, max_distance: int, thickness: int = 1
     ) -> np.ndarray:
-        """Join each endpoint to its nearest endpoint if within `max_distance`."""
+        """Draw a line from each endpoint to its nearest endpoint if that is
+        at most `max_distance` px away. Each endpoint is joined at most once."""
         result = skeleton.copy()
         endpoints = self._find_skeleton_endpoints(skeleton)
 
