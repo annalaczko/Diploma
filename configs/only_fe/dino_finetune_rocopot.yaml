@@ -1,0 +1,58 @@
+# The best DINO fine-tune (DINO loss, P-N, unfreeze_blocks 3: the highest mean ARI over the clusterings
+# on test_top5, 0.204; the P-A u3 0.252 did not hold up on repeated trainings) applied to the ROCOPOT
+# rim profiles. Nothing is trained: the checkpoint only extracts features, which are clustered and
+# evaluated against the ROCOPOT types (data/rocopot_results.csv: ID, TypeRev; 27 types, 4611 of the 4620
+# images labelled).
+# The sweep runs every ROCOPOT variant (all 256x256, the same 4620 profiles):
+#   outlines  clean outline (the closest to the line drawings the model was fine-tuned on)
+#   noisy     outline with synthetic noise
+#   broken    outline with synthetic gaps
+#   Rims_256  filled silhouette
+#
+#   python run_experiment.py configs/only_fe/dino_finetune_rocopot.yaml --dry-run
+#   python run_experiment.py configs/only_fe/dino_finetune_rocopot.yaml
+#
+# Summary: data/pipeline/sweep-DINO-P-N-u3-rocopot__<time>/summary.csv
+
+data:
+  source: preprocessed
+  preprocessed_path: null    # not used: nothing is trained (training.train: false)
+  extract_path: data/rocopot_raw/outlines   # set by the sweep
+  labels: data/rocopot_results.csv
+  features: null
+
+experiment: dinov3-rocopot
+name: DINO-P-N-u3-rocopot
+stop_after: null
+sweep:                       # features extracted once per variant, then clustered with each setting
+  data.extract_path:
+    - data/rocopot_raw/outlines
+    - data/rocopot_raw/noisy
+    - data/rocopot_raw/broken
+    - data/rocopot_raw/Rims_256
+  clustering.method: [average, ward]
+  clustering.metric: [euclidean, cosine]   # ward: euclidean only
+  clustering.cluster_num: [15, 27]         # 27 = number of ROCOPOT types; 15 as in the earlier full-test runs
+
+model:
+  type: dinov3
+  params:                    # must match the checkpoint (its model.yaml)
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    finetune: true
+    finetune_method: dino
+    unfreeze_blocks: 3
+    num_prototypes: 1024
+    teacher_momentum: 0.99
+    teacher_temp: 0.04
+    student_temp: 0.1
+    center_momentum: 0.9
+  checkpoint: data/pipeline/DINO-P-N__unfreeze_blocks3-methodaverage-metriceuclidean__20261105-010442/FeatureLearningStep/DINOv3/model.pt
+
+training:
+  train: false               # only extract features with the checkpoint
+  batch_size: 256
+
+clustering:
+  standardize: false
+  min_variance: 1.0e-3
+  feature_importance: 0

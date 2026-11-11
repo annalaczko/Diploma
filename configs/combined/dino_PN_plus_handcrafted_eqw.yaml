@@ -1,0 +1,40 @@
+# DINO + handcrafted with EQUAL BLOCK WEIGHTS: each block (DINO-P-N u3, 768 dims; handcrafted, 47 or 7 dims)
+# z-scored on its own (dims with variance < 1e-3 dropped) and divided by sqrt(its dims), so both blocks have
+# total variance 1 and count the same in euclidean distance. The blocks are already scaled, so
+# clustering.standardize stays false (true would z-score every dim again and undo the weighting).
+# Compare with dino_PN_plus_handcrafted.yaml (plain concatenation).
+#
+#   python run_experiment.py configs/combined/dino_PN_plus_handcrafted_eqw.yaml
+#
+# Summary: data/pipeline/sweep-dino-PN-plus-handcrafted-eqw__<time>/summary.csv
+
+data:
+  source: preprocessed
+  labels: data/ocr_data.csv
+  extract_path: null
+  features: null             # set by the sweep
+
+experiment: dino-plus-handcrafted
+name: dino-PN-plus-handcrafted-eqw
+stop_after: null
+sweep:
+  data.features:
+    - data/pipeline/DINO-P-N-u3+handcrafted-top5-eqw__20261106-160000/FeatureLearningStep/DINOv3+Handcrafted/features.csv
+    - data/pipeline/DINO-P-N-u3+handcrafted-top5-nofourier-eqw__20261106-160000/FeatureLearningStep/DINOv3+Handcrafted/features.csv
+  clustering.method: [single, complete, average, weighted, centroid, ward]
+  clustering.metric: [euclidean, cityblock, chebyshev, cosine]   # centroid/ward: euclidean only
+  clustering.standardize: [false]   # blocks already scaled
+  clustering.cluster_num: [5]
+
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+  checkpoint: null
+
+training:
+  train: true                # not used: with data.features nothing is trained or extracted
+
+clustering:
+  min_variance: 1.0e-3
+  feature_importance: 0

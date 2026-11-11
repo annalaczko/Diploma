@@ -1,0 +1,59 @@
+# DINOv3 fine-tuned with the DINO loss ONCE on the ROCOPOT rim profiles, then its features of the same
+# images clustered and evaluated. Settings as the night run DINO-P-N u3 (configs/night/dino_P-N.yaml),
+# the best DINO fine-tune on the pagecrop drawings, only the images differ.
+# Training uses no labels, so training and clustering on the same images is fair for an unsupervised
+# method (ROCOPOT has no train/test split); the labels are used only for the evaluation.
+#
+# Images: data/rocopot_raw/outlines, 4620 clean 256x256 outlines (the closest to the line drawings).
+# Labels: data/rocopot_results.csv (ID, TypeRev; 27 types, 4611 of the 4620 images labelled).
+# The other variants (noisy, broken, Rims_256) can be evaluated afterwards with this run's model.pt as
+# model.checkpoint in configs/only_fe/dino_finetune_rocopot.yaml.
+#
+#   python run_experiment.py configs/only_fe/dino_finetune_on_rocopot.yaml --dry-run
+#   python run_experiment.py configs/only_fe/dino_finetune_on_rocopot.yaml
+#
+# Summary: data/pipeline/sweep-DINO-rocopot-u3__<time>/summary.csv
+# Model:   data/pipeline/<first run>/FeatureLearningStep/DINOv3/model.pt
+
+data:
+  source: preprocessed
+  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/rocopot_raw/outlines
+  extract_path: null         # null = features of the same images the model is fine-tuned on
+  labels: data/rocopot_results.csv
+  features: null
+
+experiment: dinov3-rocopot
+name: DINO-rocopot-u3
+stop_after: null
+sweep:                       # the model is fine-tuned once; every clustering setting re-clusters its features
+  clustering.method: [average, ward]
+  clustering.metric: [euclidean, cosine]   # ward: euclidean only
+  clustering.cluster_num: [15, 27]         # 27 = number of ROCOPOT types; 15 as in the earlier full-test runs
+
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    finetune: true
+    finetune_method: dino
+    unfreeze_blocks: 3
+    num_prototypes: 1024
+    teacher_momentum: 0.99   # ~18 steps per epoch: the teacher lags ~100 steps (~5-6 epochs)
+    teacher_temp: 0.04
+    student_temp: 0.1
+    center_momentum: 0.9
+  checkpoint: null           # start from the pretrained DINOv3
+
+training:
+  train: true
+  epochs: 50
+  lr: 3.0e-05
+  batch_size: 256            # images per step (x2 views); lower it on CUDA out-of-memory
+  early_stopping_patience: 30       # the DINO loss often rises in the first epochs
+  early_stopping_min_delta: 0.0
+  early_stopping_smoothing_window: 3
+
+clustering:
+  standardize: false
+  min_variance: 1.0e-3
+  feature_importance: 0

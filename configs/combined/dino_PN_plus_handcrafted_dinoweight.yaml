@@ -1,0 +1,42 @@
+# DINO + handcrafted (no Fourier) with the DINO block weighted a bit MORE than half. As in
+# dino_PN_plus_handcrafted_eqw.yaml each block is z-scored on its own (dims with variance < 1e-3 dropped)
+# and divided by sqrt(its dims); then the DINO block is multiplied by sqrt(w) and the handcrafted block by
+# sqrt(1 - w), so DINO has share w of the total variance: w = 0.55, 0.60, 0.65, 0.70 (eqw is w = 0.50).
+# The blocks are already scaled, so clustering.standardize stays false.
+#
+#   python run_experiment.py configs/combined/dino_PN_plus_handcrafted_dinoweight.yaml
+#
+# Summary: data/pipeline/sweep-dino-PN-plus-handcrafted-dinoweight__<time>/summary.csv
+
+data:
+  source: preprocessed
+  labels: data/ocr_data.csv
+  extract_path: null
+  features: null             # set by the sweep
+
+experiment: dino-plus-handcrafted
+name: dino-PN-plus-handcrafted-dinoweight
+stop_after: null
+sweep:
+  data.features:
+    - data/pipeline/DINO-P-N-u3+handcrafted-top5-nofourier-dino55__20261106-170000/FeatureLearningStep/DINOv3+Handcrafted/features.csv   # DINO 55%
+    - data/pipeline/DINO-P-N-u3+handcrafted-top5-nofourier-dino60__20261106-170000/FeatureLearningStep/DINOv3+Handcrafted/features.csv   # DINO 60%
+    - data/pipeline/DINO-P-N-u3+handcrafted-top5-nofourier-dino65__20261106-170000/FeatureLearningStep/DINOv3+Handcrafted/features.csv   # DINO 65%
+    - data/pipeline/DINO-P-N-u3+handcrafted-top5-nofourier-dino70__20261106-170000/FeatureLearningStep/DINOv3+Handcrafted/features.csv   # DINO 70%
+  clustering.method: [single, complete, average, weighted, centroid, ward]
+  clustering.metric: [euclidean, cityblock, chebyshev, cosine]   # centroid/ward: euclidean only
+  clustering.standardize: [false]   # blocks already scaled
+  clustering.cluster_num: [5]
+
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+  checkpoint: null
+
+training:
+  train: true                # not used: with data.features nothing is trained or extracted
+
+clustering:
+  min_variance: 1.0e-3
+  feature_importance: 0

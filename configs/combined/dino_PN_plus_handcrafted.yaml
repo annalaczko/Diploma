@@ -1,0 +1,48 @@
+# DINO + handcrafted features together. The DINO-P-N unfreeze_blocks3 test_top5 features (768 dims) with the
+# handcrafted features of the same 356 images appended (47 dims with the Fourier descriptors, 7 without),
+# and for comparison each part alone. Every clustering option, standardized and not.
+# Nothing is trained; only existing features.csv files are clustered and evaluated.
+# The combined files were made by joining the two features.csv on filename (DINO dims first, then handcrafted);
+# feature_columns.txt next to them names the dims (dino_<i>, then the handcrafted names).
+#
+#   python run_experiment.py configs/combined/dino_PN_plus_handcrafted.yaml --dry-run
+#   python run_experiment.py configs/combined/dino_PN_plus_handcrafted.yaml
+#
+# Summary: data/pipeline/sweep-dino-PN-plus-handcrafted__<time>/summary.csv
+
+data:
+  source: preprocessed
+  labels: data/ocr_data.csv
+  extract_path: null
+  features: null             # set by the sweep
+
+experiment: dino-plus-handcrafted
+name: dino-PN-plus-handcrafted
+stop_after: null
+sweep:
+  data.features:
+    # DINO alone (DINO-P-N, unfreeze_blocks 3)
+    - data/pipeline/DINO-P-N__unfreeze_blocks3-methodaverage-metriceuclidean__20261105-010442/FeatureLearningStep/DINOv3/features.csv
+    # handcrafted alone, with and without Fourier
+    - data/pipeline/handcrafted-top5__20261030-133334/FeatureLearningStep/HandcraftedFeatures/features.csv
+    - data/pipeline/handcrafted-top5-nofourier__20261030-133334/FeatureLearningStep/HandcraftedFeatures/features.csv
+    # DINO + handcrafted
+    - data/pipeline/DINO-P-N-u3+handcrafted-top5__20261106-120000/FeatureLearningStep/DINOv3+Handcrafted/features.csv
+    - data/pipeline/DINO-P-N-u3+handcrafted-top5-nofourier__20261106-120000/FeatureLearningStep/DINOv3+Handcrafted/features.csv
+  clustering.method: [single, complete, average, weighted, centroid, ward]
+  clustering.metric: [euclidean, cityblock, chebyshev, cosine]   # centroid/ward: euclidean only
+  clustering.standardize: [true, false]
+  clustering.cluster_num: [5]
+
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+  checkpoint: null
+
+training:
+  train: true                # not used: with data.features nothing is trained or extracted
+
+clustering:
+  min_variance: 1.0e-3
+  feature_importance: 0
