@@ -18,7 +18,7 @@ vae = VAE(f=4, n=3, s=1, k=16, beta_max=32, run_id=run_id).to(device)
 
 pipeline = Pipeline(
     preprocessing_steps=[
-        # BackgroundEraser(mode="segmentation", model="models/yolov8n_seg_finetuned.pt",
+        # BackgroundEraser(mode="segmentation", model="/data/alaczko/models/yolov8n_seg_finetuned.pt",
         #                  mask_margin=0.01, record_axes=True, run_id=run_id),
         # Normalizer(background_color=(255, 255, 255), run_id=run_id),
         # Repair(contrast_factor=5, dilate_kernel_size=1, dilate_iterations=1,

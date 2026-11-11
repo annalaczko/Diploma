@@ -15,12 +15,12 @@ experiment: prep             # MLflow experiment name
 name: PREP-tightcrop-noaxes   # run name; the sweep adds the split to it
 stop_after: preprocessing    # no model, no clustering
 sweep:                       # one run per split
-  data.raw_path: [data/legion_raw_train, data/legion_raw_test]
+  data.raw_path: [/data/alaczko/legion_raw_train, /data/alaczko/legion_raw_test]
 
 # ===================================================================== data
 data:
   source: raw
-  raw_path: data/legion_raw_train   # set by the sweep: the 5732 train scans and the 439 test scans
+  raw_path: /data/alaczko/legion_raw_train   # set by the sweep: the 5732 train scans and the 439 test scans
 
 # ===================================================================== preprocessing
 preprocessing:
@@ -29,7 +29,7 @@ preprocessing:
   steps:
     - BackgroundEraser:
         mode: segmentation
-        model: models/yolov8n_seg_finetuned.pt
+        model: /data/alaczko/models/yolov8n_seg_finetuned.pt
         batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
         mask_margin: 0.01
         crop_size: null   # square fitted to each shard (the size ratio between shards is lost)

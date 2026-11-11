@@ -19,9 +19,9 @@ sweep:                       # one run per combination (see pipeline/README.md#s
 # ===================================================================== data
 data:
   source: preprocessed       # ready images
-  preprocessed_path: data/processed/legion/raster_axes/test   # the images embedded, clustered and evaluated
+  preprocessed_path: /data/alaczko/processed/legion/raster_axes/test   # the images embedded, clustered and evaluated
                              # (the same ones the VAE configs cluster)
-  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
   features: null             # features.csv of an earlier run: only cluster and evaluate these
 
 model:

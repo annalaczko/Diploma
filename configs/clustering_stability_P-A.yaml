@@ -13,7 +13,7 @@
 
 data:
   source: preprocessed
-  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
   extract_path: null
   features: null             # set by the sweep
 

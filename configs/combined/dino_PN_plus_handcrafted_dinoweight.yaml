@@ -10,7 +10,7 @@
 
 data:
   source: preprocessed
-  labels: data/ocr_data.csv
+  labels: /data/alaczko/ocr_data.csv
   extract_path: null
   features: null             # set by the sweep
 

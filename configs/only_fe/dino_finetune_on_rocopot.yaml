@@ -4,8 +4,8 @@
 # Training uses no labels, so training and clustering on the same images is fair for an unsupervised
 # method (ROCOPOT has no train/test split); the labels are used only for the evaluation.
 #
-# Images: data/rocopot_raw/outlines, 4620 clean 256x256 outlines (the closest to the line drawings).
-# Labels: data/rocopot_results.csv (ID, TypeRev; 27 types, 4611 of the 4620 images labelled).
+# Images: /data/alaczko/rocopot/outlines, 4620 clean 256x256 outlines (the closest to the line drawings).
+# Labels: /data/alaczko/rocopot_results.csv (ID, TypeRev; 27 types, 4611 of the 4620 images labelled).
 # The other variants (noisy, broken, Rims_256) can be evaluated afterwards with this run's model.pt as
 # model.checkpoint in configs/only_fe/dino_finetune_rocopot.yaml.
 #
@@ -17,9 +17,9 @@
 
 data:
   source: preprocessed
-  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/rocopot_raw/outlines
+  preprocessed_path: /data/alaczko/rocopot/outlines
   extract_path: null         # null = features of the same images the model is fine-tuned on
-  labels: data/rocopot_results.csv
+  labels: /data/alaczko/rocopot_results.csv
   features: null
 
 experiment: dinov3-rocopot

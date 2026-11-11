@@ -132,10 +132,10 @@ python run_experiment.py configs/vae_k16_beta32.yaml --dry-run    # resolved con
 ```
 
 - `data.source: preprocessed` (default) trains on ready images in
-  `data.preprocessed_path` (default `data/processed/legion/no_axes/train`);
+  `data.preprocessed_path` (default `/data/alaczko/processed/legion/no_axes/train`);
   `raw` runs `preprocessing.steps` on `data.raw_path` first; the result is
   in the last step's folder (see below), and can be copied by hand to
-  e.g. `data/processed/<name>` to be reused as `preprocessed_path`.
+  e.g. `/data/alaczko/processed/<name>` to be reused as `preprocessed_path`.
 - `stop_after` ends a run early: `preprocessing` (with `data.source: raw`)
   only produces the preprocessed images (run name `prep-<steps>__raw`,
   e.g. `configs/only_prep/vector_axes.yaml`); `features` trains/saves the model and
@@ -289,7 +289,7 @@ vae.run(mode="train_model", epochs=10)
 features = vae.extract_features(batch_size=128)
 
 # 2b. ...or supervised classification on top of the VAE's encoder.
-classifier = VAEClassifier(vae=vae, labels_path="data/rocopot_results.csv", input_path=repaired)
+classifier = VAEClassifier(vae=vae, labels_path="/data/alaczko/rocopot_results.csv", input_path=repaired)
 classifier.to(device)
 history = classifier.run(epochs=100)
 

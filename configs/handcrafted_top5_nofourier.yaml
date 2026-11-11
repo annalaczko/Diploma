@@ -1,13 +1,13 @@
 # Handcrafted features WITHOUT the Fourier descriptors (efd_*) of the top-5-type test images, clustered and evaluated.
 # Same features and clustering as the run handcrafted__methodward-metriceuclidean-cluster_num5__20261030-133334
 # (Vectorizer output, features: position, size, axis_distance, thickness, fourier; ward, 5 clusters, here without fourier);
-# its features.csv filtered to the 356 images of data/processed/pagecrop/no_axes/test_top5
+# its features.csv filtered to the 356 images of /data/alaczko/processed/pagecrop/no_axes/test_top5
 # with the efd_* columns dropped (data/pipeline/handcrafted-top5-nofourier__20261030-133334/), so only the clustering runs again.
 #   python run_experiment.py configs/handcrafted_top5_nofourier.yaml
 
 data:
   source: preprocessed
-  labels: data/ocr_data.csv
+  labels: /data/alaczko/ocr_data.csv
   features: data/pipeline/handcrafted-top5-nofourier__20261030-133334/FeatureLearningStep/HandcraftedFeatures/features.csv
 
 experiment: pottery

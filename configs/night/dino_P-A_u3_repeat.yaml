@@ -6,9 +6,9 @@
 
 data:
   source: preprocessed
-  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/pagecrop/axes/train
-  extract_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/pagecrop/axes/test_top5
-  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  preprocessed_path: /data/alaczko/processed/pagecrop/axes/train
+  extract_path: /data/alaczko/processed/pagecrop/axes/test_top5
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
   features: null             # must stay null: with extract_path the features are computed in this run
 
 experiment: dinov3-night     # MLflow experiment (separate from the runs with the old augmentation)

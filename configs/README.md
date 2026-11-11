@@ -60,7 +60,7 @@ and offset of the final image on the scan, px/cm, and the coordinate system
 collection skips them, so a step folder can be used as input as it is.
 
 To reuse preprocessed images, copy (or move) the last step's folder by hand,
-e.g. to `data/processed/<name>/`, split it with
-`python split_by_labels.py data/processed/<name>`, and point
+e.g. to `/data/alaczko/processed/<name>/`, split it with
+`python split_by_labels.py /data/alaczko/processed/<name>`, and point
 `data.preprocessed_path` at it. A trained model is reused with
 `model.checkpoint: data/pipeline/<run id>/FeatureLearningStep/VAE/model.pt`.

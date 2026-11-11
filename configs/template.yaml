@@ -24,11 +24,11 @@ sweep: {}                    # settings to try, one run per combination (see pip
 # ===================================================================== data
 data:
   source: raw                # raw: preprocess raw_path from scratch | preprocessed: use ready images
-  raw_path: data/legion_raw  # raw scans (searched recursively)
-  preprocessed_path: data/processed/legion/no_axes/train   # ready images (used with source: preprocessed)
-  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
+  raw_path: /data/alaczko/legion_raw  # raw scans (searched recursively)
+  preprocessed_path: /data/alaczko/processed/legion/no_axes/train   # ready images (used with source: preprocessed)
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
   extract_path: null         # ready images to extract features from, then cluster and evaluate, e.g.
-                             # data/processed/legion/no_axes/test; the model trains on preprocessed_path (or the
+                             # /data/alaczko/processed/legion/no_axes/test; the model trains on preprocessed_path (or the
                              # raw images), its features of those go to features_train.csv; null = the same images
   features: null             # features.csv of an earlier run (data/pipeline/<run id>/FeatureLearningStep/<Model>/features.csv):
                              # only cluster and evaluate these; preprocessing, model and training are not used
@@ -44,7 +44,7 @@ preprocessing:
   steps:
     - BackgroundEraser:
         mode: segmentation   # segmentation: white out outside the YOLO mask | detection: outside the (padded) box
-        model: models/yolov8n_seg_finetuned.pt   # YOLO weights
+        model: /data/alaczko/models/yolov8n_seg_finetuned.pt   # YOLO weights
         batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
         box_margin: 0.15     # detection mode: pad the box by this fraction of its size per side
         mask_margin: 0.01    # segmentation mode: grow the mask by this fraction of its longer side (class default 0.10)

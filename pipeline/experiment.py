@@ -60,8 +60,8 @@ from pipeline.preprocessing import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "default.yaml"
 # Ready images are usually copied here by hand; their path below it names
-# the data in run names (data/processed/legion/no_axes/train -> legion-no_axes-train).
-PROCESSED_ROOT = REPO_ROOT / "data" / "processed"
+# the data in run names (/data/alaczko/processed/legion/no_axes/train -> legion-no_axes-train).
+PROCESSED_ROOT = Path("/data/alaczko/processed")
 
 MODELS = {"vae": VAE, "simclr": SimCLR, "byol": BYOL, "handcrafted": HandcraftedFeatures, "dinov3": DINOv3}
 # Feature steps with their own params, not the learned models' shared
@@ -409,7 +409,7 @@ def _features_label(features) -> tuple[str, str | None]:
 
 def _data_label(config: dict) -> str:
     """The images the run uses: 'raw', the preprocessed_path below
-    data/processed (legion/no_axes/train -> legion-no_axes-train), and with
+    /data/alaczko/processed (legion/no_axes/train -> legion-no_axes-train), and with
     data.extract_path the folder features come from: trained on one and
     extracting from the other, '<train>-to-<extract>' without their common
     start (legion-no_axes-train-to-test)."""

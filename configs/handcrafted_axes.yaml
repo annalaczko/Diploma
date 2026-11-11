@@ -24,7 +24,7 @@ sweep:                       # one run per combination (see pipeline/README.md#s
 data:
   source: preprocessed                # raw: preprocess raw_path from scratch | preprocessed: use ready images
   preprocessed_path: data/pipeline/vector_axes__20261016-101757/PreprocessingStep/Vectorizer   # TODO: the images with axes. ready images (used with source: preprocessed)
-  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
   features: null             # features.csv of an earlier run (data/pipeline/<run id>/FeatureLearningStep/<Model>/features.csv):
                              # only cluster and evaluate these; preprocessing, model and training are not used
 

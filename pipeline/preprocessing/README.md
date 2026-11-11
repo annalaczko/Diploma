@@ -81,7 +81,7 @@ BackgroundEraser(
     input_path=None,
     output_path=None,           # auto-derived from run_id when omitted (see Step)
     mode='detection',           # 'detection' or 'segmentation'
-    model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt',  # absolute path
+    model='/data/alaczko/models/yolov8n_seg_finetuned.pt',  # absolute path
     run_id="default_run",
     batch_size=256,              # model.predict's inference batch size
     box_margin=0.15,             # 'detection' only: see _expand_box below

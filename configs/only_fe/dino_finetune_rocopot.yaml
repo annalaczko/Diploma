@@ -1,7 +1,7 @@
 # The best DINO fine-tune (DINO loss, P-N, unfreeze_blocks 3: the highest mean ARI over the clusterings
 # on test_top5, 0.204; the P-A u3 0.252 did not hold up on repeated trainings) applied to the ROCOPOT
 # rim profiles. Nothing is trained: the checkpoint only extracts features, which are clustered and
-# evaluated against the ROCOPOT types (data/rocopot_results.csv: ID, TypeRev; 27 types, 4611 of the 4620
+# evaluated against the ROCOPOT types (/data/alaczko/rocopot_results.csv: ID, TypeRev; 27 types, 4611 of the 4620
 # images labelled).
 # The sweep runs every ROCOPOT variant (all 256x256, the same 4620 profiles):
 #   outlines  clean outline (the closest to the line drawings the model was fine-tuned on)
@@ -17,8 +17,8 @@
 data:
   source: preprocessed
   preprocessed_path: null    # not used: nothing is trained (training.train: false)
-  extract_path: data/rocopot_raw/outlines   # set by the sweep
-  labels: data/rocopot_results.csv
+  extract_path: /data/alaczko/rocopot/outlines   # set by the sweep
+  labels: /data/alaczko/rocopot_results.csv
   features: null
 
 experiment: dinov3-rocopot
@@ -26,10 +26,10 @@ name: DINO-P-N-u3-rocopot
 stop_after: null
 sweep:                       # features extracted once per variant, then clustered with each setting
   data.extract_path:
-    - data/rocopot_raw/outlines
-    - data/rocopot_raw/noisy
-    - data/rocopot_raw/broken
-    - data/rocopot_raw/Rims_256
+    - /data/alaczko/rocopot/outlines
+    - /data/alaczko/rocopot/noisy
+    - /data/alaczko/rocopot/broken
+    - /data/alaczko/rocopot/Rims_256
   clustering.method: [average, ward]
   clustering.metric: [euclidean, cosine]   # ward: euclidean only
   clustering.cluster_num: [15, 27]         # 27 = number of ROCOPOT types; 15 as in the earlier full-test runs

@@ -19,8 +19,8 @@ sweep:                       # one run per combination (see pipeline/README.md#s
 # ===================================================================== data
 data:
   source: preprocessed       # ready images, no preprocessing in this run
-  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/tightcrop/no_axes/test   # the preprocessed scans of the test split
-  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
+  preprocessed_path: /data/alaczko/processed/tightcrop/no_axes/test   # the preprocessed scans of the test split
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev; null = silhouette only
   features: null             # features.csv of an earlier run: only cluster and evaluate these
 
 # ===================================================================== preprocessing
@@ -32,7 +32,7 @@ data:
 #   steps:
 #     - BackgroundEraser:
 #         mode: segmentation
-#         model: models/yolov8n_seg_finetuned.pt
+#         model: /data/alaczko/models/yolov8n_seg_finetuned.pt
 #         batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
 #         mask_margin: 0.01
 #         crop_size: 0.5       # square side = half the scan width, centered on the shard; null = fitted to the shard

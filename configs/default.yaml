@@ -17,9 +17,9 @@ sweep: {}                    # settings to try, e.g. {model.params.k: [16, 32], 
 
 data:
   source: preprocessed       # preprocessed: use ready images from preprocessed_path | raw: preprocess raw_path from scratch
-  preprocessed_path: data/processed/legion/no_axes/train
-  raw_path: data/legion_raw
-  labels: data/ocr_data.csv  # ground truth for evaluation (columns ID, TypeRev); null = silhouette only
+  preprocessed_path: /data/alaczko/processed/legion/no_axes/train
+  raw_path: /data/alaczko/legion_raw
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation (columns ID, TypeRev); null = silhouette only
   extract_path: null         # ready images to extract features from (and cluster/evaluate), e.g. .../test;
                              # the model still trains on preprocessed_path (or the raw images); null = the same images
   features: null             # features.csv of an earlier run: only cluster and evaluate these (no preprocessing or model)
@@ -28,7 +28,7 @@ preprocessing:               # only used when data.source is raw
   mode: memory               # memory | disk
   batch_size: 64             # images preprocessed at once in memory mode
   steps:                     # run in this order; images (+ extracted_metadata.csv) go to data/pipeline/<run name>/PreprocessingStep/<Step>/
-    - BackgroundEraser: {mode: segmentation, model: models/yolov8n_seg_finetuned.pt, mask_margin: 0.01, record_axes: true, debug_images: 0}
+    - BackgroundEraser: {mode: segmentation, model: /data/alaczko/models/yolov8n_seg_finetuned.pt, mask_margin: 0.01, record_axes: true, debug_images: 0}
     - Normalizer: {background_color: [255, 255, 255]}
     - Repair: {contrast_factor: 5, dilate_kernel_size: 1, dilate_iterations: 1, skeletonize: false, output_thickness: 2, debug_images: 0}
 

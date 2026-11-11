@@ -3,7 +3,7 @@ same folder by the labels file: an image whose ID (file name without
 extension, with its subfolders joined by "__", see `flatten_name`) is in the
 labels file goes to test/, every other image to train/.
 
-    python split_by_labels.py <folder> [--labels data/ocr_data.csv] [--copy] [--dry-run]
+    python split_by_labels.py <folder> [--labels /data/alaczko/ocr_data.csv] [--copy] [--dry-run]
 
 The subfolders below <folder> are kept (<folder>/a/b/001.jpg ->
 <folder>/test/a/b/001.jpg), so running the pipeline on <folder>/test gives
@@ -25,7 +25,7 @@ from pipeline.preprocessing.dataset import collect_image_paths, flatten_name
 SPLITS = ("train", "test")
 
 
-def split_by_labels(folder: str, labels_path: str = "data/ocr_data.csv", copy: bool = False,
+def split_by_labels(folder: str, labels_path: str = "/data/alaczko/ocr_data.csv", copy: bool = False,
                     dry_run: bool = False) -> dict[str, list[Path]]:
     """Put every image under `folder` into `folder/test` (its ID is in the
     `ID` column of `labels_path`) or `folder/train` (it isn't).
@@ -78,7 +78,7 @@ def split_by_labels(folder: str, labels_path: str = "data/ocr_data.csv", copy: b
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("folder", help="folder searched (recursively) for images; train/ and test/ are created in it")
-    parser.add_argument("--labels", default="data/ocr_data.csv",
+    parser.add_argument("--labels", default="/data/alaczko/ocr_data.csv",
                         help="CSV with an ID column (file name without extension); these images go to test/")
     parser.add_argument("--copy", action="store_true", help="copy the files instead of hard-linking them")
     parser.add_argument("--dry-run", action="store_true", help="only print the counts, write nothing")

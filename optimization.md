@@ -19,7 +19,7 @@ JPEG), memory mode, batch size 64, on one free RTX 3090 and a 36-core CPU:
 | Vectorizer (with SVG) | 2.1 s | 2.1 s |
 | **Total** | **42.0 s** | **7.7 s** (about 5.5x faster) |
 
-For the whole `data/legion_raw` (6277 images), that is roughly 4–5 minutes
+For the whole `/data/alaczko/legion_raw` (6277 images), that is roughly 4–5 minutes
 instead of about 24.
 
 **The output is unchanged.** A copy of the old code was run on the same sample,

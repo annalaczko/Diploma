@@ -15,10 +15,10 @@
 data:
   source: preprocessed       # ready images, no preprocessing in this run
   # EDIT: TRAIN folder, the model is fine-tuned on these (their features: features_train.csv)
-  preprocessed_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/tightcrop/axes/train
+  preprocessed_path: /data/alaczko/processed/tightcrop/axes/train
   # EDIT: TEST folder, features, clustering and evaluation come from these
-  extract_path: /caa/Homes01/alaczko/Diploma/Diploma/data/processed/tightcrop/axes/test
-  labels: data/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  extract_path: /data/alaczko/processed/tightcrop/axes/test
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
   features: null             # must stay null: with extract_path the features are computed in this run
 
 # ===================================================================== run

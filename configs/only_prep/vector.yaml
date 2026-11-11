@@ -15,7 +15,7 @@ stop_after: preprocessing             # null = whole run | preprocessing (needs 
 # ===================================================================== data
 data:
   source: raw                # raw: preprocess raw_path from scratch | preprocessed: use ready images
-  raw_path: data/legion_raw  # raw scans (searched recursively)
+  raw_path: /data/alaczko/legion_raw  # raw scans (searched recursively)
 
 # ===================================================================== preprocessing
 # Only used with data.source: raw. The steps run in this order; each writes to
@@ -28,7 +28,7 @@ preprocessing:
   steps:
     - BackgroundEraser:
         mode: segmentation   # segmentation: white out outside the YOLO mask | detection: outside the (padded) box
-        model: models/yolov8n_seg_finetuned.pt   # YOLO weights
+        model: /data/alaczko/models/yolov8n_seg_finetuned.pt   # YOLO weights
         batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
         box_margin: 0.01     # detection mode: pad the box by this fraction of its size per side
         mask_margin: 0.01    # segmentation mode: grow the mask by this fraction of its longer side (class default 0.10)

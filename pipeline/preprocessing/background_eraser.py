@@ -48,7 +48,7 @@ class BackgroundEraser(PreprocessingStep):
                  input_path=None,
                  output_path=None,
                  mode = 'detection',
-                 model='/caa/Homes01/alaczko/Diploma/Diploma/models/yolov8n_seg_finetuned.pt',
+                 model='/data/alaczko/models/yolov8n_seg_finetuned.pt',
                  run_id="default_run",
                  batch_size=256,
                  box_margin=0.15,
