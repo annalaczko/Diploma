@@ -8,6 +8,7 @@
     InMemoryImages       the final preprocessed images, as one numpy array
     ImageDataset         a torch Dataset that turns images into tensors for training
     TwoViewDataset       a torch Dataset that yields two random transformed views of each image
+    MultiCropDataset     two global views plus several small local crops of each image (DINO multi-crop)
 """
 
 import queue
@@ -309,3 +310,41 @@ class TwoViewDataset(Dataset):
         view1 = self.transform(image)
         view2 = self.transform(image)
         return view1, view2
+
+
+class MultiCropDataset(Dataset):
+    """Yields two global views and `n_local` local crops of each image, the
+    "multi-crop" of DINO (Caron et al., 2021): `(global1, global2, local1,
+    ..., localM)`. All are made anew on every fetch.
+
+    The global views are full-size (`global_transform`), the local crops
+    small pieces of the image at a lower resolution (`local_transform`).
+    The default collate stacks each position separately, so a batch is a
+    list of 2 + M tensors, the globals of one size and the locals of
+    another.
+    """
+
+    def __init__(self, paths, global_transform, local_transform, n_local):
+        """
+        Args:
+            paths: sequence of image file paths, or an `InMemoryImages`.
+            global_transform: applied independently twice per image.
+            local_transform: applied independently `n_local` times per
+                image, e.g. an augmentation followed by
+                `InkedRandomResizedCrop`.
+            n_local: number of local crops per image (0 = only the two
+                global views, as `TwoViewDataset`).
+        """
+        self.paths, _ = image_entries(paths)
+        self.global_transform = global_transform
+        self.local_transform = local_transform
+        self.n_local = n_local
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        image = open_image(self.paths, idx).convert("L")
+        globals_ = [self.global_transform(image) for _ in range(2)]
+        locals_ = [self.local_transform(image) for _ in range(self.n_local)]
+        return tuple(globals_ + locals_)

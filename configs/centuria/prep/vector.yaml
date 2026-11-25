@@ -1,0 +1,38 @@
+# Centuria preprocessing: vector, the same steps as configs/only_prep/vector.yaml (for handcrafted).
+# run_centuria.py runs it and copies the result to /data/alaczko/processed/centuria/vector/,
+# which the configs in configs/centuria/models/ read.
+
+experiment: centuria-prep
+name: CENT-PREP-vector
+stop_after: preprocessing
+
+data:
+  source: raw
+  raw_path: /data/alaczko/centuria/images_labelled   # the Centuria scans that have a Class (made by run_centuria.py)
+
+preprocessing:
+  mode: memory
+  batch_size: 256
+  steps:
+    - BackgroundEraser:
+        mode: segmentation
+        model: /data/alaczko/models/yolov8n_seg_finetuned.pt
+        batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
+        mask_margin: 0.01
+        crop_size: null # square fitted to each shard
+        record_axes: true    # find the coordinate system (into extracted_metadata.csv)
+        debug_images: 0
+    - Normalizer:
+        target_size: 256
+        background_color: [255, 255, 255]
+    - Vectorizer:
+        line_thickness: 2
+        antialias: false
+        max_paths: 12
+        max_gap_frac: 0.10
+        min_keep_frac: 0.06
+        remove_axes: false
+        on_failure: keep
+        axes: none
+        save_svg: true       # needed by model.type: handcrafted
+        debug_images: 0

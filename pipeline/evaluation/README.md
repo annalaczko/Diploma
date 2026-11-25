@@ -16,8 +16,8 @@ pipeline/evaluation/
 from pipeline.evaluation import EvaluationStep
 ```
 
-Common contract for evaluation methods (ARI, NMI, F-measure, precision@k,
-nearest-neighbour retrieval, silhouette). `run()` takes predicted labels
+Common contract for evaluation methods (currently ACC, ARI, NMI and
+silhouette; nearest-neighbour retrieval with precision@k is planned). `run()` takes predicted labels
 (and ground truth / features as needed, passed at construction — see the
 two concrete subclasses below) and returns a dict of metric values, which
 is also logged to the active MLflow run as `eval/<name>`.

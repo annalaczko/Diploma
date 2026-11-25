@@ -1,0 +1,40 @@
+# Centuria preprocessing: tightcrop_axes, the same steps as configs/only_prep/prep_tightcrop_axes.yaml.
+# run_centuria.py runs it and copies the result to /data/alaczko/processed/centuria/tightcrop_axes/,
+# which the configs in configs/centuria/models/ read.
+
+experiment: centuria-prep
+name: CENT-PREP-tightcrop_axes
+stop_after: preprocessing
+
+data:
+  source: raw
+  raw_path: /data/alaczko/centuria/images_labelled   # the Centuria scans that have a Class (made by run_centuria.py)
+
+preprocessing:
+  mode: memory
+  batch_size: 256
+  steps:
+    - BackgroundEraser:
+        mode: segmentation
+        model: /data/alaczko/models/yolov8n_seg_finetuned.pt
+        batch_size: 256      # YOLO inference batch; lower it on CUDA out-of-memory
+        mask_margin: 0.01
+        crop_size: null # square fitted to each shard
+        record_axes: true    # find the coordinate system (into extracted_metadata.csv)
+        debug_images: 0
+    - Normalizer:
+        target_size: 256
+        background_color: [255, 255, 255]
+    - Repair:
+        contrast_factor: 5
+        dilate_kernel_size: 1
+        dilate_iterations: 1
+        skeletonize: false
+        output_thickness: 2
+        debug_images: 0
+    - AxisRenderer:
+        axis_thickness: 2
+        margin: 0.03
+        binarize: true
+        threshold: 235
+        antialias: false

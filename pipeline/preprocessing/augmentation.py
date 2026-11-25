@@ -95,6 +95,46 @@ class EraseLineSegments:
         return Image.fromarray(pixels.numpy())
 
 
+class InkedRandomResizedCrop:
+    """A random crop of a white-background drawing, resized to `size`,
+    that shows some of the drawing: the "local crops" of DINO's multi-crop.
+
+    Like `transforms.RandomResizedCrop` (the crop covers `scale` of the
+    image's area, with an aspect ratio within `ratio`), but a crop is
+    redrawn, up to `max_tries` times, while less than `min_ink` of its
+    pixels are dark (below 128). A line drawing is mostly white paper, so
+    plain random crops would often be blank, and a student matching the
+    teacher from a blank crop learns nothing about the sherd. When no try
+    has enough ink, the inkiest one is used. `min_ink=0` accepts the first
+    crop, as `RandomResizedCrop` does.
+
+    Randomness comes from torch (`RandomResizedCrop.get_params`), which
+    DataLoader workers seed separately.
+    """
+
+    def __init__(self, size, scale=(0.05, 0.32), ratio=(3 / 4, 4 / 3), min_ink=0.005, max_tries=10):
+        self.size = size
+        self.scale = tuple(scale)
+        self.ratio = tuple(ratio)
+        self.min_ink = min_ink
+        self.max_tries = max_tries
+
+    def __call__(self, image):
+        dark = np.asarray(image.convert("L")) < 128
+        best, best_ink = None, -1.0
+        for _ in range(self.max_tries):
+            top, left, height, width = transforms.RandomResizedCrop.get_params(image, self.scale, self.ratio)
+            ink = float(dark[top:top + height, left:left + width].mean())
+            if ink > best_ink:
+                best, best_ink = (top, left, height, width), ink
+            if ink >= self.min_ink:
+                break
+        top, left, height, width = best
+        return transforms.functional.resized_crop(
+            image, top, left, height, width, [self.size, self.size],
+            interpolation=transforms.InterpolationMode.BILINEAR)
+
+
 def build_line_drawing_augmentation(
     output_size=256,
     rotation_degrees=5.0,

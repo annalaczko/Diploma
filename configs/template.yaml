@@ -157,7 +157,18 @@ model:
     # teacher_temp: 0.04     # dino: teacher softmax temperature (low = sharp targets)
     # student_temp: 0.1      # dino: student softmax temperature
     # center_momentum: 0.9   # dino: momentum of the center subtracted from the teacher's logits
-  checkpoint: null           # .pt (state_dict) to start from: fine-tuned if training.train, else only used to extract features
+    # Optional additions to dino, each off by default (example: configs/only_fe/dinov3_finetune_PN_dino_ablation.yaml):
+    # local_crops_number: 0  # multi-crop: local crops per image besides the 2 whole views (DINOv2: 8)
+    # local_crops_size: 96   # multi-crop: crop side in pixels (multiple of 16)
+    # local_crops_scale: [0.05, 0.32]   # multi-crop: fraction of the image's area a crop covers
+    # local_crops_min_ink: 0.005        # multi-crop: redraw crops with less dark pixels than this (0 = no check)
+    # ibot_loss_weight: 0.0  # iBOT: weight of the masked-patch loss (DINOv2: 1.0); also trains mask_token
+    # ibot_num_prototypes: null         # iBOT: size of the patch head's output; null = num_prototypes
+    # ibot_mask_ratio: [0.1, 0.5]       # iBOT: fraction of a masked view's patches masked
+    # ibot_mask_probability: 0.5        # iBOT: chance that a global view is masked at all
+    # koleo_loss_weight: 0.0 # KoLeo: weight of the regularizer spreading the CLS tokens (DINOv2: 0.1)
+    # layerwise_lr_decay: 1.0           # finetune: block i of L gets lr * decay**(L - i); 1.0 = off (DINOv2: 0.9)
+  checkpoint: null          # .pt (state_dict) to start from: fine-tuned if training.train, else only used to extract features
 
 training:                    # arguments of the model's run() / train_model() (ignored by handcrafted; frozen dinov3 uses only batch_size)
   train: true                # false = only extract features (needs model.checkpoint)

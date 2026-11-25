@@ -1,9 +1,24 @@
 # `pipeline` — Pottery-Sherd Image Analysis Pipeline
 
-This package implements an image-analysis pipeline for pottery sherd photographs
-(the ROCOPOT dataset). It goes from raw photographs to a clustering of pottery
-types, with an optional supervised classifier and evaluation metrics along the
-way.
+This package implements an image-analysis pipeline for scanned profile
+drawings of Roman pottery sherds. It goes from raw scans to form-based
+clusters of the sherds, with an optional supervised classifier and evaluation
+metrics along the way. The research questions are in the thesis proposal
+([`docs/`](../docs/)); the root [`README.md`](../README.md) shows which parts
+are implemented.
+
+## Data
+
+The drawings come from the [LEGION project](https://legion-hsa-2-0.github.io/):
+section drawings of Roman common ware from the Carnuntum excavations. The
+models are trained on about 6,300 LEGION scans (`/data/alaczko/legion_raw`,
+preprocessed variants under `/data/alaczko/processed/`). They are evaluated on
+the annotated subset, about 500 drawings with expert Form labels, released as
+CENTURIA (`run_centuria.py`, `configs/centuria/`). The label files have the
+columns `ID` and `TypeRev`; `TypeRev` holds the Form (e.g. pot, bowl, lid). The
+ROCOPOT rim profiles are only used as an external benchmark
+(`configs/only_fe/dino_finetune*_rocopot*.yaml`). None of the data is part of
+the repository.
 
 ## Architecture
 
@@ -16,10 +31,10 @@ preprocessing  ->  feature_learning  ->  clustering  ->  evaluation (optional)
 
 | Stage | Package | Purpose |
 |---|---|---|
-| Preprocessing | [`pipeline/preprocessing`](preprocessing/README.md) | Clean up raw photos: remove background, repair broken line drawings, normalize size. |
-| Feature learning | [`pipeline/feature_learning`](feature_learning/README.md) | Turn preprocessed images into fixed-length feature vectors (unsupervised VAE, SimCLR, or BYOL) or predict pottery type directly (supervised classifier). |
+| Preprocessing | [`pipeline/preprocessing`](preprocessing/README.md) | Clean up raw scans: crop to the sherd, repair broken line drawings, normalize size, optionally vectorize the outline and draw the coordinate axes. |
+| Feature learning | [`pipeline/feature_learning`](feature_learning/README.md) | Turn preprocessed images into fixed-length feature vectors (VAE, SimCLR, BYOL, a pretrained or fine-tuned DINOv3, or hand-crafted profile measures) or predict the Form label directly (supervised classifier). |
 | Clustering | [`pipeline/clustering`](clustering/README.md) | Group feature vectors into clusters, e.g. hierarchical clustering. |
-| Evaluation | [`pipeline/evaluation`](evaluation/README.md) | Score cluster/classifier output against ground truth (or unsupervised, via silhouette score). |
+| Evaluation | [`pipeline/evaluation`](evaluation/README.md) | Score cluster/classifier output against the Form labels (ACC, NMI, ARI) or, without labels, via silhouette score. |
 
 Every stage's concrete classes inherit from a common `Step` base class:
 see [`pipeline/steps`](steps/README.md).
@@ -289,7 +304,7 @@ vae.run(mode="train_model", epochs=10)
 features = vae.extract_features(batch_size=128)
 
 # 2b. ...or supervised classification on top of the VAE's encoder.
-classifier = VAEClassifier(vae=vae, labels_path="/data/alaczko/rocopot_results.csv", input_path=repaired)
+classifier = VAEClassifier(vae=vae, labels_path="/data/alaczko/ocr_data.csv", input_path=repaired)
 classifier.to(device)
 history = classifier.run(epochs=100)
 
@@ -325,8 +340,8 @@ pipeline/
 ├── tracking.py              # optional MLflow logging used by every stage
 ├── experiment.py            # config-driven runs (run_experiment.py, configs/)
 ├── steps/                   # Step: shared abstract base for every stage
-├── preprocessing/           # BackgroundEraser, Repair, Normalizer, Augmentor + shared image-loading helpers
-├── feature_learning/        # VAE, SimCLR, BYOL, VAEClassifier
-├── clustering/               # HierarchicalClustering
-└── evaluation/                # EvaluationWithGroundTruth, EvaluationWithNoGroundTruth
+├── preprocessing/           # BackgroundEraser, Normalizer, Repair, Vectorizer, AxisRenderer, Augmentor + shared image loading
+├── feature_learning/        # VAE, SimCLR, BYOL, DINOv3, HandcraftedFeatures, VAEClassifier
+├── clustering/              # HierarchicalClustering
+└── evaluation/              # EvaluationWithGroundTruth, EvaluationWithNoGroundTruth, latent-space plots
 ```

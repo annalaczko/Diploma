@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Diploma-thesis research code: an image-analysis pipeline for pottery-sherd photographs and line drawings (the ROCOPOT dataset). It takes raw photos to learned feature vectors, then to clusters of pottery types, with an optional supervised classifier and evaluation metrics. Most experimentation happens in `notebooks/sandbox.ipynb`. The `pipeline/` package is the reusable library behind it.
+Diploma-thesis research code: an image-analysis pipeline for scanned profile drawings of Roman pottery sherds from the LEGION project (https://legion-hsa-2-0.github.io/), and uses a labelled subset of them, publicised as CENTURIA to evaluate. It takes raw scans to learned feature vectors, then to form-based clusters (evaluated against the experts' Form labels, CSV column `TypeRev`), with an optional supervised classifier and evaluation metrics. Experimentation happens in `notebooks/sandbox.ipynb`. The `pipeline/` package is the reusable library behind it.
 
 Comments and docstrings are in English and written for readers new to the code; `pipeline/__init__.py` gives a suggested reading order.
 

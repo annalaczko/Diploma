@@ -2,7 +2,7 @@
 
 Date: 2026-10-15. Scope: the in-memory preprocessing pipeline
 (`BackgroundEraser -> Normalizer -> Repair -> Vectorizer`, config
-`configs/prep_vector_axes_svg.yaml`). Feature learning has not been profiled
+`configs/prep_vector_axes_svg.yaml`, now `configs/only_prep/vector_axes.yaml`). Feature learning has not been profiled
 or changed yet.
 
 ## Result

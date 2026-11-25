@@ -1,7 +1,7 @@
 # `pipeline.preprocessing`
 
 Concrete `PreprocessingStep` implementations that clean up raw pottery-sherd
-photographs before feature learning, plus the shared image-loading helpers
+scans before feature learning, plus the shared image-loading helpers
 they (and `pipeline.feature_learning`) all use.
 
 ```
@@ -16,7 +16,7 @@ pipeline/preprocessing/
 ├── repair.py                # Repair
 ├── normalizer.py            # Normalizer
 ├── augmentation.py           # Augmentor
-├── dataset.py                # collect_image_paths, ImageDataset, TwoViewDataset (shared, also used by feature_learning)
+├── dataset.py                # collect_image_paths, ImageDataset, TwoViewDataset, MultiCropDataset (shared, also used by feature_learning)
 └── utils.py                   # convert_json_to_yolo: standalone LabelMe -> YOLO conversion script
 ```
 
@@ -464,6 +464,14 @@ filter), sometimes missing pieces of the lines (`EraseLineSegments`:
 1-3 squares centred on line pixels, 5-15% of the drawing's extent). The
 background stays white. The Augmentor itself doesn't use it.
 
+`InkedRandomResizedCrop(size, scale=(0.05, 0.32), ratio=(3/4, 4/3),
+min_ink=0.005, max_tries=10)`, also in this file, makes the "local crops"
+of DINOv3's multi-crop fine-tuning: a `RandomResizedCrop` (covering `scale`
+of the image's area, resized to `size`) that is redrawn, up to `max_tries`
+times, while less than `min_ink` of its pixels are dark, because a random
+piece of a line drawing is often blank paper. If no try has enough ink,
+the inkiest one is used; `min_ink=0` takes the first crop.
+
 ## `dataset.py` — shared image-loading helpers
 
 These live in `preprocessing` because it's the one place in the codebase
@@ -536,6 +544,15 @@ returning the pair `(view1, view2)` - two random views of the same image,
 the "positive pair" the loss pulls together. They are made anew on every
 fetch, so each epoch sees different variations. It has no labels, unlike
 `ImageDataset`. `paths` may also be an `InMemoryImages`.
+
+### `MultiCropDataset(paths, global_transform, local_transform, n_local)`
+
+The multi-crop version, for `DINOv3` with `local_crops_number > 0`: each
+`__getitem__` returns `(global1, global2, local1, ..., localM)`,
+`global_transform` applied twice and `local_transform` (e.g. ending in
+`InkedRandomResizedCrop`) `n_local` times, independently. The default
+collate stacks each position separately, so a batch is a list of 2 + M
+tensors, the globals of one size and the locals of another.
 
 ## `utils.py` — `convert_json_to_yolo`
 

@@ -1,7 +1,7 @@
 """Pottery-sherd image analysis pipeline.
 
 From scanned drawings of pottery sherds to groups (clusters) of similar
-pottery types, in four stages. Each stage is a `Step` subclass, so every
+forms, in four stages. Each stage is a `Step` subclass, so every
 part can be swapped for another:
 
     preprocessing        clean the scans: one sherd per image, same size
@@ -10,7 +10,7 @@ part can be swapped for another:
            (pipeline.feature_learning)
         -> clustering         group similar vectors
            (pipeline.clustering)
-        -> evaluation         compare the groups with the known types
+        -> evaluation         compare the groups with the Form labels
            (pipeline.evaluation)
 
 Suggested reading order for a first look:

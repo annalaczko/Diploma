@@ -628,6 +628,17 @@ DINOv3(
     teacher_temp=0.04,          # dino: teacher softmax temperature (low = sharp targets)
     student_temp=0.1,           # dino: student softmax temperature
     center_momentum=0.9,        # dino: momentum of the center subtracted from the teacher's logits
+    # optional additions to "dino", each off by default (an error with "nt_xent"):
+    local_crops_number=0,       # multi-crop: local crops per image besides the 2 global views (DINOv2: 8)
+    local_crops_size=96,        # multi-crop: side of a local crop in pixels (96 = 6 x 6 patches)
+    local_crops_scale=(0.05, 0.32),  # multi-crop: fraction of the image's area a local crop covers
+    local_crops_min_ink=0.005,  # multi-crop: redraw crops with less dark pixels than this (0 = no check)
+    ibot_loss_weight=0.0,       # iBOT: weight of the masked-patch loss (DINOv2: 1.0); also trains mask_token
+    ibot_num_prototypes=None,   # iBOT: size of the patch head's output; None = num_prototypes
+    ibot_mask_ratio=(0.1, 0.5), # iBOT: fraction of a masked view's patches that are masked
+    ibot_mask_probability=0.5,  # iBOT: chance that a global view is masked at all
+    koleo_loss_weight=0.0,      # KoLeo: weight of the CLS-spreading regularizer (DINOv2: 0.1)
+    layerwise_lr_decay=1.0,     # any method: block i of L gets lr * decay**(L - i); 1.0 = off (DINOv2: 0.9)
 )
 ```
 
@@ -652,7 +663,8 @@ exist only for the test images, which the evaluation uses).
   stay h (the head absorbs the invariances the loss forces).
 - **`"dino"`** (DINO self-distillation, the objective DINOv3 was
   pretrained with, in its basic form: CLS token only, two global views,
-  centering; no iBOT/KoLeo/Gram terms, no multi-crop): the student is the
+  centering; multi-crop, iBOT and KoLeo can be added, see below; no Gram
+  anchoring): the student is the
   backbone + a `DINOHead` (MLP -> L2-normalized bottleneck -> cosine with
   `num_prototypes` normalized prototypes). The teacher is a copy of both,
   never trained by gradients: after every optimizer step
@@ -666,6 +678,35 @@ exist only for the test images, which the evaluation uses).
   keeps a second copy of the backbone, so it needs more GPU memory. The
   loss starts near log(num_prototypes) and often rises first, so a
   larger `early_stopping_patience` is safer.
+
+  Three additions from the DINOv2/DINOv3 recipe, each switched on by its
+  own parameter (off by default, and then the run is exactly the basic
+  "dino": same params, `model.pt` keys and run name), so they can be
+  compared one at a time:
+  - **multi-crop** (`local_crops_number > 0`): every batch also has that
+    many small local crops per image (`MultiCropDataset` with
+    `InkedRandomResizedCrop`, both in `pipeline/preprocessing`), which the
+    student alone sees, in one more forward pass. `_dino_loss` then matches
+    the teacher's target for each global view from every other view and
+    crop (2 x (2 + M) - 2 pairs, averaged). The global views stay whole
+    drawings, not crops as in DINO, so the targets still come from the
+    whole sherd. A crop with less than `local_crops_min_ink` dark pixels
+    is redrawn, since a drawing is mostly white paper.
+  - **iBOT** (`ibot_loss_weight > 0`): `random_block_masks` masks blocks of
+    patches of `ibot_mask_probability` of the student's global views
+    (`bool_masked_pos` of the Hugging Face model, which puts `mask_token`
+    there; that token is all zeros in the released checkpoints, so it is
+    trained too). A second `DINOHead` on the patch tokens (its own
+    teacher copy and center) predicts, at each masked patch, the teacher's
+    target for the unmasked patch (`_ibot_loss`, every masked image
+    weighted the same). The CLS tokens of the DINO loss come from the same
+    masked pass, as in DINOv2.
+  - **KoLeo** (`koleo_loss_weight > 0`): `_koleo_loss`, -mean log of each
+    CLS token's distance to its nearest neighbour in the batch, per global
+    view, which spreads the features out.
+
+  With more than one term, each epoch's `dino_loss`, `ibot_loss` and
+  `koleo_loss` are logged besides the total `loss`.
 
 Common to both:
 
@@ -681,7 +722,10 @@ Common to both:
 - `_finetune_loss` runs both views through the backbone in one pass and
   computes the chosen loss.
 - `finetune_model`: AdamW on `_student_modules()` (the unfrozen blocks,
-  norm and head), `EarlyStopping` on the smoothed training loss, which
+  norm and head, with iBOT also its head and `mask_token`), in the groups
+  of `_param_groups`: with `layerwise_lr_decay` d < 1, block i of the L
+  blocks gets lr * d**(L - i) and the norm and heads the full lr (as
+  DINOv2), so the earlier blocks change less. `EarlyStopping` watches the smoothed training loss, which
   snapshots `_finetuned_modules()` (the student, and with "dino" also the
   teacher and `center`) and restores the best epoch at the end.
   With "dino" it also logs, per epoch, statistics of the teacher's
@@ -695,7 +739,9 @@ Common to both:
   "dino"; the rest comes from `model_name`), so `run_experiment` saves it
   to `model.pt` and loads `model.checkpoint` like the learned models.
   With "dino" the keys are prefixed `student.` / `teacher.`; with
-  "nt_xent" they are unprefixed, as before. DINOv3 itself is not an
+  "nt_xent" they are unprefixed, as before. With iBOT there are also
+  `ibot_head.*` and `mask_token.mask_token` keys, so such a `model.pt`
+  only loads into a step with iBOT on. DINOv3 itself is not an
   `nn.Module`.
 
 In configs: `model.type: dinov3`, `model.params: {model_name: ...}`.
@@ -704,6 +750,7 @@ checkpoint. With `model.params.finetune: true` it trains with `training.*`
 and takes a checkpoint (`configs/dinov3_finetune.yaml`: fine-tuned on
 `legion/raster/train`, features of `test`). The run name shows the
 backbone (`dinov3-vitl16__...`) when `model_name` is set,
-`finetune_method` (`-dino`) and `unfreeze_blocks` (`-u2`) when given. The checkpoints are gated: accept
+`finetune_method` (`-dino`) and `unfreeze_blocks` (`-u2`) when given, and the additions when
+set (`-mc6`, `-ibot1`, `-koleo0.1`, `-lld0.9`; the ablation sweep is `configs/only_fe/dinov3_finetune_PN_dino_ablation.yaml`). The checkpoints are gated: accept
 the license on the model page and run `huggingface-cli login` (or set `HF_TOKEN`) once; afterwards the
 weights come from the local cache.

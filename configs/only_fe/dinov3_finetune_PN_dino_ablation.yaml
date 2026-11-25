@@ -1,0 +1,79 @@
+# Ablation of the DINOv2/DINOv3 additions to the DINO fine-tuning of DINOv3: the same data and
+# settings as dinov3_finetune_PN_dino.yaml, trained four times, with and without multi-crop and
+# with and without iBOT (the sweep below), so each addition's effect can be read off on its own:
+#
+#   local_crops_number  ibot_loss_weight
+#   0                   0                  baseline (the basic DINO objective)
+#   6                   0                  + multi-crop
+#   0                   1.0                + iBOT
+#   6                   1.0                + multi-crop + iBOT
+#
+# KoLeo and layer-wise lr decay are off here; switch one on below (or add it to the sweep) for the
+# next round. Differences between runs can be within noise: repeat the best ones before relying on them.
+# batch_size is 64 for all four (not 256 as in dinov3_finetune_PN_dino.yaml): with iBOT the trained
+# mask_token sits before the first block, so gradients go through every block and need about twice
+# the memory (64: ~14 GB with both on, ~6 GB without, on one RTX 3090; ~2 min per epoch).
+# Every option: configs/template.yaml.
+#
+# To use it:
+#   python run_experiment.py configs/only_fe/dinov3_finetune_PN_dino_ablation.yaml --dry-run   # check the paths
+#   python run_experiment.py configs/only_fe/dinov3_finetune_PN_dino_ablation.yaml
+
+# ===================================================================== data
+data:
+  source: preprocessed       # ready images, no preprocessing in this run
+  # TRAIN folder, the model is fine-tuned on these (their features: features_train.csv)
+  preprocessed_path: /data/alaczko/processed/pagecrop/no_axes/train
+  # TEST folder, features, clustering and evaluation come from these
+  extract_path: /data/alaczko/processed/pagecrop/no_axes/test_top5
+  labels: /data/alaczko/ocr_data.csv  # ground truth for evaluation: columns ID (file name without extension), TypeRev
+  features: null             # must stay null: with extract_path the features are computed in this run
+
+# ===================================================================== run
+experiment: dinov3-experiments          # MLflow experiment name
+name: null                   # null = generated, e.g. dinov3-vitb16-dino-u2-mc6-ibot1__... (one per combination)
+stop_after: null             # null = whole run | features (no clustering/evaluation)
+sweep:                       # one run per combination (see pipeline/README.md#sweeps); each model is
+                             # fine-tuned once, the clustering settings re-cluster the same test features.
+  model.params.local_crops_number: [0, 6]
+  model.params.ibot_loss_weight: [0, 1.0]
+  clustering.method: [average, ward]
+  clustering.metric: [euclidean, cosine]
+  clustering.cluster_num: [5]
+
+# ===================================================================== model
+model:
+  type: dinov3
+  params:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    finetune: true           # train the last blocks (training.train: true) before extracting features
+    finetune_method: dino    # teacher-student self-distillation, required by the additions
+    unfreeze_blocks: 2       # last N transformer blocks (+ final norm) trained, the rest stays frozen
+    num_prototypes: 1024     # size of the head output (soft pseudo-classes)
+    teacher_momentum: 0.996  # ~90 steps per epoch at batch 64, so the teacher lags ~1/(1-m) = 250 steps (~3 epochs)
+    teacher_temp: 0.04       # low = sharp teacher targets
+    student_temp: 0.1        # higher than teacher_temp
+    center_momentum: 0.9     # moving average of the teacher's logits, subtracted against collapse
+    # multi-crop (set by the sweep; 0 = off)
+    local_crops_number: 0    # local crops per image besides the 2 whole views
+    local_crops_size: 96     # 6 x 6 patches
+    local_crops_scale: [0.05, 0.32]   # fraction of the image's area a local crop covers
+    local_crops_min_ink: 0.005        # redraw crops with less dark pixels than this (blank paper)
+    # iBOT (set by the sweep; 0 = off)
+    ibot_loss_weight: 0      # weight of the masked-patch loss
+    ibot_mask_ratio: [0.1, 0.5]       # fraction of a masked view's patches masked
+    ibot_mask_probability: 0.5        # chance that a global view is masked at all
+    # off in this round (left out, so they are not in the run names either)
+    # koleo_loss_weight: 0.1   # spreads the CLS tokens in the batch
+    # layerwise_lr_decay: 0.9  # matters with more unfreeze_blocks
+  checkpoint: null           # model.pt of an earlier fine-tuning run: continue it, or with train: false only extract
+
+# ===================================================================== training
+training:                    # arguments of DINOv3.run()
+  train: true                # true = fine-tune on preprocessed_path, then extract from extract_path
+  epochs: 50                 # maximum epochs (early stopping may end sooner)
+  lr: 3.0e-5                 # AdamW; small, so the pretrained blocks are only adjusted
+  batch_size: 64             # images per step (x2 views, + the local crops); also the extraction batch
+  early_stopping_patience: 30       # the DINO loss often rises in the first epochs
+  early_stopping_min_delta: 0.0     # minimum improvement that counts
+  early_stopping_smoothing_window: 3    # epochs in the moving average early stopping watches

@@ -81,7 +81,9 @@ NAME_KEYS = {
     "simclr": [("k", "k"), ("projection_dim", "proj")],
     "byol": [("k", "k"), ("tau", "tau")],
     "handcrafted": [("efd_harmonics", "efd")],
-    "dinov3": [("model_name", ""), ("finetune_method", ""), ("unfreeze_blocks", "u")],
+    "dinov3": [("model_name", ""), ("finetune_method", ""), ("unfreeze_blocks", "u"),
+               ("local_crops_number", "mc"), ("ibot_loss_weight", "ibot"), ("koleo_loss_weight", "koleo"),
+               ("layerwise_lr_decay", "lld")],
 }
 # How a parameter's value is written in run names, where not as it is.
 NAME_FORMATS = {"model_name": short_model_name}
@@ -573,7 +575,8 @@ def evaluate(clustering: HierarchicalClustering, predicted: np.ndarray, labels_p
     if labels_path is None or clustering.filenames is None:
         return metrics
 
-    truth = pd.read_csv(labels_path)
+    # IDs as text: numeric ones like 00000 would otherwise become 0.
+    truth = pd.read_csv(labels_path, dtype={"ID": str})
     label_of = dict(zip(truth["ID"].astype(str).str.strip(), truth["TypeRev"]))
     ids = (pd.Series(clustering.filenames).astype(str)
            .str.rsplit(".", n=1).str[0].str.replace(r"_aug\d+$", "", regex=True))
